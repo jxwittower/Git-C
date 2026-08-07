@@ -34,9 +34,14 @@ jobs:
             test -s "$f"
             cat "$f" >> "$RUNNER_TEMP/payload-prefix.enc.b64"
           done
-          base64 -d "$RUNNER_TEMP/payload-prefix.enc.b64" > "$RUNNER_TEMP/payload-prefix.enc"
+          base64 -d "$RUNNER_TEMP/payload-prefix.enc.b64" > "$RUNNER_TEMP/payload-prefix.raw"
+          raw_bytes=$(wc -c < "$RUNNER_TEMP/payload-prefix.raw")
+          usable_bytes=$((raw_bytes - (raw_bytes % 16)))
+          test "$usable_bytes" -gt 16
+          head -c "$usable_bytes" "$RUNNER_TEMP/payload-prefix.raw" > "$RUNNER_TEMP/payload-prefix.enc"
           bytes=$(wc -c < "$RUNNER_TEMP/payload-prefix.enc")
-          echo "ENCRYPTED_PREFIX_BYTES=$bytes" | tee prefix_gate.txt
+          echo "ENCRYPTED_PREFIX_RAW_BYTES=$raw_bytes" | tee prefix_gate.txt
+          echo "ENCRYPTED_PREFIX_USABLE_BYTES=$bytes" | tee -a prefix_gate.txt
           test $((bytes % 16)) -eq 0
 
       - name: Create one-time RSA transport key
