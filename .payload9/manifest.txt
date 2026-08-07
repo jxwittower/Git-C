@@ -1,0 +1,8 @@
+format=openssl-aes-256-cbc-pbkdf2-base64-chunks
+chunk_count=12
+chunk_glob=.payload9/chunk_*
+base64_bytes=643160
+encrypted_sha256=5ee76530061c73b361055f3872448a97f64edcdc17d1441bd31aac1f19550d8f
+pbkdf2_iterations=200000
+payload_class=windows-native-small
+contains_plaintext=false
