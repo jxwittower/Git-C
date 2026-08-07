@@ -129,7 +129,7 @@ jobs:
               echo "FAIL_STAGE=MISSING_FILE:$f"
               exit 39
             fi
-            actual=$(sha256sum < "payload/$f" | awk '{print $1}')
+            actual=$(sha256sum -b "payload/$f" | awk '{print $1}')
             echo "FILE_SHA $f $actual"
             if [ "$actual" != "$expected" ]; then
               echo "FAIL_STAGE=FILE_SHA:$f"
