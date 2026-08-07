@@ -1,0 +1,159 @@
+name: native-windows-init-seh-probe-v9
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_init_seh_probe_v9.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Checkout current main full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Publish one-time RSA public key
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          rm -rf .init_probe_v9_handoff
+          mkdir -p .init_probe_v9_handoff
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .init_probe_v9_handoff/public.pem
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          git add .init_probe_v9_handoff/public.pem
+          git commit -m "Publish one-time RSA key for Init probe v9"
+          ok=0
+          for i in $(seq 1 5); do
+            if git push origin HEAD:main; then ok=1; break; fi
+            git pull --rebase origin main
+          done
+          [ "$ok" = 1 ] || exit 19
+
+      - name: Receive one-time wrapped AES key
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 300); do
+            git pull --ff-only origin main >/dev/null 2>&1 || true
+            if [ -s .init_probe_v9_handoff/key.enc.b64 ]; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "FAIL_STAGE=KEY_TIMEOUT"; exit 20; }
+          tr -d '[:space:]' < .init_probe_v9_handoff/key.enc.b64 | base64 -d > "$RUNNER_TEMP/key.enc"
+          [ "$(wc -c < "$RUNNER_TEMP/key.enc" | tr -d '[:space:]')" = 384 ] || exit 21
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+
+      - name: Recover exact candidate and runtime
+        run: |
+          set -euo pipefail
+          rt=$(cygpath -u "$RUNNER_TEMP")
+          PAYLOAD_REF='447f0ed3d653c425e7e603638f1ebae1d132ead8'
+          p64="$RUNNER_TEMP/payload.enc.b64"
+          : > "$p64"
+          for p in \
+            chunk_00 chunk_01 chunk_02 chunk_03 chunk_04 chunk_05 chunk_06 \
+            chunk_07 chunk_08 chunk_09 chunk_10 chunk_11 \
+            chunk_12fix_00 chunk_12fix_01 chunk_12fix_02 \
+            chunk_12fix_03_00 chunk_12fix_03_01 chunk_12fix_03_02 chunk_12fix_03_03 chunk_12fix_03_04 \
+            chunk_12b
+          do git show "$PAYLOAD_REF:.recovered_payload/$p" >> "$p64"; done
+          [ "$(wc -c < "$p64" | tr -d '[:space:]')" = 259884 ] || exit 31
+          base64 -d "$p64" > "$RUNNER_TEMP/payload.enc"
+          [ "$(sha256sum < "$RUNNER_TEMP/payload.enc" | awk '{print $1}')" = '49087efe5f8506eaa1ba8ed42196678019220ac1db0847ac5ae5ea140796d4a3' ] || exit 32
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          [ "$(sha256sum < "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')" = '46cd159d17a7e83a4a65af0afca61e967de519a232459ce3821b6263bf962bf5' ] || exit 33
+          rm -rf payload; mkdir payload
+          tar -xJf "$rt/payload.tar.xz" -C payload
+          [ "$(sha256sum -b payload/SigProcDll-64HF.dll | awk '{print $1}')" = '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804' ] || exit 34
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.enc" "$RUNNER_TEMP/payload.enc.b64" "$RUNNER_TEMP/payload.tar.xz"
+
+      - name: Write non-secret SEH diagnostic source
+        shell: bash
+        run: |
+          cat > payload/init_seh_probe.c <<'EOF'
+          #include <windows.h>
+          #include <stdint.h>
+          typedef int (__stdcall *InitFn)(char *, void *);
+          typedef void (__stdcall *FiniFn)(void);
+          typedef unsigned char (__stdcall *StatFn)(void);
+          static DWORD g_code, g_addr, g_eip, g_esp;
+          static void out(const char *s){ DWORD n=0,w=0; HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE); while(s[n])++n; WriteFile(h,s,n,&w,0); }
+          static char hx(unsigned v){ v&=15u; return (char)(v<10u?'0'+v:'A'+v-10u); }
+          static void out_hex32(const char *tag,DWORD v){ char b[64]; DWORD i=0,j; while(tag[i]){b[i]=tag[i];++i;} b[i++]='0';b[i++]='x'; for(j=0;j<8;j++)b[i++]=hx(v>>(28-4*j)); b[i++]='\r';b[i++]='\n';b[i]=0;out(b); }
+          static LONG seh_filter(EXCEPTION_POINTERS *ep){ g_code=ep->ExceptionRecord->ExceptionCode; g_addr=(DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress; g_eip=ep->ContextRecord->Eip; g_esp=ep->ContextRecord->Esp; return EXCEPTION_EXECUTE_HANDLER; }
+          static void dump_exception(HMODULE m){ DWORD base=(DWORD)(uintptr_t)m; out_hex32("EXCEPTION_CODE=",g_code);out_hex32("EXCEPTION_ADDRESS=",g_addr);out_hex32("MODULE_BASE=",base);out_hex32("EXCEPTION_RVA=",g_addr-base);out_hex32("EIP=",g_eip);out_hex32("ESP=",g_esp); }
+          int main(void){ HMODULE m; InitFn init; FiniFn fini; StatFn stat; char product[80]; unsigned char minimal_license[4]={1,0,0,0}; int rc=-99;
+            out("[1] LoadLibrary ... "); m=LoadLibraryA("SigProcDll-64HF.dll"); if(!m){out("FAIL\r\n");return 10;} out("PASS\r\n");
+            init=(InitFn)GetProcAddress(m,"_SigProc_Init@8"); fini=(FiniFn)GetProcAddress(m,"_SigProc_Fini@0"); stat=(StatFn)GetProcAddress(m,"_SigProc_Stat@0"); if(!init||!fini||!stat){out("[2] Exports FAIL\r\n");return 11;} out("[2] Exports PASS\r\n");out_hex32("MODULE_BASE=",(DWORD)(uintptr_t)m);
+            out("[3] Fini cold ... "); __try{fini();}__except(seh_filter(GetExceptionInformation())){out("EXCEPTION\r\n");dump_exception(m);return 20;} out("PASS\r\n");
+            product[0]='X'; out("[4] Init null-license ... "); __try{rc=init(product,0);}__except(seh_filter(GetExceptionInformation())){out("EXCEPTION\r\n");dump_exception(m);return 21;} if(rc!=0){out("UNEXPECTED_RC\r\n");return 22;} out("PASS(rc=0)\r\n");
+            product[0]='X'; out("[5] Init minimal-valid-license ... "); __try{rc=init(product,minimal_license);}__except(seh_filter(GetExceptionInformation())){out("EXCEPTION\r\n");dump_exception(m);return 23;} out("RETURNED\r\n");out_hex32("INIT_RC=",(DWORD)rc);out_hex32("STAT_AFTER_INIT=",(DWORD)stat());if(rc)fini();FreeLibrary(m);return 0; }
+          EOF
+          sha256sum payload/init_seh_probe.c
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build Init SEH probe
+        shell: cmd
+        working-directory: payload
+        run: |
+          cl /nologo /W4 /O2 /MT /GS- init_seh_probe.c /Fe:InitSehProbe.exe > ..\init_probe_build.txt 2>&1
+          if errorlevel 1 (type ..\init_probe_build.txt & exit /b 50)
+          type ..\init_probe_build.txt
+
+      - name: Run Init SEH probe
+        shell: cmd
+        working-directory: payload
+        run: |
+          InitSehProbe.exe > ..\init_seh_probe.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\init_seh_probe.txt
+          echo PROBE_RC=%RC%
+          echo %RC%>..\init_seh_probe_rc.txt
+          exit /b 0
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: init-seh-probe-v9-evidence
+          path: |
+            init_probe_build.txt
+            init_seh_probe.txt
+            init_seh_probe_rc.txt
+          if-no-files-found: ignore
+          retention-days: 2
+
+      - name: Remove one-time handoff
+        if: always()
+        run: |
+          set +e
+          git fetch origin main
+          git reset --hard origin/main
+          rm -rf .init_probe_v9_handoff
+          git add -A .init_probe_v9_handoff
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove Init probe v9 handoff"
+            for i in $(seq 1 5); do if git push origin HEAD:main; then break; fi; git pull --rebase origin main || break; done
+          fi
+          rm -rf payload
+          rm -f "$RUNNER_TEMP/private.pem" "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.enc" "$RUNNER_TEMP/payload.enc.b64" "$RUNNER_TEMP/payload.tar.xz"
