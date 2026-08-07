@@ -1,0 +1,18 @@
+name: drive-cipher-probe-inner-v14b
+on:
+  push:
+    paths:
+      - '.github/workflows/drive_cipher_probe_inner_v14b.yml'
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail -o response.bin 'https://drive.google.com/uc?export=download&id=1nNNvV2NakOScNz70xE4IgWc2BMNbAL-x'
+          wc -c response.bin
+          file response.bin
+          head -c 160 response.bin | base64 -w0
+          echo
