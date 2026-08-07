@@ -1,0 +1,208 @@
+name: native-windows-stackfix-smoke-v13
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_stackfix_smoke_v13.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Publish one-time RSA transport key
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          rm -rf .stackfix_v13_handoff
+          mkdir -p .stackfix_v13_handoff
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .stackfix_v13_handoff/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .stackfix_v13_handoff/public.pem
+          git commit -m "Publish one-time RSA key for stackfix smoke v13"
+          ok=0
+          for i in $(seq 1 5); do
+            if git push origin HEAD:main; then ok=1; break; fi
+            git pull --rebase origin main
+          done
+          [ "$ok" = 1 ] || exit 19
+
+      - name: Receive one-time wrapped AES key
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 300); do
+            git pull --ff-only origin main >/dev/null 2>&1 || true
+            if [ -s .stackfix_v13_handoff/key.enc.b64 ]; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "FAIL_STAGE=KEY_TIMEOUT"; exit 20; }
+          tr -d '[:space:]' < .stackfix_v13_handoff/key.enc.b64 | base64 -d > "$RUNNER_TEMP/key.enc"
+          [ "$(wc -c < "$RUNNER_TEMP/key.enc" | tr -d '[:space:]')" = 384 ] || exit 21
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          echo RSA_WRAPPED_AES_KEY_ACCEPTED
+
+      - name: Recover and verify original candidate payload
+        run: |
+          set -euo pipefail
+          rt=$(cygpath -u "$RUNNER_TEMP")
+          REF=447f0ed3d653c425e7e603638f1ebae1d132ead8
+          p64="$RUNNER_TEMP/payload.enc.b64"
+          : > "$p64"
+          for p in chunk_00 chunk_01 chunk_02 chunk_03 chunk_04 chunk_05 chunk_06 chunk_07 chunk_08 chunk_09 chunk_10 chunk_11 chunk_12fix_00 chunk_12fix_01 chunk_12fix_02 chunk_12fix_03_00 chunk_12fix_03_01 chunk_12fix_03_02 chunk_12fix_03_03 chunk_12fix_03_04 chunk_12b; do
+            git show "$REF:.recovered_payload/$p" >> "$p64"
+          done
+          [ "$(wc -c < "$p64" | tr -d '[:space:]')" = 259884 ] || exit 31
+          base64 -d "$p64" > "$RUNNER_TEMP/payload.enc"
+          [ "$(sha256sum < "$RUNNER_TEMP/payload.enc" | awk '{print $1}')" = 49087efe5f8506eaa1ba8ed42196678019220ac1db0847ac5ae5ea140796d4a3 ] || exit 32
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          [ "$(sha256sum < "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')" = 46cd159d17a7e83a4a65af0afca61e967de519a232459ce3821b6263bf962bf5 ] || exit 33
+          rm -rf payload
+          mkdir payload
+          tar -xJf "$rt/payload.tar.xz" -C payload
+          check_sha(){ got=$(sha256sum -b "payload/$1" | awk '{print $1}'); echo "FILE_SHA $1 $got"; [ "$got" = "$2" ] || exit 34; }
+          check_sha SigProcDll-64HF.dll 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+          check_sha SigProcLoaderContractSmoke.exe a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+          check_sha filter_brth ab3f170ff90741c614bd8ff2e5942038f1d14489f2c9df0a1dad7f3dd12b7b9a
+          check_sha filter_hrt3 0ea419a929ac7d765f7c6bcb04fc151927eb6954a65a69819136bf3ae0946805
+          check_sha file_sig a9caf6b2a06fb194bed68b7de910e30d48b31e8e3b03c23b1ae675d037753290
+          check_sha file_bed_model_v1 48571bf163e1f12b5265bb09b65ce2dc4025f01d27b748bfc521381f94611520
+          echo ORIGINAL_PAYLOAD_VERIFIED
+
+      - name: Apply deterministic stack-probe hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/apply_stackfix.py" <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('payload/SigProcDll-64HF.dll')
+          b=bytearray(p.read_bytes())
+          old='081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+          if hashlib.sha256(b).hexdigest()!=old: raise SystemExit('OLD_SHA_MISMATCH')
+          helper=bytes.fromhex('51528b5424080fb6024289542408e800000000598d893d0000008b04818d54240c3d00100000721481ea0010000085122d001000003d0010000077ec29c285128b4c2408894afc89d05a598d60fcc390902200004c21000068810000300f0100406f0000a0d60000c09d000070100000805a02004040000048200000e0370000')
+          sites=[(0x1209,0x2290),(0x2a04,0x214c),(0x52f1,0x8168),(0x79a9,0x10f30),(0x1e7e9,0x6f40),(0x21d79,0xd6a0),(0x37141,0x9dc0),(0x45b59,0x1070),(0x460f9,0x25a80),(0x4a6c9,0x4040),(0x4b2f9,0x2048),(0x4d6c6,0x37e0)]
+          def al(v,a): return (v+a-1)//a*a
+          pe=struct.unpack_from('<I',b,0x3c)[0]; fh=pe+4
+          machine,nsec=struct.unpack_from('<HH',b,fh)
+          if machine!=0x14c or nsec!=4: raise SystemExit('PE_LAYOUT_MISMATCH')
+          optsz=struct.unpack_from('<H',b,fh+16)[0]; opt=fh+20; sec=opt+optsz
+          sa=struct.unpack_from('<I',b,opt+32)[0]; fa=struct.unpack_from('<I',b,opt+36)[0]; sh=struct.unpack_from('<I',b,opt+60)[0]
+          text=None; last=None
+          for i in range(nsec):
+              o=sec+i*40; name=bytes(b[o:o+8]).rstrip(b'\0'); vs,va,rs,rp=struct.unpack_from('<IIII',b,o+8)
+              if name==b'.text': text=(vs,va,rs,rp)
+              if last is None or va>last[1]: last=(vs,va,rs,rp)
+          tvs,tva,trs,trp=text
+          nva=al(last[1]+max(last[0],last[2]),sa); nrp=al(len(b),fa); nrs=al(len(helper),fa); nvs=len(helper)
+          if sec+(nsec+1)*40>sh: raise SystemExit('NO_HEADER_SLACK')
+          if len(b)<nrp: b.extend(b'\0'*(nrp-len(b)))
+          b.extend(helper); b.extend(b'\0'*(nrs-len(helper)))
+          so=sec+nsec*40; b[so:so+8]=b'.stkfix\0'
+          struct.pack_into('<IIIIIIHHI',b,so+8,nvs,nva,nrs,nrp,0,0,0,0,0x60000020)
+          struct.pack_into('<H',b,fh+2,nsec+1)
+          struct.pack_into('<I',b,opt+56,al(nva+nvs,sa))
+          struct.pack_into('<I',b,opt+4,struct.unpack_from('<I',b,opt+4)[0]+nrs)
+          for idx,(rva,imm) in enumerate(sites):
+              fo=trp+(rva-tva); exp=b'\x81\xec'+struct.pack('<I',imm)
+              if bytes(b[fo:fo+6])!=exp: raise SystemExit('SITE_%d_MISMATCH'%idx)
+              rel=(nva-(rva+5))&0xffffffff
+              b[fo:fo+6]=b'\xe8'+struct.pack('<I',rel)+bytes([idx])
+          p.write_bytes(b)
+          print('STACKFIX_SHA='+hashlib.sha256(b).hexdigest())
+          PY
+          python "$RUNNER_TEMP/apply_stackfix.py" | tee stackfix_apply.txt
+          got=$(sha256sum -b payload/SigProcDll-64HF.dll | awk '{print $1}')
+          echo FIXED_DLL_SHA=$got
+          [ "$got" = da4228b5f0fdb39bea9763dd1ffb9e7438fd3cb39223542255f39603660d15f3 ] || { echo FAIL_STAGE=FIXED_SHA; exit 40; }
+          [ "$(wc -c < payload/SigProcDll-64HF.dll | tr -d '[:space:]')" = 440320 ] || exit 41
+          rm -f "$RUNNER_TEMP/apply_stackfix.py" "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.enc" "$RUNNER_TEMP/payload.enc.b64" "$RUNNER_TEMP/payload.tar.xz"
+          echo DETERMINISTIC_STACKFIX_READY
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Record PE ABI on native Windows
+        shell: cmd
+        run: |
+          dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
+          findstr /C:"machine (x86)" pe_headers.txt > nul
+          if errorlevel 1 exit /b 50
+          findstr /C:"_SigProc@24" pe_exports.txt > nul
+          if errorlevel 1 exit /b 51
+          findstr /C:"_SigProc_Fini@0" pe_exports.txt > nul
+          if errorlevel 1 exit /b 52
+          findstr /C:"_SigProc_Init@8" pe_exports.txt > nul
+          if errorlevel 1 exit /b 53
+          findstr /C:"_SigProc_Stat@0" pe_exports.txt > nul
+          if errorlevel 1 exit /b 54
+          findstr /I /C:"ucrtbase.dll" pe_imports.txt > nul
+          if not errorlevel 1 exit /b 55
+          echo NATIVE_PE_ABI_PASS
+          exit /b 0
+
+      - name: Execute original loader contract smoke
+        shell: cmd
+        working-directory: payload
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\loader_smoke.txt
+          exit /b %RC%
+
+      - name: Validate exact loader sentinel
+        shell: cmd
+        run: |
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" loader_smoke.txt > nul
+          if errorlevel 1 exit /b 60
+          echo NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS
+          exit /b 0
+
+      - name: Upload non-proprietary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-stackfix-smoke-v13-evidence
+          path: |
+            stackfix_apply.txt
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            loader_smoke.txt
+          if-no-files-found: ignore
+          retention-days: 2
+
+      - name: Cleanup one-time handoff
+        if: always()
+        run: |
+          set +e
+          git fetch origin main
+          git reset --hard origin/main
+          rm -rf .stackfix_v13_handoff
+          git add -A .stackfix_v13_handoff
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove stackfix smoke v13 handoff"
+            for i in $(seq 1 5); do git push origin HEAD:main && break; git pull --rebase origin main || break; done
+          fi
+          rm -rf payload
+          rm -f "$RUNNER_TEMP/private.pem" "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.enc" "$RUNNER_TEMP/payload.enc.b64" "$RUNNER_TEMP/payload.tar.xz" "$RUNNER_TEMP/apply_stackfix.py"
