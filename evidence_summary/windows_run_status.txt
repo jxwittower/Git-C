@@ -1,0 +1,19 @@
+RUN 31165450197 name= secure-windows-drive-test path= .github/workflows/secure_windows_drive_test.yml status= in_progress conclusion= None head_sha= 731453baf8828461c83c83a691aff1ea33877be9 created= 2026-08-07T09:20:11Z updated= 2026-08-07T09:20:15Z
+RUN 31163456419 name= secure-windows-dll-test path= .github/workflows/secure_windows_dll_test.yml status= completed conclusion= failure head_sha= da13c27df3a249888676ba545db6eb27b1fadfa1 created= 2026-08-07T08:51:41Z updated= 2026-08-07T09:25:45Z
+RUN 31162072011 name= secure-windows-dll-test path= .github/workflows/secure_windows_dll_test.yml status= completed conclusion= failure head_sha= a16dd45a2f3e8328a88b389dda08ce20bc3b6bbe created= 2026-08-07T08:31:45Z updated= 2026-08-07T08:47:53Z
+RUN 31161882393 name= secure-windows-dll-test path= .github/workflows/secure_windows_dll_test.yml status= completed conclusion= failure head_sha= ff5c7ae1546dfbb58a5a921f51fe63c879a8df9d created= 2026-08-07T08:29:07Z updated= 2026-08-07T08:50:29Z
+RUN 31159812951 name= secure-windows-dll-test path= .github/workflows/secure_windows_dll_test.yml status= completed conclusion= failure head_sha= b7db965814570aeec2215d97a66674fc3daa4429 created= 2026-08-07T07:58:58Z updated= 2026-08-07T08:15:47Z
+LATEST_RUN_ID=31165450197
+JOB 92825070680 test status= in_progress conclusion= None
+ STEP 1 Set up job status= completed conclusion= success
+ STEP 2 Checkout status= completed conclusion= success
+ STEP 3 Create ephemeral RSA transport key status= completed conclusion= success
+ STEP 4 Wait for encrypted AES key status= in_progress conclusion= None
+ STEP 5 Download encrypted payload from Drive status= pending conclusion= None
+ STEP 6 Decrypt payload in runner temp status= pending conclusion= None
+ STEP 7 Configure MSVC x86 status= pending conclusion= None
+ STEP 8 Inspect candidate PE on native Windows status= pending conclusion= None
+ STEP 9 Run loader ABI contract smoke on native Windows status= pending conclusion= None
+ STEP 10 Upload Windows evidence status= pending conclusion= None
+ STEP 11 Remove ephemeral transport files status= pending conclusion= None
+ STEP 22 Post Checkout status= pending conclusion= None
