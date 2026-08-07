@@ -1,0 +1,74 @@
+name: collect-seq-candidate-v3-status
+
+on:
+  workflow_run:
+    workflows: ["native-windows-seq-candidate-v3"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Verify v3 native evidence and bind SHA
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          rm -f evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock evidence_summary/SEQ_CANDIDATE_V3_NATIVE_FAIL.lock
+          {
+            echo "RUN_ID=$RUN_ID"
+            echo "CONCLUSION=$CONCLUSION"
+            echo "HEAD_SHA=$HEAD_SHA"
+          } > evidence_summary/seq_candidate_v3_native_status.txt
+          if [ "$CONCLUSION" = success ]; then
+            rm -rf "$RUNNER_TEMP/evidence"; mkdir -p "$RUNNER_TEMP/evidence"
+            gh run download "$RUN_ID" -n seq-candidate-v3-native-evidence -D "$RUNNER_TEMP/evidence"
+            test -s "$RUNNER_TEMP/evidence/candidate_v3_sha.txt"
+            test -s "$RUNNER_TEMP/evidence/loader_smoke_v3.txt"
+            test -s "$RUNNER_TEMP/evidence/import_subset_v3.txt"
+            grep -q 'ALL_LOADER_CONTRACT_TESTS_PASS' "$RUNNER_TEMP/evidence/loader_smoke_v3.txt"
+            grep -q 'IMPORT_SUBSET_PASS' "$RUNNER_TEMP/evidence/import_subset_v3.txt"
+            sha=$(tr -d '[:space:]' < "$RUNNER_TEMP/evidence/candidate_v3_sha.txt")
+            test "${#sha}" = 64
+            printf 'NATIVE_WINDOWS_SEQ_CANDIDATE_V3_PASS SHA256=%s\n' "$sha" > evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock
+            cp "$RUNNER_TEMP/evidence/loader_smoke_v3.txt" evidence_summary/seq_candidate_v3_loader_smoke.txt
+            cp "$RUNNER_TEMP/evidence/import_subset_v3.txt" evidence_summary/seq_candidate_v3_import_subset.txt
+            echo "CANDIDATE_SHA=$sha" >> evidence_summary/seq_candidate_v3_native_status.txt
+          else
+            printf 'SEQ_CANDIDATE_V3_NATIVE_NOT_PASSED\n' > evidence_summary/SEQ_CANDIDATE_V3_NATIVE_FAIL.lock
+          fi
+      - name: Publish v3 native result
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          rm -rf "$RUNNER_TEMP/persist"; mkdir -p "$RUNNER_TEMP/persist"
+          cp -f evidence_summary/seq_candidate_v3_* "$RUNNER_TEMP/persist/" 2>/dev/null || true
+          cp -f evidence_summary/SEQ_CANDIDATE_V3_NATIVE_*.lock "$RUNNER_TEMP/persist/" 2>/dev/null || true
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p evidence_summary
+            cp -f "$RUNNER_TEMP/persist/"* evidence_summary/ 2>/dev/null || true
+            git add evidence_summary
+            git commit -m "Record final seq candidate v3 native result" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
