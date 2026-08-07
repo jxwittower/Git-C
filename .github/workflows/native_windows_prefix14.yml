@@ -1,0 +1,151 @@
+name: native-windows-prefix14
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_prefix14.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-smoke-prefix:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Assemble encrypted prefix
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/payload-prefix.enc.b64"
+          for i in $(seq -w 0 13); do
+            f=".payload9/chunk_${i}"
+            test -s "$f"
+            cat "$f" >> "$RUNNER_TEMP/payload-prefix.enc.b64"
+          done
+          base64 -d "$RUNNER_TEMP/payload-prefix.enc.b64" > "$RUNNER_TEMP/payload-prefix.enc"
+          bytes=$(wc -c < "$RUNNER_TEMP/payload-prefix.enc")
+          echo "ENCRYPTED_PREFIX_BYTES=$bytes" | tee prefix_gate.txt
+          test $((bytes % 16)) -eq 0
+
+      - name: Create one-time RSA transport key
+        run: |
+          set -euo pipefail
+          rm -rf .secureprefix14
+          mkdir -p .secureprefix14
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secureprefix14/public.pem
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          git add .secureprefix14/public.pem
+          git commit -m "Publish one-time RSA key for Windows prefix smoke"
+          git push
+          echo "EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED"
+
+      - name: Wait for RSA-wrapped AES key
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 180); do
+            git pull --ff-only >/dev/null 2>&1 || true
+            if [ -s .secureprefix14/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          echo "RSA_WRAPPED_AES_KEY_RECEIVED"
+
+      - name: Decrypt encrypted prefix and stream-extract completed tar entries
+        run: |
+          set -euo pipefail
+          base64 -d .secureprefix14/key.enc.b64 > "$RUNNER_TEMP/key.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -nopad -in "$RUNNER_TEMP/payload-prefix.enc" -out "$RUNNER_TEMP/payload-prefix.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          set +e
+          xz -dc "$RUNNER_TEMP/payload-prefix.xz" > "$RUNNER_TEMP/payload-prefix.tar" 2> xz_prefix_stderr.txt
+          xz_rc=$?
+          mkdir -p payload
+          tar -xf "$RUNNER_TEMP/payload-prefix.tar" -C payload 2> tar_prefix_stderr.txt
+          tar_rc=$?
+          set -e
+          echo "XZ_PREFIX_RC=$xz_rc" | tee -a prefix_gate.txt
+          echo "TAR_PREFIX_RC=$tar_rc" | tee -a prefix_gate.txt
+          ls -la payload | tee payload_listing.txt
+          for f in SigProcDll-64HF.dll SigProcLoaderContractSmoke.exe file_sig filter_brth filter_hrt3; do
+            if [ -s "payload/$f" ]; then echo "PRESENT $f $(wc -c < payload/$f)"; else echo "MISSING $f"; exit 71; fi
+          done | tee extracted_files.txt
+          dll_sha=$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')
+          echo "DLL_SHA256=$dll_sha" | tee -a prefix_gate.txt
+          test "$dll_sha" = "081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804"
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/private.pem"
+          echo "PREFIX_RECOVERY_GATE_PASS" | tee -a prefix_gate.txt
+
+      - name: Configure MSVC x86 tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Record native Windows PE contract
+        shell: cmd
+        run: |
+          ver > windows_environment.txt
+          echo PROCESSOR_ARCHITECTURE=%PROCESSOR_ARCHITECTURE%>> windows_environment.txt
+          where dumpbin >> windows_environment.txt
+          dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
+          dumpbin /headers payload\SigProcLoaderContractSmoke.exe > smoke_headers.txt
+
+      - name: Execute PE32 host-contract smoke on native Windows
+        shell: cmd
+        working-directory: payload
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\loader_smoke.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul
+          if errorlevel 1 exit /b 91
+
+      - name: Mark native gate
+        run: echo "NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS" > native_gate.txt
+
+      - name: Upload non-proprietary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-prefix14-evidence
+          path: |
+            prefix_gate.txt
+            xz_prefix_stderr.txt
+            tar_prefix_stderr.txt
+            payload_listing.txt
+            extracted_files.txt
+            windows_environment.txt
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            smoke_headers.txt
+            loader_smoke.txt
+            native_gate.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Remove ephemeral RSA handoff
+        if: always()
+        run: |
+          git pull --ff-only || true
+          rm -rf .secureprefix14
+          git add -A .secureprefix14 || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove one-time RSA key for Windows prefix smoke"
+            git push || true
+          fi
