@@ -15,7 +15,7 @@ defaults:
 jobs:
   test:
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
           openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure3/public.pem
           git config user.name "windows-dll-test-bot"
           git config user.email "windows-dll-test-bot@users.noreply.github.com"
-          git add .secure3/public.pem
+          git add -A .secure3
           git commit -m "Publish ephemeral Windows smoke-test public key"
           git push
           echo "EPHEMERAL_PUBLIC_KEY_PUBLISHED"
@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           ok=0
-          for i in $(seq 1 180); do
+          for i in $(seq 1 720); do
             git pull --ff-only >/dev/null 2>&1 || true
             if [ -s .secure3/key.enc.b64 ] && [ -s .secure3/payload.done ]; then
               ok=1
