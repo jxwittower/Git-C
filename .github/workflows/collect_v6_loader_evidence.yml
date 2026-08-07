@@ -1,0 +1,61 @@
+name: collect-v6-loader-evidence
+
+on:
+  push:
+    paths:
+      - 'evidence_summary/v6_native_status.txt'
+      - 'evidence_summary/V6_PASS.lock'
+      - '.github/workflows/collect_v6_loader_evidence.yml'
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Require exact native pass and fetch smoke evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          grep -qx 'NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS' evidence_summary/V6_PASS.lock
+          run_id=$(sed -n 's/^RUN_ID=//p' evidence_summary/v6_native_status.txt | head -1)
+          test -n "$run_id"
+          rm -rf "$RUNNER_TEMP/v6e"
+          mkdir -p "$RUNNER_TEMP/v6e"
+          gh run download "$run_id" -n exact-original-native-loader-gate-v6-evidence -D "$RUNNER_TEMP/v6e"
+          f=$(find "$RUNNER_TEMP/v6e" -type f -name loader_smoke.txt -print -quit)
+          test -n "$f"
+          grep -q 'ALL_LOADER_CONTRACT_TESTS_PASS' "$f"
+          mkdir -p evidence_summary
+          cp "$f" evidence_summary/v6_loader_smoke.txt
+          printf 'V6_NATIVE_EVIDENCE_REVALIDATED\n' > evidence_summary/V6_EVIDENCE.lock
+      - name: Publish smoke evidence
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          cp evidence_summary/v6_loader_smoke.txt "$RUNNER_TEMP/loader_smoke.txt"
+          cp evidence_summary/V6_EVIDENCE.lock "$RUNNER_TEMP/V6_EVIDENCE.lock"
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/loader_smoke.txt" evidence_summary/v6_loader_smoke.txt
+            cp "$RUNNER_TEMP/V6_EVIDENCE.lock" evidence_summary/V6_EVIDENCE.lock
+            git add evidence_summary/v6_loader_smoke.txt evidence_summary/V6_EVIDENCE.lock
+            git commit -m "Persist exact native v6 smoke evidence" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
