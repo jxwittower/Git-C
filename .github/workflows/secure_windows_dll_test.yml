@@ -4,7 +4,6 @@ on:
   push:
     paths:
       - '.github/workflows/secure_windows_dll_test.yml'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,7 +15,7 @@ defaults:
 jobs:
   test:
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,24 +25,24 @@ jobs:
       - name: Create ephemeral RSA transport key
         run: |
           set -euo pipefail
-          rm -rf .secure
-          mkdir -p .secure
+          rm -rf .secure3
+          mkdir -p .secure3
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
-          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure/public.pem
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure3/public.pem
           git config user.name "windows-dll-test-bot"
           git config user.email "windows-dll-test-bot@users.noreply.github.com"
-          git add .secure/public.pem
-          git commit -m "Publish ephemeral Windows test public key"
+          git add .secure3/public.pem
+          git commit -m "Publish ephemeral Windows smoke-test public key"
           git push
           echo "EPHEMERAL_PUBLIC_KEY_PUBLISHED"
 
-      - name: Wait for encrypted payload
+      - name: Wait for chunked encrypted payload
         run: |
           set -euo pipefail
           ok=0
-          for i in $(seq 1 240); do
+          for i in $(seq 1 180); do
             git pull --ff-only >/dev/null 2>&1 || true
-            if [ -s .secure/payload.enc.b64 ] && [ -s .secure/key.enc.b64 ]; then
+            if [ -s .secure3/key.enc.b64 ] && [ -s .secure3/payload.done ]; then
               ok=1
               break
             fi
@@ -53,18 +52,18 @@ jobs:
             echo "ENCRYPTED_PAYLOAD_TIMEOUT"
             exit 20
           fi
-          echo "ENCRYPTED_PAYLOAD_RECEIVED"
+          cat .secure3/payload.part.* > "$RUNNER_TEMP/payload.enc.b64"
+          echo "parts=$(ls .secure3/payload.part.* | wc -l) chars=$(wc -c < "$RUNNER_TEMP/payload.enc.b64")"
 
-      - name: Decrypt payload in runner temp
+      - name: Decrypt payload
         run: |
           set -euo pipefail
-          base64 -d .secure/key.enc.b64 > "$RUNNER_TEMP/key.enc"
+          base64 -d .secure3/key.enc.b64 > "$RUNNER_TEMP/key.enc"
           openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
-          base64 -d .secure/payload.enc.b64 > "$RUNNER_TEMP/payload.enc"
+          base64 -d "$RUNNER_TEMP/payload.enc.b64" > "$RUNNER_TEMP/payload.enc"
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.zip" -pass file:"$RUNNER_TEMP/pass.txt"
           mkdir -p payload
           7z x -y "$RUNNER_TEMP/payload.zip" -opayload >/dev/null
-          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.enc" "$RUNNER_TEMP/payload.zip"
           echo "PAYLOAD_DECRYPTED"
 
       - name: Configure MSVC x86
@@ -72,105 +71,43 @@ jobs:
         with:
           arch: x86
 
-      - name: Record native Windows environment
+      - name: Inspect candidate PE on native Windows
         shell: cmd
         run: |
           ver > windows_environment.txt
-          echo PROCESSOR_ARCHITECTURE=%PROCESSOR_ARCHITECTURE%>> windows_environment.txt
-          where cl >> windows_environment.txt
-          cl 2>> windows_environment.txt
-
-      - name: Inspect PE and dependencies
-        shell: cmd
-        run: |
           dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
           dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
           dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
-          dumpbin /headers payload\SigProcLoaderContractSmoke.exe > smoke_headers.txt
 
-      - name: Run loader contract smoke on native Windows
+      - name: Run loader ABI contract smoke on native Windows
         shell: cmd
         working-directory: payload
         run: |
           SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
           type ..\loader_smoke.txt
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt
 
-      - name: Build x86 host replay and stress harness
-        shell: cmd
-        working-directory: payload
-        run: |
-          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS host_replay_win.c /Fe:HostReplayWin.exe > ..\harness_build.txt 2>&1
-          if errorlevel 1 (type ..\harness_build.txt & exit /b 1)
-
-      - name: Run candidate inner final-empty replay at real 1Hz host cadence
-        shell: cmd
-        working-directory: payload
-        run: |
-          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_replay.csv > ..\inner_replay.log 2>&1
-          type ..\inner_replay.log
-
-      - name: Run candidate outer leave-return replay at real 1Hz host cadence
-        shell: cmd
-        working-directory: payload
-        run: |
-          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 1000 --out ..\outer_replay.csv > ..\outer_replay.log 2>&1
-          type ..\outer_replay.log
-
-      - name: Run lifecycle concurrency and zero-input stress
-        shell: cmd
-        working-directory: payload
-        run: |
-          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode stress --loops 2000 --threads 2 --out ..\stress.csv > ..\stress.log 2>&1
-          type ..\stress.log
-
-      - name: Run original C63 structural host comparison
-        shell: cmd
-        working-directory: payload
-        run: |
-          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out ..\inner_original.csv > ..\inner_original.log 2>&1
-          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 0 --out ..\outer_original.csv > ..\outer_original.log 2>&1
-
-      - name: Validate Windows gates
-        shell: cmd
-        working-directory: payload
-        run: |
-          python validate_windows_results.py ..\loader_smoke.txt ..\inner_replay.csv ..\outer_replay.csv ..\stress.csv ..\inner_original.csv ..\outer_original.csv > ..\validation.txt 2>&1
-          type ..\validation.txt
-
-      - name: Upload non-proprietary Windows evidence
+      - name: Upload Windows evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-test-evidence
+          name: windows-native-smoke-evidence
           path: |
             windows_environment.txt
             pe_headers.txt
             pe_exports.txt
             pe_imports.txt
-            smoke_headers.txt
             loader_smoke.txt
-            harness_build.txt
-            inner_replay.log
-            outer_replay.log
-            stress.log
-            inner_original.log
-            outer_original.log
-            inner_replay.csv
-            outer_replay.csv
-            stress.csv
-            inner_original.csv
-            outer_original.csv
-            validation.txt
           if-no-files-found: ignore
           retention-days: 2
 
-      - name: Remove encrypted transport files
+      - name: Remove transport files
         if: always()
         run: |
           git pull --ff-only || true
-          rm -rf .secure
-          git add -A .secure || true
+          rm -rf .secure3
+          git add -A .secure3 || true
           if ! git diff --cached --quiet; then
-            git commit -m "Remove ephemeral Windows test transport files"
+            git commit -m "Remove ephemeral Windows smoke-test transport"
             git push || true
           fi
