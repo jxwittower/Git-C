@@ -83,7 +83,7 @@ jobs:
             echo "FAIL_STAGE=BASE64_DECODE"
             exit 32
           fi
-          cipher_sha=$(sha256sum "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
+          cipher_sha=$(sha256sum < "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
           echo "CIPHERTEXT_SHA=$cipher_sha"
           if [ "$cipher_sha" != '49087efe5f8506eaa1ba8ed42196678019220ac1db0847ac5ae5ea140796d4a3' ]; then
             echo "FAIL_STAGE=CIPHERTEXT_SHA"
@@ -107,7 +107,7 @@ jobs:
           fi
           echo "AES_DECRYPT_OK"
 
-          tar_sha=$(sha256sum "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')
+          tar_sha=$(sha256sum < "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')
           echo "TAR_SHA=$tar_sha"
           if [ "$tar_sha" != '46cd159d17a7e83a4a65af0afca61e967de519a232459ce3821b6263bf962bf5' ]; then
             echo "FAIL_STAGE=TAR_SHA"
@@ -129,7 +129,7 @@ jobs:
               echo "FAIL_STAGE=MISSING_FILE:$f"
               exit 39
             fi
-            actual=$(sha256sum "payload/$f" | awk '{print $1}')
+            actual=$(sha256sum < "payload/$f" | awk '{print $1}')
             echo "FILE_SHA $f $actual"
             if [ "$actual" != "$expected" ]; then
               echo "FAIL_STAGE=FILE_SHA:$f"
