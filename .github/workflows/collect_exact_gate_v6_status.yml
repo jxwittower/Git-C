@@ -1,0 +1,57 @@
+name: collect-exact-gate-v6-status
+
+on:
+  workflow_run:
+    workflows: ["native-windows-exact-original-gate-v6"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Write auditable v6 status
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          {
+            echo "RUN_ID=$RUN_ID"
+            echo "CONCLUSION=$CONCLUSION"
+            echo "HEAD_SHA=$HEAD_SHA"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '.jobs[] | "JOB=" + .name + " STATUS=" + .status + " CONCLUSION=" + (.conclusion // "")'
+            if [ "$CONCLUSION" = success ]; then echo V6_EXACT_NATIVE_GATE_PASS; else echo V6_EXACT_NATIVE_GATE_NOT_PASS; fi
+          } > evidence_summary/v6_native_status.txt
+          cat evidence_summary/v6_native_status.txt
+      - name: Publish status marker
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            cp evidence_summary/v6_native_status.txt "$RUNNER_TEMP/v6_native_status.txt"
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/v6_native_status.txt" evidence_summary/v6_native_status.txt
+            git add evidence_summary/v6_native_status.txt
+            git commit -m "Record exact native Windows gate v6 status" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
