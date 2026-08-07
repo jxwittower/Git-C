@@ -1,0 +1,165 @@
+name: native-windows-seq-candidate-v1
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_seq_candidate_v1.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-gate:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Fetch encrypted candidate payload
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/candidate.enc" "$url"
+          test -s "$RUNNER_TEMP/candidate.enc"
+          echo "CANDIDATE_CIPHERTEXT_BYTES=$(wc -c < "$RUNNER_TEMP/candidate.enc" | tr -d '[:space:]')"
+          echo "CANDIDATE_CIPHERTEXT_SHA=$(sha256sum "$RUNNER_TEMP/candidate.enc" | awk '{print $1}')"
+
+      - name: Create and publish one-time RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            rm -rf .seq_candidate_v1_handoff
+            mkdir -p .seq_candidate_v1_handoff
+            cp "$RUNNER_TEMP/public.pem" .seq_candidate_v1_handoff/public.pem
+            git add .seq_candidate_v1_handoff/public.pem
+            git commit -m "Publish one-time RSA key for seq candidate v1" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=PUBLIC_KEY_PUSH; exit 19; }
+          echo SEQ_CANDIDATE_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for matching wrapped AES key
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1qodNWgYhbzggtOx_cOZjDo17jxrSXXj0'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/key.enc"
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=RSA_KEY_TIMEOUT; exit 20; }
+          echo SEQ_CANDIDATE_RSA_KEY_ACCEPTED
+
+      - name: Decrypt and verify candidate payload
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/candidate.enc" -out "$RUNNER_TEMP/candidate.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt" || { echo FAIL_STAGE=CANDIDATE_AES; exit 24; }
+          rm -rf payload
+          mkdir payload
+          tar -xJf "$RUNNER_TEMP/candidate.tar.xz" -C payload || { echo FAIL_STAGE=CANDIDATE_EXTRACT; exit 25; }
+          cd payload
+          sha256sum -c CANDIDATE_NATIVE_SHA256SUMS.txt
+          sha256sum SigProcDll-64HF.dll | awk '{print $1}' > ../candidate_sha.txt
+          echo "CANDIDATE_SHA=$(cat ../candidate_sha.txt)"
+          echo CANDIDATE_PAYLOAD_VERIFIED
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/candidate.enc" "$RUNNER_TEMP/candidate.tar.xz"
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native PE ABI import gate
+        shell: cmd
+        run: |
+          dumpbin /headers payload\SigProcDll-64HF.dll > candidate_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > candidate_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > candidate_imports.txt
+          dumpbin /imports payload\SigProcDll-HostCompat-baseline.dll > baseline_imports.txt
+          findstr /C:"machine (x86)" candidate_headers.txt > nul
+          if errorlevel 1 exit /b 40
+          findstr /C:"_SigProc_Init@8" candidate_exports.txt > nul
+          if errorlevel 1 exit /b 41
+          findstr /C:"_SigProc@24" candidate_exports.txt > nul
+          if errorlevel 1 exit /b 42
+          findstr /C:"_SigProc_Stat@0" candidate_exports.txt > nul
+          if errorlevel 1 exit /b 43
+          findstr /C:"_SigProc_Fini@0" candidate_exports.txt > nul
+          if errorlevel 1 exit /b 44
+          findstr /I /C:"ucrtbase.dll" candidate_imports.txt > nul
+          if not errorlevel 1 exit /b 45
+
+      - name: Verify import subset of HostCompat baseline
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          function Get-Dlls($p) {
+            $txt=Get-Content $p
+            $a=@()
+            foreach($l in $txt){ if($l -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$'){ $a += $Matches[1].ToLowerInvariant() } }
+            return @($a | Sort-Object -Unique)
+          }
+          $cand=Get-Dlls 'candidate_imports.txt'
+          $base=Get-Dlls 'baseline_imports.txt'
+          $extra=@($cand | Where-Object { $_ -notin $base })
+          "CANDIDATE_IMPORTS=$($cand -join ',')" | Out-File import_subset.txt
+          "BASELINE_IMPORTS=$($base -join ',')" | Add-Content import_subset.txt
+          "EXTRA_IMPORTS=$($extra -join ',')" | Add-Content import_subset.txt
+          Get-Content import_subset.txt
+          if($extra.Count -ne 0){ exit 46 }
+          'IMPORT_SUBSET_PASS' | Add-Content import_subset.txt
+
+      - name: Execute exact loader contract on native Windows
+        shell: cmd
+        working-directory: payload
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\loader_smoke.txt
+          if not %RC%==0 exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul
+          if errorlevel 1 exit /b 47
+          echo SEQ_CANDIDATE_NATIVE_GATE_PASS
+
+      - name: Upload native candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-candidate-v1-native-evidence
+          path: |
+            candidate_sha.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_imports.txt
+            baseline_imports.txt
+            import_subset.txt
+            loader_smoke.txt
+          if-no-files-found: ignore
+          retention-days: 3
