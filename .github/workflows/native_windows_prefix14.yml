@@ -5,6 +5,8 @@ on:
     paths:
       - '.github/workflows/native_windows_prefix14.yml'
   workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
 
 permissions:
   contents: write
