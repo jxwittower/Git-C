@@ -1,0 +1,156 @@
+name: native-windows-smoke9
+
+on:
+  push:
+    paths:
+      - '.payload9/chunk_19'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-smoke:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Assemble and verify encrypted payload
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/payload.enc.b64"
+          : > "$out"
+          for i in $(seq -w 0 19); do
+            f=".payload9/chunk_${i}"
+            test -s "$f"
+            cat "$f" >> "$out"
+          done
+          b64_sha=$(sha256sum "$out" | awk '{print $1}')
+          echo "B64_SHA256=$b64_sha" | tee payload_hashes.txt
+          test "$b64_sha" = "7456edf0a5dc6bcb8b2b9a54303ca13da16d185ea7938d4f8fc3b2efd4d45c9b"
+          base64 -d "$out" > "$RUNNER_TEMP/payload.enc"
+          enc_sha=$(sha256sum "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
+          echo "ENC_SHA256=$enc_sha" | tee -a payload_hashes.txt
+          test "$enc_sha" = "5cdcff206767d90cc1a7fef7f6fc626d55de6419ef061e4d995d1abb1e5a2fac"
+          echo "ENCRYPTED_PAYLOAD_HASH_GATE_PASS" | tee -a payload_hashes.txt
+
+      - name: Create one-time RSA transport key
+        run: |
+          set -euo pipefail
+          rm -rf .secure9
+          mkdir -p .secure9
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure9/public.pem
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          git add .secure9/public.pem
+          git commit -m "Publish one-time RSA key for native Windows smoke"
+          git push
+          echo "EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED"
+
+      - name: Wait for RSA-wrapped AES key
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 180); do
+            git pull --ff-only >/dev/null 2>&1 || true
+            if [ -s .secure9/key.enc.b64 ]; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          test "$ok" = 1
+          echo "RSA_WRAPPED_AES_KEY_RECEIVED"
+
+      - name: Decrypt and verify native payload
+        run: |
+          set -euo pipefail
+          base64 -d .secure9/key.enc.b64 > "$RUNNER_TEMP/key.enc"
+          openssl pkeyutl -decrypt \
+            -inkey "$RUNNER_TEMP/private.pem" \
+            -in "$RUNNER_TEMP/key.enc" \
+            -out "$RUNNER_TEMP/pass.txt" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/payload.enc" \
+            -out "$RUNNER_TEMP/payload.tar.xz" \
+            -pass file:"$RUNNER_TEMP/pass.txt"
+          tar_sha=$(sha256sum "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')
+          echo "TAR_XZ_SHA256=$tar_sha" | tee -a payload_hashes.txt
+          test "$tar_sha" = "315f6341ac5550fb02bc0db8f905d9746cb10fe69f7deecdf20975d072c31ecd"
+          mkdir -p payload
+          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C payload
+          dll_sha=$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')
+          echo "DLL_SHA256=$dll_sha" | tee -a payload_hashes.txt
+          test "$dll_sha" = "081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804"
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/private.pem"
+          echo "DECRYPTED_PAYLOAD_HASH_GATE_PASS" | tee -a payload_hashes.txt
+
+      - name: Configure MSVC x86 tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Record native Windows environment and PE contract
+        shell: cmd
+        run: |
+          ver > windows_environment.txt
+          echo PROCESSOR_ARCHITECTURE=%PROCESSOR_ARCHITECTURE%>> windows_environment.txt
+          where dumpbin >> windows_environment.txt
+          dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
+          dumpbin /headers payload\SigProcLoaderContractSmoke.exe > smoke_headers.txt
+
+      - name: Execute PE32 DLL host-contract smoke on Windows
+        shell: cmd
+        working-directory: payload
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\loader_smoke.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul
+          if errorlevel 1 exit /b 91
+
+      - name: Record smoke gate
+        run: |
+          echo "NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS" > native_gate.txt
+
+      - name: Upload non-proprietary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-smoke9-evidence
+          path: |
+            payload_hashes.txt
+            windows_environment.txt
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            smoke_headers.txt
+            loader_smoke.txt
+            native_gate.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Remove encrypted transport from repository
+        if: always()
+        run: |
+          git pull --ff-only || true
+          rm -rf .secure9 .payload9
+          git add -A .secure9 .payload9 || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove encrypted native Windows smoke transport"
+            git push || true
+          fi
