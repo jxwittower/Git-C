@@ -1,0 +1,57 @@
+name: secure5-key-helper
+
+on:
+  push:
+    paths:
+      - '.github/workflows/secure5_key_helper.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Fetch RSA ciphertext from Drive
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1PgDQKB2XOGbBvQWYUcoJA9I39dM8CqMP'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/key.enc" "$url"
+          size=$(wc -c < "$RUNNER_TEMP/key.enc")
+          echo "key_ciphertext_bytes=$size"
+          test "$size" -eq 384
+          base64 -w 0 "$RUNNER_TEMP/key.enc" > "$RUNNER_TEMP/key.enc.b64"
+
+      - name: Publish fetched marker
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          mkdir -p .secure5
+          printf 'FETCHED\n' > .secure5/helper_downloaded
+          git add .secure5/helper_downloaded
+          git commit -m "Mark secure5 RSA ciphertext fetched"
+          git push
+
+      - name: Safety delay before releasing RSA ciphertext
+        run: sleep 180
+
+      - name: Publish RSA ciphertext for waiting Windows runner
+        run: |
+          set -euo pipefail
+          git pull --ff-only
+          cp "$RUNNER_TEMP/key.enc.b64" .secure5/key.enc.b64
+          git add .secure5/key.enc.b64
+          git commit -m "Release secure5 RSA ciphertext to Windows runner"
+          git push
+          echo "RSA_CIPHERTEXT_RELEASED"
