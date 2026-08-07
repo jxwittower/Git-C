@@ -1,0 +1,176 @@
+name: payload9-windows-native
+
+on:
+  push:
+    paths:
+      - '.github/workflows/payload9_windows_native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Verify encrypted payload9 transport
+        run: |
+          set -euo pipefail
+          test -f .payload9/manifest.txt
+          count=$(find .payload9 -maxdepth 1 -type f -name 'chunk_*' | wc -l | tr -d ' ')
+          echo "payload9_chunk_count=$count"
+          test "$count" = "12"
+          cat .payload9/chunk_* > "$RUNNER_TEMP/payload.b64"
+          b64bytes=$(wc -c < "$RUNNER_TEMP/payload.b64" | tr -d ' ')
+          echo "payload9_base64_bytes=$b64bytes"
+          test "$b64bytes" = "643160"
+          base64 -d "$RUNNER_TEMP/payload.b64" > "$RUNNER_TEMP/payload.enc"
+          actual=$(sha256sum "$RUNNER_TEMP/payload.enc" | awk '{print $1}')
+          echo "payload9_encrypted_sha256=$actual"
+          test "$actual" = "5ee76530061c73b361055f3872448a97f64edcdc17d1441bd31aac1f19550d8f"
+          echo "PAYLOAD9_TRANSPORT_PASS"
+
+      - name: Create one-time RSA bridge key
+        run: |
+          set -euo pipefail
+          rm -rf .payload9_bridge
+          mkdir -p .payload9_bridge
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/payload9_private.pem"
+          openssl pkey -in "$RUNNER_TEMP/payload9_private.pem" -pubout -out .payload9_bridge/public.pem
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          git add .payload9_bridge/public.pem
+          git commit -m "Publish payload9 one-time Windows public key"
+          git push
+          echo "PAYLOAD9_PUBLIC_KEY_PUBLISHED"
+
+      - name: Wait for encrypted AES password
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 360); do
+            git pull --ff-only >/dev/null 2>&1 || true
+            if [ -s .payload9_bridge/key.enc.b64 ]; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ok" != 1 ]; then
+            echo "PAYLOAD9_KEY_TIMEOUT"
+            exit 20
+          fi
+          echo "PAYLOAD9_ENCRYPTED_KEY_RECEIVED"
+
+      - name: Decrypt payload only inside Windows runner
+        run: |
+          set -euo pipefail
+          base64 -d .payload9_bridge/key.enc.b64 > "$RUNNER_TEMP/key.enc"
+          test "$(wc -c < "$RUNNER_TEMP/key.enc" | tr -d ' ')" = "384"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/payload9_private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          test "$(wc -c < "$RUNNER_TEMP/pass.txt" | tr -d ' ')" = "65"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.zip" -pass file:"$RUNNER_TEMP/pass.txt"
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/payload.b64" "$RUNNER_TEMP/payload.enc"
+          mkdir -p payload
+          7z x -y "$RUNNER_TEMP/payload.zip" -opayload >/dev/null
+          rm -f "$RUNNER_TEMP/payload.zip"
+          echo "PAYLOAD9_DECRYPT_PASS"
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native PE32 and export inspection
+        shell: cmd
+        run: |
+          ver > windows_environment.txt
+          echo PROCESSOR_ARCHITECTURE=%PROCESSOR_ARCHITECTURE%>> windows_environment.txt
+          where cl >> windows_environment.txt
+          dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
+          findstr /C:"machine (x86)" pe_headers.txt
+          findstr /C:"_SigProc@24" pe_exports.txt
+          findstr /C:"_SigProc_Init@8" pe_exports.txt
+          findstr /C:"_SigProc_Stat@0" pe_exports.txt
+          findstr /C:"_SigProc_Fini@0" pe_exports.txt
+
+      - name: Native LoadLibrary Init Stat zero-input Fini smoke
+        shell: cmd
+        run: |
+          copy /Y payload\SigProcDll-64HF.dll payload\runtime_outer\SigProcDll-64HF.dll >NUL
+          copy /Y payload\SigProcLoaderContractSmoke.exe payload\runtime_outer\SigProcLoaderContractSmoke.exe >NUL
+          pushd payload\runtime_outer
+          SigProcLoaderContractSmoke.exe > ..\..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          popd
+          type loader_smoke.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" loader_smoke.txt
+
+      - name: Build x86 replay and concurrency harness
+        shell: cmd
+        working-directory: payload
+        run: |
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS host_replay_win.c /Fe:HostReplayWin.exe > ..\harness_build.txt 2>&1
+          if errorlevel 1 (type ..\harness_build.txt & exit /b 1)
+          type ..\harness_build.txt
+
+      - name: Native real-data short replay
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out ..\inner_native.csv > ..\inner_native.log 2>&1
+          if errorlevel 1 (type ..\inner_native.log & exit /b 1)
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 0 --out ..\outer_native.csv > ..\outer_native.log 2>&1
+          if errorlevel 1 (type ..\outer_native.log & exit /b 1)
+          type ..\inner_native.log
+          type ..\outer_native.log
+
+      - name: Native two-thread lifecycle stress
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode stress --loops 2000 --threads 2 --out ..\stress_native.csv > ..\stress_native.log 2>&1
+          if errorlevel 1 (type ..\stress_native.log & exit /b 1)
+          type ..\stress_native.log
+
+      - name: Upload non-proprietary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: payload9-windows-native-evidence
+          path: |
+            windows_environment.txt
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            loader_smoke.txt
+            harness_build.txt
+            inner_native.log
+            outer_native.log
+            stress_native.log
+          if-no-files-found: ignore
+          retention-days: 2
+
+      - name: Remove one-time bridge files
+        if: always()
+        run: |
+          git pull --ff-only || true
+          rm -rf .payload9_bridge
+          git add -A .payload9_bridge || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove payload9 one-time bridge"
+            git push || true
+          fi
