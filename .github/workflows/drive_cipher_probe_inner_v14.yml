@@ -1,0 +1,26 @@
+name: drive-cipher-probe-inner-v14
+
+on:
+  push:
+    paths:
+      - '.github/workflows/drive_cipher_probe_inner_v14.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download encrypted replay payload only
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1nNNvV2NakOScNz70xE4IgWc2BMNbAL-x'
+          curl -L --fail --retry 2 --retry-delay 1 -o inner.enc "$url"
+          bytes=$(wc -c < inner.enc)
+          sha=$(sha256sum inner.enc | awk '{print $1}')
+          echo "BYTES=$bytes"
+          echo "SHA=$sha"
+          [ "$bytes" = '660464' ]
+          [ "$sha" = '9e86cbae2144cc19d6b293fe0a0811493ed5113ee6941db6a87ab62f5657aacb' ]
+          echo DRIVE_CIPHERTEXT_DOWNLOAD_PASS
