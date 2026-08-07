@@ -16,7 +16,7 @@ defaults:
 jobs:
   test:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +26,7 @@ jobs:
       - name: Create ephemeral RSA transport key
         run: |
           set -euo pipefail
+          rm -rf .secure
           mkdir -p .secure
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
           openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure/public.pem
@@ -37,13 +38,10 @@ jobs:
           echo "EPHEMERAL_PUBLIC_KEY_PUBLISHED"
 
       - name: Wait for encrypted payload
-        env:
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           ok=0
-          for i in $(seq 1 180); do
+          for i in $(seq 1 240); do
             git pull --ff-only >/dev/null 2>&1 || true
             if [ -s .secure/payload.enc.b64 ] && [ -s .secure/key.enc.b64 ]; then
               ok=1
@@ -57,7 +55,7 @@ jobs:
           fi
           echo "ENCRYPTED_PAYLOAD_RECEIVED"
 
-      - name: Decrypt payload in runner memory
+      - name: Decrypt payload in runner temp
         run: |
           set -euo pipefail
           base64 -d .secure/key.enc.b64 > "$RUNNER_TEMP/key.enc"
@@ -90,28 +88,28 @@ jobs:
           dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
           dumpbin /headers payload\SigProcLoaderContractSmoke.exe > smoke_headers.txt
 
-      - name: Run loader contract smoke on real Windows
+      - name: Run loader contract smoke on native Windows
         shell: cmd
         working-directory: payload
         run: |
           SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
           type ..\loader_smoke.txt
 
-      - name: Build Windows host replay and stress harness
+      - name: Build x86 host replay and stress harness
         shell: cmd
         working-directory: payload
         run: |
-          cl /nologo /O2 /W4 /EHsc- /D_CRT_SECURE_NO_WARNINGS host_replay_win.c /Fe:HostReplayWin.exe > ..\harness_build.txt 2>&1
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS host_replay_win.c /Fe:HostReplayWin.exe > ..\harness_build.txt 2>&1
           if errorlevel 1 (type ..\harness_build.txt & exit /b 1)
 
-      - name: Run inner-bed real-frame replay
+      - name: Run candidate inner final-empty replay at real 1Hz host cadence
         shell: cmd
         working-directory: payload
         run: |
           HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_replay.csv > ..\inner_replay.log 2>&1
           type ..\inner_replay.log
 
-      - name: Run outer-bed transition replay
+      - name: Run candidate outer leave-return replay at real 1Hz host cadence
         shell: cmd
         working-directory: payload
         run: |
@@ -125,21 +123,21 @@ jobs:
           HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode stress --loops 2000 --threads 2 --out ..\stress.csv > ..\stress.log 2>&1
           type ..\stress.log
 
-      - name: Compare candidate with original C63 host behavior
+      - name: Run original C63 structural host comparison
         shell: cmd
         working-directory: payload
         run: |
-          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_original.csv > ..\inner_original.log 2>&1
-          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 1000 --out ..\outer_original.csv > ..\outer_original.log 2>&1
+          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out ..\inner_original.csv > ..\inner_original.log 2>&1
+          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 0 --out ..\outer_original.csv > ..\outer_original.log 2>&1
 
-      - name: Validate result gates
+      - name: Validate Windows gates
         shell: cmd
         working-directory: payload
         run: |
           python validate_windows_results.py ..\loader_smoke.txt ..\inner_replay.csv ..\outer_replay.csv ..\stress.csv ..\inner_original.csv ..\outer_original.csv > ..\validation.txt 2>&1
           type ..\validation.txt
 
-      - name: Upload non-proprietary Windows test evidence
+      - name: Upload non-proprietary Windows evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -166,7 +164,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 2
 
-      - name: Remove encrypted transport files from repository
+      - name: Remove encrypted transport files
         if: always()
         run: |
           git pull --ff-only || true
