@@ -1,0 +1,52 @@
+name: lock-exact-gate-v6-result
+
+on:
+  push:
+    paths:
+      - 'evidence_summary/v6_native_status.txt'
+      - '.github/workflows/lock_exact_gate_v6_result.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Normalize exact gate result
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          rm -f evidence_summary/V6_PASS.lock evidence_summary/V6_FAIL.lock
+          if [ -s evidence_summary/v6_native_status.txt ] && grep -qx 'V6_EXACT_NATIVE_GATE_PASS' evidence_summary/v6_native_status.txt; then
+            printf 'NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS\n' > evidence_summary/V6_PASS.lock
+          else
+            printf 'NATIVE_GATE_NOT_PASSED\n' > evidence_summary/V6_FAIL.lock
+          fi
+      - name: Publish gate lock
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            cp -f evidence_summary/V6_PASS.lock "$RUNNER_TEMP/V6_PASS.lock" 2>/dev/null || true
+            cp -f evidence_summary/V6_FAIL.lock "$RUNNER_TEMP/V6_FAIL.lock" 2>/dev/null || true
+            git fetch origin main
+            git checkout -B main origin/main
+            rm -f evidence_summary/V6_PASS.lock evidence_summary/V6_FAIL.lock
+            if [ -s "$RUNNER_TEMP/V6_PASS.lock" ]; then cp "$RUNNER_TEMP/V6_PASS.lock" evidence_summary/V6_PASS.lock; fi
+            if [ -s "$RUNNER_TEMP/V6_FAIL.lock" ]; then cp "$RUNNER_TEMP/V6_FAIL.lock" evidence_summary/V6_FAIL.lock; fi
+            git add -A evidence_summary/V6_PASS.lock evidence_summary/V6_FAIL.lock
+            git commit -m "Lock exact native gate v6 result" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
