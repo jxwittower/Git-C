@@ -1,0 +1,54 @@
+name: stackprobe-7c305-status-bridge
+on:
+  workflow_run:
+    workflows: ['stackprobe-7c305-wormhole-native-fullreg']
+    types: [completed]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  persist-status:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Build auditable run status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          {
+            echo "RUN_ID=$RUN_ID"
+            echo "CONCLUSION=$CONCLUSION"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "WORKFLOW=stackprobe-7c305-wormhole-native-fullreg"
+            echo '--- JOBS/STEPS ---'
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" --jq '.jobs[] | "JOB " + (.name//"") + " status=" + (.status//"") + " conclusion=" + (.conclusion//""), (.steps[]? | "STEP " + ((.number|tostring)) + " " + (.name//"") + " status=" + (.status//"") + " conclusion=" + (.conclusion//""))'
+          } > evidence_summary/STACKPROBE_7C305_LAST_RUN_STATUS.txt
+          rm -f evidence_summary/STACKPROBE_7C305_WORKFLOW_SUCCESS.lock evidence_summary/STACKPROBE_7C305_WORKFLOW_FAILURE.lock
+          if [ "$CONCLUSION" = success ]; then
+            printf '%s\n' "WORKFLOW_SUCCESS RUN_ID=$RUN_ID SHA256=7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64" > evidence_summary/STACKPROBE_7C305_WORKFLOW_SUCCESS.lock
+          else
+            printf '%s\n' "WORKFLOW_FAILURE RUN_ID=$RUN_ID CONCLUSION=$CONCLUSION" > evidence_summary/STACKPROBE_7C305_WORKFLOW_FAILURE.lock
+          fi
+      - name: Commit status to main
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B status origin/main
+            git add evidence_summary/STACKPROBE_7C305_LAST_RUN_STATUS.txt evidence_summary/STACKPROBE_7C305_WORKFLOW_SUCCESS.lock evidence_summary/STACKPROBE_7C305_WORKFLOW_FAILURE.lock 2>/dev/null || true
+            git commit -qm 'Persist exact 7c305 Windows workflow completion status' || true
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep 2
+          done
+          exit 1
