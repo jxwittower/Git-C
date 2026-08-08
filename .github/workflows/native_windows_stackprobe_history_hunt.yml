@@ -1,0 +1,236 @@
+name: native-windows-stackprobe-history-hunt
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_stackprobe_history_hunt.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  hunt-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch all refs
+        run: |
+          set -euo pipefail
+          git fetch --all --tags --prune
+          git for-each-ref --format='%(refname) %(objectname)' refs/remotes refs/heads refs/tags | tee refs.txt
+
+      - name: Search reachable git blobs for exact fixed DLL and native assets
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib, os, pathlib, subprocess, sys
+          T='7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'
+          B='66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          root=pathlib.Path('history_hunt'); root.mkdir(exist_ok=True)
+          def run(args): return subprocess.check_output(args, text=True, errors='replace')
+          objs=[]
+          for line in run(['git','rev-list','--objects','--all']).splitlines():
+              p=line.split(' ',1)
+              if len(p)==2: objs.append((p[0],p[1]))
+          cand=None; bad=None; assets={}
+          wanted_names={'native_nonzero_smoke.c','sigproc_loader_contract_smoke.c','sigproc_regression_host.c','filter_brth','filter_hrt3','file_sig','file_bed_model_v1','run_final_regression_windows.py','validate_windows_results.py','validate_seq_targets.py','patch_exact_stackprobe.py'}
+          ghf=[]
+          for sha,path in objs:
+              name=pathlib.PurePosixPath(path).name
+              low=name.lower()
+              interesting=low.endswith('.dll') or name in wanted_names or low.endswith('.ghf')
+              if not interesting: continue
+              try: data=subprocess.check_output(['git','cat-file','blob',sha])
+              except Exception: continue
+              if low.endswith('.dll'):
+                  h=hashlib.sha256(data).hexdigest()
+                  if h==T and cand is None:
+                      q=root/'candidate_7c305.dll'; q.write_bytes(data); cand=str(q)
+                      (root/'candidate_git_source.txt').write_text(f'{sha} {path}\n')
+                  if h==B and bad is None:
+                      q=root/'bad_66a44.dll'; q.write_bytes(data); bad=str(q)
+                      (root/'bad_git_source.txt').write_text(f'{sha} {path}\n')
+              elif name in wanted_names and name not in assets:
+                  q=root/name; q.write_bytes(data); assets[name]=str(q)
+                  with open(root/'asset_git_sources.txt','a',encoding='utf-8') as f:f.write(f'{name}\t{sha}\t{path}\n')
+              elif low.endswith('.ghf') and len(ghf)<4 and len(data)>1000:
+                  q=root/f'history_{len(ghf)}.ghf'; q.write_bytes(data); ghf.append(str(q))
+                  with open(root/'asset_git_sources.txt','a',encoding='utf-8') as f:f.write(f'{q.name}\t{sha}\t{path}\n')
+          print('GIT_HISTORY_EXACT_FOUND',bool(cand))
+          print('GIT_HISTORY_BAD_FOUND',bool(bad))
+          print('GIT_HISTORY_ASSETS',sorted(assets), 'GHF',len(ghf))
+          if cand: pathlib.Path('exact_candidate_path.txt').write_text(cand+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\hunt_git.py
+          python $env:RUNNER_TEMP\hunt_git.py | Tee-Object history_hunt.log
+
+      - name: Download likely historical Actions artifacts when exact DLL or assets still missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib, json, os, pathlib, shutil, subprocess, sys, urllib.request, zipfile
+          T='7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'
+          B='66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          root=pathlib.Path('artifact_hunt'); root.mkdir(exist_ok=True)
+          token=os.environ['GH_TOKEN']; repo=os.environ['GITHUB_REPOSITORY']
+          headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          def get(url):
+              r=urllib.request.Request(url,headers=headers); return urllib.request.urlopen(r,timeout=60).read()
+          meta=json.loads(get(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100'))
+          arts=[a for a in meta.get('artifacts',[]) if not a.get('expired')]
+          scorewords=('stack','probe','native','final','regress','v4','candidate','payload','dll')
+          arts.sort(key=lambda a:(-sum(w in a.get('name','').lower() for w in scorewords),a.get('size_in_bytes',0)))
+          wanted={'native_nonzero_smoke.c','sigproc_loader_contract_smoke.c','sigproc_regression_host.c','filter_brth','filter_hrt3','file_sig','file_bed_model_v1','run_final_regression_windows.py','validate_windows_results.py','validate_seq_targets.py','patch_exact_stackprobe.py'}
+          exact=None; bad=None; found_assets={}; ghfs=[]; checked=0
+          for a in arts:
+              if checked>=45: break
+              if a.get('size_in_bytes',0)>140_000_000: continue
+              checked+=1
+              zp=root/f"artifact_{a['id']}.zip"
+              try: zp.write_bytes(get(a['archive_download_url']))
+              except Exception as e:
+                  print('ARTIFACT_DOWNLOAD_SKIP',a['id'],a['name'],repr(e)); continue
+              d=root/f"a_{a['id']}"; d.mkdir(exist_ok=True)
+              try: zipfile.ZipFile(zp).extractall(d)
+              except Exception: continue
+              for p in d.rglob('*'):
+                  if not p.is_file(): continue
+                  n=p.name; low=n.lower()
+                  if low.endswith('.dll'):
+                      try:h=hashlib.sha256(p.read_bytes()).hexdigest()
+                      except Exception:continue
+                      if h==T and exact is None:
+                          q=pathlib.Path('history_hunt')/'candidate_7c305.dll'; shutil.copy2(p,q); exact=str(q)
+                          pathlib.Path('history_hunt/candidate_artifact_source.txt').write_text(f"{a['id']}\t{a['name']}\t{p}\n")
+                      if h==B and bad is None:
+                          q=pathlib.Path('history_hunt')/'bad_66a44.dll'; shutil.copy2(p,q); bad=str(q)
+                  if n in wanted and n not in found_assets:
+                      q=pathlib.Path('history_hunt')/n
+                      if not q.exists(): shutil.copy2(p,q)
+                      found_assets[n]=str(q)
+                  if low.endswith('.ghf') and len(ghfs)<4 and p.stat().st_size>1000:
+                      q=pathlib.Path('history_hunt')/f'artifact_{len(ghfs)}.ghf'; shutil.copy2(p,q); ghfs.append(str(q))
+              if exact and all((pathlib.Path('history_hunt')/n).exists() for n in ('filter_brth','filter_hrt3','file_sig')) and ((pathlib.Path('history_hunt')/'native_nonzero_smoke.c').exists() or (pathlib.Path('history_hunt')/'sigproc_regression_host.c').exists()) and list(pathlib.Path('history_hunt').glob('*.ghf')):
+                  break
+          print('ARTIFACTS_CHECKED',checked,'EXACT',bool(exact or pathlib.Path('history_hunt/candidate_7c305.dll').exists()),'BAD',bool(bad or pathlib.Path('history_hunt/bad_66a44.dll').exists()))
+          if pathlib.Path('history_hunt/candidate_7c305.dll').exists(): pathlib.Path('exact_candidate_path.txt').write_text('history_hunt/candidate_7c305.dll\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\hunt_artifacts.py
+          python $env:RUNNER_TEMP\hunt_artifacts.py 2>&1 | Tee-Object -Append history_hunt.log
+
+      - name: Require exact fixed SHA without substituting any other DLL
+        run: |
+          set -euo pipefail
+          test -f history_hunt/candidate_7c305.dll || { echo FAIL_STAGE=EXACT_7C305_NOT_FOUND_IN_HISTORY_OR_ARTIFACTS; exit 31; }
+          echo '7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64  history_hunt/candidate_7c305.dll' | sha256sum -c -
+          file history_hunt/candidate_7c305.dll | tee exact_file.txt
+          echo EXACT_7C305_RECOVERED
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: PE ABI and stack-probe section gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll='history_hunt/candidate_7c305.dll'
+          dumpbin /headers $dll | Tee-Object exact_headers.txt
+          dumpbin /exports $dll | Tee-Object exact_exports.txt
+          dumpbin /imports $dll | Tee-Object exact_imports.txt
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){ if(-not (Select-String exact_exports.txt -SimpleMatch $e -Quiet)){throw "MISSING_EXPORT $e"} }
+          if(-not (Select-String exact_headers.txt -SimpleMatch '.stkfix' -Quiet)){throw 'STACKFIX_SECTION_MISSING'}
+          if(Select-String exact_imports.txt -SimpleMatch 'ucrtbase.dll' -Quiet){throw 'DIRECT_UCRTBASE_IMPORT'}
+          'PE_ABI_STACKPROBE_PASS' | Out-File pe_abi_stackprobe_pass.txt
+
+      - name: Require runtime and a real nonzero native host asset
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($n in @('filter_brth','filter_hrt3','file_sig')){ if(!(Test-Path (Join-Path 'history_hunt' $n))){ throw "MISSING_RUNTIME_$n" } }
+          $ghf=Get-ChildItem history_hunt -Filter '*.ghf' -File | Select-Object -First 1
+          if(!$ghf){ throw 'MISSING_REAL_GHF' }
+          $src=$null
+          foreach($n in @('native_nonzero_smoke.c','sigproc_regression_host.c')){ if(Test-Path (Join-Path 'history_hunt' $n)){ $src=Join-Path 'history_hunt' $n; break } }
+          if(!$src){ throw 'MISSING_NONZERO_NATIVE_HOST_SOURCE' }
+          "SOURCE=$src" | Out-File native_source.txt
+          "GHF=$($ghf.FullName)" | Add-Content native_source.txt
+
+      - name: Compile and execute real nonzero x86 path
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=((Get-Content native_source.txt | Where-Object {$_ -like 'SOURCE=*'}) -replace '^SOURCE=','').Trim()
+          $ghf=((Get-Content native_source.txt | Where-Object {$_ -like 'GHF=*'}) -replace '^GHF=','').Trim()
+          $exe=Join-Path $env:RUNNER_TEMP 'nonzero.exe'
+          & cl.exe /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS $src /Fe:$exe
+          if($LASTEXITCODE -ne 0){ throw 'HOST_COMPILE_FAILED' }
+          $rt=Join-Path $env:RUNNER_TEMP 'rt'; New-Item -ItemType Directory -Force $rt | Out-Null
+          Copy-Item history_hunt/filter_brth,history_hunt/filter_hrt3,history_hunt/file_sig $rt
+          if(Test-Path history_hunt/file_bed_model_v1){Copy-Item history_hunt/file_bed_model_v1 $rt}
+          Copy-Item history_hunt/candidate_7c305.dll (Join-Path $rt 'SigProcDll-64HF.dll')
+          Push-Location $rt
+          try {
+            if([IO.Path]::GetFileName($src) -eq 'native_nonzero_smoke.c'){
+              & $exe '.\SigProcDll-64HF.dll' $ghf 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero.log"
+            } else {
+              & $exe '.\SigProcDll-64HF.dll' $ghf 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero.log"
+            }
+            $rc=$LASTEXITCODE
+          } finally { Pop-Location }
+          if($rc -ne 0){ throw "NATIVE_NONZERO_EXIT_$rc" }
+          $h=(Get-FileHash history_hunt/candidate_7c305.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne '7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'){throw 'POST_EXEC_HASH_DRIFT'}
+          'EXACT_NATIVE_NONZERO_STACKPROBE_PASS SHA256=7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64' | Out-File exact_native_nonzero_pass.txt
+
+      - name: Record exact native PASS lock
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          mkdir -p evidence_summary
+          printf '%s\n' 'EXACT_NATIVE_NONZERO_STACKPROBE_PASS SHA256=7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64' > evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B record origin/main
+            mkdir -p evidence_summary
+            printf '%s\n' 'EXACT_NATIVE_NONZERO_STACKPROBE_PASS SHA256=7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64' > evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock
+            git add evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock
+            git commit -qm 'Record exact 7c305 native nonzero PASS' || true
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Upload hunt and native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackprobe-7c305-history-native-evidence
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            history_hunt.log
+            history_hunt/*source*.txt
+            refs.txt
+            exact_file.txt
+            exact_headers.txt
+            exact_exports.txt
+            exact_imports.txt
+            pe_abi_stackprobe_pass.txt
+            native_source.txt
+            native_nonzero.log
+            exact_native_nonzero_pass.txt
