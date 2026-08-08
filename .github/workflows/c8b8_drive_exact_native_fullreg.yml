@@ -45,7 +45,7 @@ jobs:
 
           base='https://api.mail.tm'
           domains=req('GET',base+'/domains')
-          members=domains.get('hydra:member',[])
+          members=domains if isinstance(domains,list) else domains.get('hydra:member',[])
           if not members: raise SystemExit('MAILTM_NO_DOMAIN')
           domain=members[0]['domain']
           alphabet=string.ascii_lowercase+string.digits
@@ -107,7 +107,7 @@ jobs:
           seen=set()
           while time.time()<deadline and (len(got)<4 or not key_ok):
               listing=get_json(base+'/messages')
-              for m in listing.get('hydra:member',[]):
+              for m in (listing if isinstance(listing,list) else listing.get('hydra:member',[])):
                   subj=m.get('subject','')
                   if subj not in wanted or m['id'] in seen: continue
                   seen.add(m['id'])
