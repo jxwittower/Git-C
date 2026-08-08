@@ -1,0 +1,106 @@
+name: release-7c305-native-realghf
+on:
+  push:
+    paths: ['.github/workflows/release_7c305_native_realghf.yml']
+permissions: {contents: write}
+defaults: {run: {shell: bash}}
+env:
+  BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+  P9_REF: 50389db4873509be1507a40f7a86d68dbf48b6c3
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+      with: {fetch-depth: 0, persist-credentials: true}
+    - name: Bind historical base and exact real data
+      run: |
+        set -euo pipefail
+        git checkout "$P9_REF" -- .payload9
+        cat .payload9/chunk_* | base64 -d > "$RUNNER_TEMP/p9.enc"
+        cat .release7c305_realghf/chunk_* | base64 -d > "$RUNNER_TEMP/p20.xz"
+        echo '4e8a9a69d015a960dc2c91a313637011401b677c7c564cd5160911d6540a7579  '"$RUNNER_TEMP/p20.xz" | sha256sum -c -
+        xz -dc "$RUNNER_TEMP/p20.xz" > "$RUNNER_TEMP/prefix20.ghf"
+        echo 'f5e507d88d181923b774abb2ac51e5b2e26034e53199b111f1de7e50e8e4e8eb  '"$RUNNER_TEMP/prefix20.ghf" | sha256sum -c -
+        cat .release7c305_runtime/chunk_* | base64 -d > "$RUNNER_TEMP/runtime.xz"
+        echo '9f467fd7f70e04d387d7bf7c8455d2ecf5f4bee91ad12c7522cae3ab1d7870b6  '"$RUNNER_TEMP/runtime.xz" | sha256sum -c -
+        mkdir -p native_stage/runtime; tar -xJf "$RUNNER_TEMP/runtime.xz" -C native_stage/runtime
+        cp "$RUNNER_TEMP/prefix20.ghf" native_stage/runtime/prefix20.ghf
+        cp .release7c305_native/native_nonzero_smoke.c native_stage/
+        echo EXACT_TEST_ASSETS_BOUND
+    - name: Publish one-time RSA key
+      run: |
+        set -euo pipefail
+        openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+        openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+        git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
+        for n in 1 2 3 4 5; do
+          git reset --hard -q HEAD;git fetch -q origin main;git checkout -q -B main origin/main
+          rm -rf .release7c305_native_handoff;mkdir .release7c305_native_handoff;cp "$RUNNER_TEMP/public.pem" .release7c305_native_handoff/public.pem
+          git add .release7c305_native_handoff/public.pem;git commit -qm 'Publish release 7c305 native RSA key' || true
+          git push -q origin HEAD:main && exit 0;sleep 2
+        done;exit 19
+    - name: Receive three candidate bundles
+      run: |
+        set -euo pipefail;base='https://raw.githubusercontent.com/jxwittower/Git-C/main/.release7c305_native_handoff'
+        for i in 1 2 3; do
+          ok=0
+          for k in $(seq 1 600); do
+            if curl -Lsf --max-time 10 -H 'Cache-Control: no-cache' "${base}/wrapped_${i}.b64?run=$GITHUB_RUN_ID&k=$k" -o "$RUNNER_TEMP/w.b64"; then
+              base64 -d "$RUNNER_TEMP/w.b64" > "$RUNNER_TEMP/w.bin" 2>/dev/null || true
+              if [ "$(wc -c < "$RUNNER_TEMP/w.bin" | tr -d ' ')" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/w.bin" -out "$RUNNER_TEMP/c${i}.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1;then ok=1;break;fi
+            fi;sleep 2
+          done
+          [ "$ok" = 1 ] || exit 20
+        done
+        cat "$RUNNER_TEMP"/c{1,2,3}.txt > "$RUNNER_TEMP/candidates.txt";echo RSA_HANDOFF_PASS
+    - name: Recover exact 66a and deterministically patch
+      run: |
+        set -euo pipefail
+        python .release7c305_native/recover_base.py
+        python .release7c305_native/patch_stack.py
+        echo "$FIX_SHA  native_stage/SigProcDll-64HF.dll" | sha256sum -c -
+    - uses: ilammy/msvc-dev-cmd@v1
+      with: {arch: x86}
+    - name: PE ABI and real nonzero fresh-process repeat
+      shell: powershell
+      run: |
+        $ErrorActionPreference='Stop';$d='native_stage\SigProcDll-64HF.dll'
+        if((Get-FileHash $d -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:FIX_SHA){throw 'SHA'}
+        dumpbin /headers $d > native_headers.txt;dumpbin /exports $d > native_exports.txt;dumpbin /imports $d > native_imports.txt
+        $e=Get-Content native_exports.txt -Raw;foreach($x in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if($e -notmatch [regex]::Escape($x)){throw "EXPORT $x"}}
+        if((Get-Content native_headers.txt -Raw) -notmatch '\.stkfix'){throw 'STKFIX'}
+        if((Get-Content native_imports.txt -Raw) -match '(?im)^\s*ucrtbase\.dll\s*$'){throw 'UCRT'}
+        cl /nologo /O2 /W3 /MT native_stage\native_nonzero_smoke.c /Fe:native_stage\native_nonzero_smoke.exe
+        & native_stage\native_nonzero_smoke.exe native_stage\runtime prefix20.ghf *>&1 | Tee-Object native_run1.txt;if($LASTEXITCODE -ne 0){throw 'RUN1'}
+        & native_stage\native_nonzero_smoke.exe native_stage\runtime prefix20.ghf *>&1 | Tee-Object native_run2.txt;if($LASTEXITCODE -ne 0){throw 'RUN2'}
+        foreach($f in @('native_run1.txt','native_run2.txt')){if(-not(Select-String -Quiet -SimpleMatch 'NONZERO_NATIVE_SMOKE_PASS' $f)){throw "SENT $f"}}
+        if((Get-FileHash $d -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:FIX_SHA){throw 'DRIFT'}
+        "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$env:FIX_SHA" | Out-File native_exact_pass.lock
+    - name: Commit native PASS lock
+      run: |
+        set -euo pipefail;cp native_exact_pass.lock "$RUNNER_TEMP/lock";git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+        for n in 1 2 3 4 5;do git reset --hard -q HEAD;git fetch -q origin main;git checkout -q -B main origin/main;mkdir -p evidence_summary;cp "$RUNNER_TEMP/lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock;git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock;git commit -qm 'PASS exact 7c305 real nonzero native gate' || true;git push -q origin HEAD:main && exit 0;sleep 2;done;exit 60
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-7c305-native-realghf
+        retention-days: 14
+        if-no-files-found: ignore
+        path: |
+          native_stage/SigProcDll-64HF.dll
+          native_run1.txt
+          native_run2.txt
+          native_headers.txt
+          native_exports.txt
+          native_imports.txt
+          native_exact_pass.lock
+          p9_recovery.txt
+          stackfix.txt
+    - name: Cleanup handoff
+      if: always()
+      run: |
+        set +e;git reset --hard -q HEAD;git fetch -q origin main;git checkout -q -B main origin/main
+        if test -d .release7c305_native_handoff;then git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git rm -r -q .release7c305_native_handoff;git commit -qm 'Remove release 7c305 native handoff';git push -q origin HEAD:main;fi;true
