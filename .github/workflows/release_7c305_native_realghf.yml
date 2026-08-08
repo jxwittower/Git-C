@@ -26,7 +26,7 @@ jobs:
         echo 'f5e507d88d181923b774abb2ac51e5b2e26034e53199b111f1de7e50e8e4e8eb  '"$RUNNER_TEMP/prefix20.ghf" | sha256sum -c -
         cat .release7c305_runtime/chunk_* | base64 -d > "$RUNNER_TEMP/runtime.xz"
         echo '9f467fd7f70e04d387d7bf7c8455d2ecf5f4bee91ad12c7522cae3ab1d7870b6  '"$RUNNER_TEMP/runtime.xz" | sha256sum -c -
-        mkdir -p native_stage/runtime; tar -xJf "$RUNNER_TEMP/runtime.xz" -C native_stage/runtime
+        mkdir -p native_stage/runtime; cp "$RUNNER_TEMP/runtime.xz" runtime.xz; tar -xJf runtime.xz -C native_stage/runtime; rm runtime.xz
         cp "$RUNNER_TEMP/prefix20.ghf" native_stage/runtime/prefix20.ghf
         cp .release7c305_native/native_nonzero_smoke.c native_stage/
         echo EXACT_TEST_ASSETS_BOUND
