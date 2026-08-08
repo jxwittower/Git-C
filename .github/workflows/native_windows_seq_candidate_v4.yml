@@ -1,0 +1,182 @@
+name: native-windows-seq-candidate-v4
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_seq_candidate_v4.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-v4:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch encrypted V4 payload
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1svsKtH1yigBHhQwaE9nnDBcOHQ8F2KU7'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/v4.enc" "$url"
+          test -s "$RUNNER_TEMP/v4.enc"
+          sha256sum "$RUNNER_TEMP/v4.enc" | tee v4_cipher_sha.txt
+          grep -qi '^8275089fae2f8347d6bd2f4b6cd2b398c6888a9671051feb4d6bab028c31d402 ' v4_cipher_sha.txt
+
+      - name: Publish one-time RSA public key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name 'windows-dll-test-bot'
+          git config user.email 'windows-dll-test-bot@users.noreply.github.com'
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p .seq_candidate_v4_handoff
+            cp "$RUNNER_TEMP/public.pem" .seq_candidate_v4_handoff/public.pem
+            git add .seq_candidate_v4_handoff/public.pem
+            git commit -m 'Publish one-time RSA key for seq candidate v4' || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]
+
+      - name: Wait for V4 wrapped key
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1F2HgZfWosVNzqNd5X9hiPEsKDGeNlqsj'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=V4_RSA_KEY_TIMEOUT; exit 20; }
+          echo V4_RSA_KEY_ACCEPTED
+
+      - name: Decrypt and verify V4 source payload
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/v4.enc" -out "$RUNNER_TEMP/v4.zip" -pass file:"$RUNNER_TEMP/pass.txt"
+          sha256sum "$RUNNER_TEMP/v4.zip" | tee v4_plain_sha.txt
+          grep -qi '^ec5651b012137b65cf27e76924b915e56f6b58c17396d164c78099dc872f4c89 ' v4_plain_sha.txt
+          mkdir payload
+          7z x -y "$RUNNER_TEMP/v4.zip" -opayload >/dev/null
+          test -f payload/GuanHu_SigProc_V2_delivery/source/windows-x86/sigproc_rebuild_win.c
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/v4.enc" "$RUNNER_TEMP/v4.zip"
+          echo V4_PAYLOAD_VERIFIED
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build exact V4 HostCompat DLL
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/payload/GuanHu_SigProc_V2_delivery"
+          WB="$ROOT/source/windows-x86"
+          HC="$ROOT/hostcompat/GuanHu_SigProc_V2_HostCompat_20260807"
+          mkdir -p native_build runtime_test
+          CFLAGS=(-target i686-pc-windows-msvc -O2 -DSP_MINIMAL_WINDOWS -fno-stack-protector -mno-stack-arg-probe -I"$WB/winshim" -I"$WB")
+          clang "${CFLAGS[@]}" -c "$WB/sigproc_rebuild_win.c" -o native_build/core.obj
+          clang "${CFLAGS[@]}" -c "$WB/sha256_portable.c" -o native_build/sha256.obj
+          clang "${CFLAGS[@]}" -c "$HC/source/sigproc_dll_hostcompat.c" -o native_build/wrapper.obj
+          clang "${CFLAGS[@]}" -c "$HC/source/crt_abi_compat.c" -o native_build/crtcompat.obj
+          clang -target i686-pc-windows-msvc -c "$WB/arith_helpers.s" -o native_build/arith.obj
+          clang -target i686-pc-windows-msvc -c "$HC/source/kernel32_hostcompat_stubs.s" -o native_build/k32stubs.obj
+          clang -target i686-pc-windows-msvc -c "$HC/source/x87_compat.s" -o native_build/x87.obj
+          lld-link /dll /machine:x86 /safeseh:no /subsystem:windows /entry:DllMainCRTStartup@12 /base:0x10000000 /def:"$HC/source/SigProcStandalone.def" native_build/core.obj native_build/sha256.obj native_build/wrapper.obj native_build/crtcompat.obj native_build/arith.obj native_build/k32stubs.obj native_build/x87.obj kernel32.lib ucrt.lib vcruntime.lib /out:native_build/SigProcDll-64HF.dll /implib:native_build/SigProcDll-64HF.lib
+          sha256sum native_build/SigProcDll-64HF.dll | tee candidate_v4_sha.txt
+
+      - name: Native PE ABI and import gate
+        shell: cmd
+        run: |
+          dumpbin /headers native_build\SigProcDll-64HF.dll > candidate_v4_headers.txt
+          dumpbin /exports native_build\SigProcDll-64HF.dll > candidate_v4_exports.txt
+          dumpbin /imports native_build\SigProcDll-64HF.dll > candidate_v4_imports.txt
+          dumpbin /imports payload\GuanHu_SigProc_V2_delivery\hostcompat\GuanHu_SigProc_V2_HostCompat_20260807\bin\SigProcDll-64HF.dll > hostcompat_imports.txt
+          findstr /C:"machine (x86)" candidate_v4_headers.txt > nul || exit /b 40
+          findstr /C:"_SigProc_Init@8" candidate_v4_exports.txt > nul || exit /b 41
+          findstr /C:"_SigProc@24" candidate_v4_exports.txt > nul || exit /b 42
+          findstr /C:"_SigProc_Stat@0" candidate_v4_exports.txt > nul || exit /b 43
+          findstr /C:"_SigProc_Fini@0" candidate_v4_exports.txt > nul || exit /b 44
+          findstr /I /C:"ucrtbase.dll" candidate_v4_imports.txt > nul && exit /b 45 || exit /b 0
+
+      - name: Verify imports are HostCompat subset
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          function Get-Dlls($p) { $a=@(); foreach($l in Get-Content $p){ if($l -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$'){ $a += $Matches[1].ToLowerInvariant() } }; @($a|Sort-Object -Unique) }
+          $cand=Get-Dlls 'candidate_v4_imports.txt'
+          $base=Get-Dlls 'hostcompat_imports.txt'
+          $extra=@($cand|Where-Object{$_ -notin $base})
+          "CANDIDATE_IMPORTS=$($cand -join ',')" | Out-File import_subset_v4.txt
+          "BASELINE_IMPORTS=$($base -join ',')" | Add-Content import_subset_v4.txt
+          "EXTRA_IMPORTS=$($extra -join ',')" | Add-Content import_subset_v4.txt
+          if($extra.Count -ne 0){ Get-Content import_subset_v4.txt; exit 46 }
+          'IMPORT_SUBSET_PASS' | Add-Content import_subset_v4.txt
+
+      - name: Build native loader contract smoke
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/payload/GuanHu_SigProc_V2_delivery"
+          HC="$ROOT/hostcompat/GuanHu_SigProc_V2_HostCompat_20260807"
+          clang -target i686-pc-windows-msvc -O2 -fno-stack-protector -mno-stack-arg-probe -c "$HC/source/sigproc_loader_contract_smoke.c" -o native_build/smoke.obj
+          lld-link /machine:x86 /subsystem:console /entry:mainCRTStartup@0 native_build/smoke.obj kernel32.lib /out:native_build/SigProcLoaderContractSmoke.exe
+
+      - name: Execute exact loader contract on native Windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:GITHUB_WORKSPACE 'payload\GuanHu_SigProc_V2_delivery'
+          Copy-Item native_build\SigProcDll-64HF.dll runtime_test\SigProcDll-64HF.dll -Force
+          Copy-Item native_build\SigProcLoaderContractSmoke.exe runtime_test\SigProcLoaderContractSmoke.exe -Force
+          Copy-Item "$root\runtime\inner-bed\*" runtime_test\ -Force
+          Push-Location runtime_test
+          .\SigProcLoaderContractSmoke.exe 2>&1 | Tee-Object ..\loader_smoke_v4.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ exit $rc }
+          if(-not (Select-String -Path loader_smoke_v4.txt -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS')){ exit 47 }
+          'NATIVE_WINDOWS_V4_LOADLIBRARY_CONTRACT_PASS' | Out-File native_v4_gate.txt
+
+      - name: Upload V4 native evidence and exact DLL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-candidate-v4-native-evidence
+          path: |
+            native_build/SigProcDll-64HF.dll
+            candidate_v4_sha.txt
+            candidate_v4_headers.txt
+            candidate_v4_exports.txt
+            candidate_v4_imports.txt
+            hostcompat_imports.txt
+            import_subset_v4.txt
+            loader_smoke_v4.txt
+            native_v4_gate.txt
+            v4_cipher_sha.txt
+            v4_plain_sha.txt
+          if-no-files-found: ignore
+          retention-days: 7
