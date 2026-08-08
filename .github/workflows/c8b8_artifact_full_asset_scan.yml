@@ -1,0 +1,128 @@
+name: c8b8-artifact-full-asset-scan
+on:
+  push:
+    paths:
+      - '.github/workflows/c8b8_artifact_full_asset_scan.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  scan:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Enumerate and download retained candidate artifacts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force artifact_scan | Out-Null
+          $arts=@()
+          for($page=1;$page -le 10;$page++){
+            $raw=gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100&page=$page"
+            if($LASTEXITCODE -ne 0){ throw "ARTIFACT_LIST_FAIL_PAGE_$page" }
+            $obj=$raw | ConvertFrom-Json
+            if(!$obj.artifacts -or $obj.artifacts.Count -eq 0){ break }
+            $arts += $obj.artifacts
+            if($obj.artifacts.Count -lt 100){ break }
+          }
+          $arts=$arts | Where-Object { -not $_.expired -and $_.size_in_bytes -lt 120000000 }
+          "RETAINED_ARTIFACTS=$($arts.Count)" | Tee-Object artifact_scan_summary.txt
+          $arts | Select-Object id,name,size_in_bytes,@{n='run_id';e={$_.workflow_run.id}},created_at | Format-Table -AutoSize | Out-String -Width 300 | Add-Content artifact_scan_summary.txt
+
+          $cands=$arts | Where-Object { $_.name -match '(?i)(full|regress|final|seq|v4|delivery|hostcompat|windows|stackprobe|native)' } | Sort-Object id -Descending
+          "CANDIDATE_ARTIFACTS=$($cands.Count)" | Add-Content artifact_scan_summary.txt
+          foreach($a in $cands){
+            if(Test-Path SELECTED_ROOT.txt){ break }
+            $dir=Join-Path artifact_scan ([string]$a.id)
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            "TRY id=$($a.id) run=$($a.workflow_run.id) name=$($a.name) bytes=$($a.size_in_bytes)" | Tee-Object -Append artifact_scan_summary.txt
+            try {
+              gh run download ([string]$a.workflow_run.id) -n ([string]$a.name) -D $dir 2>&1 | Tee-Object -Append artifact_scan_summary.txt
+              if($LASTEXITCODE -ne 0){ continue }
+            } catch { "DOWNLOAD_EXCEPTION=$($_.Exception.Message)" | Add-Content artifact_scan_summary.txt; continue }
+            python - $dir @'
+import hashlib, os, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+BASE=os.environ['BASE_SHA']; C63=os.environ['C63_SHA']; SMOKE=os.environ['SMOKE_SHA']
+def sha(p):
+    h=hashlib.sha256()
+    with open(p,'rb') as f:
+        for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+    return h.hexdigest()
+files=[p for p in root.rglob('*') if p.is_file()]
+runners=[p for p in files if p.name.lower() in ('run_final_regression_windows.py','run_complete_regression.py','fullreg.c')]
+ghfs=[p for p in files if p.suffix.lower()=='.ghf']
+hashes={}
+for p in files:
+    if p.suffix.lower() in ('.dll','.exe'):
+        try: hashes[sha(p)]=p
+        except Exception: pass
+ok_runner=bool(runners)
+ok_base=BASE in hashes
+ok_c63=C63 in hashes
+ok_smoke=SMOKE in hashes
+meta=(f'ROOT={root.resolve()}\nFILES={len(files)}\nRUNNERS={len(runners)}\nGHF_COUNT={len(ghfs)}\n'
+      f'BASE={hashes.get(BASE,"MISSING")}\nC63={hashes.get(C63,"MISSING")}\nSMOKE={hashes.get(SMOKE,"MISSING")}\n')
+Path('LAST_SCAN_META.txt').write_text(meta)
+print(meta,end='')
+if ok_runner and ok_base and ok_c63 and len(ghfs)>=2:
+    chosen=runners[0].parent.resolve()
+    Path('SELECTED_ROOT.txt').write_text(str(chosen))
+    Path('SELECTED_META.txt').write_text(meta+f'SELECTED_RUNNER={runners[0]}\n')
+    print('COMPLETE_REGRESSION_ASSET_FOUND')
+'@
+            Get-Content LAST_SCAN_META.txt | Add-Content artifact_scan_summary.txt
+          }
+          if(Test-Path SELECTED_ROOT.txt){
+            'C8B8_COMPLETE_REGRESSION_ASSET_FOUND' | Tee-Object asset_scan_result.txt
+            Get-Content SELECTED_META.txt | Tee-Object -Append asset_scan_result.txt
+          } else {
+            'C8B8_COMPLETE_REGRESSION_ASSET_NOT_FOUND' | Tee-Object asset_scan_result.txt
+          }
+
+      - name: Commit scan result
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item artifact_scan_summary.txt evidence_summary\C8B8_ARTIFACT_SCAN.txt -Force -ErrorAction SilentlyContinue
+          Copy-Item asset_scan_result.txt evidence_summary\C8B8_ARTIFACT_SCAN_RESULT.txt -Force -ErrorAction SilentlyContinue
+          if(Test-Path SELECTED_META.txt){ Copy-Item SELECTED_META.txt evidence_summary\C8B8_ARTIFACT_SELECTED_META.txt -Force }
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/C8B8_ARTIFACT_SCAN.txt evidence_summary/C8B8_ARTIFACT_SCAN_RESULT.txt
+          if(Test-Path evidence_summary\C8B8_ARTIFACT_SELECTED_META.txt){ git add evidence_summary/C8B8_ARTIFACT_SELECTED_META.txt }
+          git commit -m "Record c8b8 complete-regression artifact scan" || exit 0
+          for($i=0;$i -lt 5;$i++){
+            git fetch origin main
+            git rebase origin/main
+            if($LASTEXITCODE -ne 0){ git rebase --abort; throw 'REBASE_FAIL' }
+            git push origin HEAD:main
+            if($LASTEXITCODE -eq 0){ exit 0 }
+            Start-Sleep -Seconds 2
+          }
+          throw 'SCAN_RESULT_PUSH_FAIL'
+
+      - name: Upload scan evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-artifact-full-asset-scan-${{ github.run_id }}
+          path: |
+            artifact_scan_summary.txt
+            asset_scan_result.txt
+            SELECTED_META.txt
+          if-no-files-found: ignore
+          retention-days: 7
