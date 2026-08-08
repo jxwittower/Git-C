@@ -38,9 +38,9 @@ jobs:
           $arts=$arts | Where-Object { -not $_.expired -and $_.size_in_bytes -lt 120000000 }
           "RETAINED_ARTIFACTS=$($arts.Count)" | Tee-Object artifact_scan_summary.txt
           $arts | Select-Object id,name,size_in_bytes,@{n='run_id';e={$_.workflow_run.id}},created_at | Format-Table -AutoSize | Out-String -Width 300 | Add-Content artifact_scan_summary.txt
-
           $cands=$arts | Where-Object { $_.name -match '(?i)(full|regress|final|seq|v4|delivery|hostcompat|windows|stackprobe|native)' } | Sort-Object id -Descending
           "CANDIDATE_ARTIFACTS=$($cands.Count)" | Add-Content artifact_scan_summary.txt
+
           foreach($a in $cands){
             if(Test-Path SELECTED_ROOT.txt){ break }
             $dir=Join-Path artifact_scan ([string]$a.id)
@@ -49,41 +49,41 @@ jobs:
             try {
               gh run download ([string]$a.workflow_run.id) -n ([string]$a.name) -D $dir 2>&1 | Tee-Object -Append artifact_scan_summary.txt
               if($LASTEXITCODE -ne 0){ continue }
-            } catch { "DOWNLOAD_EXCEPTION=$($_.Exception.Message)" | Add-Content artifact_scan_summary.txt; continue }
-            python - $dir @'
-import hashlib, os, sys
-from pathlib import Path
-root=Path(sys.argv[1])
-BASE=os.environ['BASE_SHA']; C63=os.environ['C63_SHA']; SMOKE=os.environ['SMOKE_SHA']
-def sha(p):
-    h=hashlib.sha256()
-    with open(p,'rb') as f:
-        for b in iter(lambda:f.read(1<<20),b''): h.update(b)
-    return h.hexdigest()
-files=[p for p in root.rglob('*') if p.is_file()]
-runners=[p for p in files if p.name.lower() in ('run_final_regression_windows.py','run_complete_regression.py','fullreg.c')]
-ghfs=[p for p in files if p.suffix.lower()=='.ghf']
-hashes={}
-for p in files:
-    if p.suffix.lower() in ('.dll','.exe'):
-        try: hashes[sha(p)]=p
-        except Exception: pass
-ok_runner=bool(runners)
-ok_base=BASE in hashes
-ok_c63=C63 in hashes
-ok_smoke=SMOKE in hashes
-meta=(f'ROOT={root.resolve()}\nFILES={len(files)}\nRUNNERS={len(runners)}\nGHF_COUNT={len(ghfs)}\n'
-      f'BASE={hashes.get(BASE,"MISSING")}\nC63={hashes.get(C63,"MISSING")}\nSMOKE={hashes.get(SMOKE,"MISSING")}\n')
-Path('LAST_SCAN_META.txt').write_text(meta)
-print(meta,end='')
-if ok_runner and ok_base and ok_c63 and len(ghfs)>=2:
-    chosen=runners[0].parent.resolve()
-    Path('SELECTED_ROOT.txt').write_text(str(chosen))
-    Path('SELECTED_META.txt').write_text(meta+f'SELECTED_RUNNER={runners[0]}\n')
-    print('COMPLETE_REGRESSION_ASSET_FOUND')
-'@
-            Get-Content LAST_SCAN_META.txt | Add-Content artifact_scan_summary.txt
+            } catch {
+              "DOWNLOAD_EXCEPTION=$($_.Exception.Message)" | Add-Content artifact_scan_summary.txt
+              continue
+            }
+
+            $files=Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue
+            $runners=$files | Where-Object { $_.Name -in @('run_final_regression_windows.py','run_complete_regression.py','fullreg.c') }
+            $ghfs=$files | Where-Object { $_.Extension -ieq '.ghf' }
+            $basePath='MISSING'; $c63Path='MISSING'; $smokePath='MISSING'
+            foreach($p in ($files | Where-Object { $_.Extension -in @('.dll','.exe') })){
+              try { $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } catch { continue }
+              if($h -eq $env:BASE_SHA){ $basePath=$p.FullName }
+              if($h -eq $env:C63_SHA){ $c63Path=$p.FullName }
+              if($h -eq $env:SMOKE_SHA){ $smokePath=$p.FullName }
+            }
+            $meta=@(
+              "ROOT=$((Resolve-Path $dir).Path)",
+              "FILES=$($files.Count)",
+              "RUNNERS=$($runners.Count)",
+              "GHF_COUNT=$($ghfs.Count)",
+              "BASE=$basePath",
+              "C63=$c63Path",
+              "SMOKE=$smokePath"
+            )
+            $meta | Set-Content LAST_SCAN_META.txt
+            $meta | Add-Content artifact_scan_summary.txt
+            if($runners.Count -gt 0 -and $basePath -ne 'MISSING' -and $c63Path -ne 'MISSING' -and $ghfs.Count -ge 2){
+              $selected=$runners[0].Directory.FullName
+              $selected | Set-Content SELECTED_ROOT.txt
+              $meta | Set-Content SELECTED_META.txt
+              "SELECTED_RUNNER=$($runners[0].FullName)" | Add-Content SELECTED_META.txt
+              'COMPLETE_REGRESSION_ASSET_FOUND' | Add-Content artifact_scan_summary.txt
+            }
           }
+
           if(Test-Path SELECTED_ROOT.txt){
             'C8B8_COMPLETE_REGRESSION_ASSET_FOUND' | Tee-Object asset_scan_result.txt
             Get-Content SELECTED_META.txt | Tee-Object -Append asset_scan_result.txt
