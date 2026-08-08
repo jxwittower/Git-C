@@ -1,0 +1,203 @@
+name: stackprobe-fixed-fullreg-chain-v4
+on:
+  push:
+    paths:
+      - '.github/workflows/stackprobe_fixed_fullreg_chain_v4.yml'
+      - 'evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock'
+      - 'evidence_summary/STACKPROBE_DIRECT_NONZERO_PASS.lock'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      BASE_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require native nonzero PASS and capture exact SHA
+        shell: powershell
+        run: |
+          $locks=@('evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock','evidence_summary/STACKPROBE_DIRECT_NONZERO_PASS.lock') | Where-Object {Test-Path $_}
+          if($locks.Count -eq 0){ throw 'NATIVE_NONZERO_PASS_NOT_YET_AVAILABLE' }
+          $txt=Get-Content $locks[0] -Raw
+          if($txt -notmatch 'SHA256=([0-9a-f]{64})'){ throw 'NATIVE_LOCK_SHA_MISSING' }
+          $matches[1] | Out-File native_locked_sha.txt -Encoding ascii -NoNewline
+      - name: Harvest parent and all historical regression materials
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import os,json,hashlib,zipfile,io,urllib.request,pathlib,subprocess,sys,shutil
+          R=pathlib.Path('pool');R.mkdir(exist_ok=True);BAD=os.environ['BAD_SHA'];tok=os.environ['GH_TOKEN'];repo=os.environ['GITHUB_REPOSITORY'];H={'Authorization':f'Bearer {tok}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          bad=None
+          arts=[]
+          for pg in range(1,6):
+            q=urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={pg}',headers=H)
+            with urllib.request.urlopen(q,timeout=30) as r:d=json.load(r)
+            x=d.get('artifacts',[]);arts+=x
+            if len(x)<100:break
+          arts=[a for a in arts if not a.get('expired') and a.get('size_in_bytes',0)<120_000_000]
+          # extract regression/native/final artifacts first; then enough fallback artifacts to find parent.
+          arts.sort(key=lambda a:(0 if any(k in a['name'].lower() for k in ['full','regress','final','seq','native','stack','host','delivery'])else 1,-int(a['id'])))
+          extracted=0
+          for i,a in enumerate(arts):
+            likely=any(k in a['name'].lower() for k in ['full','regress','final','seq','native','stack','host','delivery'])
+            if i>180 and not likely:continue
+            try:
+              q=urllib.request.Request(a['archive_download_url'],headers=H)
+              with urllib.request.urlopen(q,timeout=60) as r:zb=r.read()
+              z=zipfile.ZipFile(io.BytesIO(zb)); names=z.namelist()
+              interesting=likely or any(n.lower().endswith(('run_final_regression_windows.py','validate_windows_results.py','validate_seq_targets.py','.ghf')) for n in names)
+              for n in names:
+                if not n.lower().endswith('.dll'):continue
+                try:
+                  bb=z.read(n)
+                  if sha(bb)==BAD:bad=bb;interesting=True
+                except:pass
+              if interesting:
+                d=R/f"a_{a['id']}";d.mkdir(exist_ok=True);z.extractall(d);extracted+=1
+              if bad is not None and extracted>=45:break
+            except Exception as e:print('WARN',a.get('id'),str(e)[:100])
+          if bad is None:
+            # last chance: reachable raw git blobs
+            for ln in subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='ignore').splitlines():
+              oid=ln.split()[0]
+              try:
+                if subprocess.check_output(['git','cat-file','-t',oid],text=True,stderr=subprocess.DEVNULL).strip()!='blob':continue
+                sz=int(subprocess.check_output(['git','cat-file','-s',oid],text=True).strip())
+                if 100000<=sz<=5000000:
+                  bb=subprocess.check_output(['git','cat-file','-p',oid])
+                  if sha(bb)==BAD:bad=bb;break
+              except:pass
+          if bad is None:sys.exit('BAD_PARENT_NOT_FOUND')
+          pathlib.Path('bad66a.dll').write_bytes(bad)
+          print('EXTRACTED_ARTIFACT_TREES',extracted)
+          print('RUNNERS',len(list(R.rglob('run_final_regression_windows.py'))),'GHF',len(list(R.rglob('*.ghf'))))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\pool.py
+          python $env:RUNNER_TEMP\pool.py 2>&1 | Tee-Object pool_harvest.log
+      - name: Rebuild identical deterministic stackprobe fix and bind native SHA
+        shell: powershell
+        run: |
+          @'
+          import struct,hashlib,sys
+          from pathlib import Path
+          b=bytearray(Path('bad66a.dll').read_bytes());u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          def p16(o,v):struct.pack_into('<H',b,o,v)
+          def p32(o,v):struct.pack_into('<I',b,o,v)
+          A=lambda x,a:(x+a-1)//a*a;pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);opt=pe+24;s0=opt+osz;sa=u32(opt+32);fa=u32(opt+36);sh=u32(opt+60);sec=[]
+          for i in range(n):o=s0+40*i;sec.append((u32(o+8),u32(o+12),u32(o+16),u32(o+20),u32(o+36),o))
+          vs,tva,trs,trp,_,_=max((s for s in sec if s[4]&0x20000000),key=lambda s:s[2]);sites=[]
+          for x in range(trp,trp+trs-6):
+            if b[x:x+2]==b'\x81\xec':
+              z=u32(x+2)
+              if 0x1000<=z<0x100000:sites.append((x,tva+x-trp,z))
+          if len(sites)!=12:sys.exit(f'SITE_COUNT={len(sites)}')
+          chk=bytearray(b'\x51\x8d\x4c\x24\x04\x29\xc1\x19\xc0\xf7\xd0\x21\xc1\x89\xe0\x25\x00\xf0\xff\xff');loop=len(chk);chk+=b'\x39\xc1\x72\x00';jb=len(chk)-1;chk+=b'\x89\xc8\x59\x94\x8b\x00\x89\x04\x24\xc3';probe=len(chk);chk+=b'\x2d\x00\x10\x00\x00\x85\x00\xeb\x00';jm=len(chk)-1;chk[jb]=(probe-jb-1)&255;chk[jm]=(loop-jm-1)&255
+          nh=s0+40*n;rp=A(max(s[3]+s[2] for s in sec),fa);va=A(max(s[1]+max(s[0],s[2]) for s in sec),sa);pay=bytearray(b'\x90'*120)+chk;rs=A(len(pay),fa)
+          if nh+40>sh:sys.exit('NO_HEADER_ROOM')
+          if len(b)<rp+rs:b.extend(b'\0'*(rp+rs-len(b)))
+          b[rp:rp+len(pay)]=pay;cr=va+120
+          for i,(x,r,z) in enumerate(sites):tr=va+10*i;to=rp+10*i;b[to]=0xb8;struct.pack_into('<I',b,to+1,z);b[to+5]=0xe9;struct.pack_into('<i',b,to+6,cr-(tr+10));b[x]=0xe8;struct.pack_into('<i',b,x+1,tr-(r+5));b[x+5]=0x90
+          b[nh:nh+8]=b'.stkfix\0';p32(nh+8,len(pay));p32(nh+12,va);p32(nh+16,rs);p32(nh+20,rp);p32(nh+24,0);p32(nh+28,0);p16(nh+32,0);p16(nh+34,0);p32(nh+36,0x60000020);p16(pe+6,n+1);p32(opt+56,A(va+len(pay),sa));p32(opt+64,0)
+          Path('SigProcDll-64HF.dll').write_bytes(b);h=hashlib.sha256(b).hexdigest();locked=Path('native_locked_sha.txt').read_text().strip();print('BUILT',h,'LOCKED',locked)
+          if h!=locked:sys.exit('NATIVE_FULLREG_SHA_MISMATCH')
+          Path('fullreg_exact_sha.txt').write_text(h+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\rebuild.py
+          python $env:RUNNER_TEMP\rebuild.py
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Assemble richest historical regression tree and run
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import os,hashlib,shutil,re,subprocess,sys
+          P=Path('pool');C=Path('SigProcDll-64HF.dll');cur=hashlib.sha256(C.read_bytes()).hexdigest();BASE=os.environ['BASE_SHA'];C63=os.environ['C63_SHA'];SM=os.environ['SMOKE_SHA'];BAD=os.environ['BAD_SHA']
+          def sha(p):
+            try:return hashlib.sha256(p.read_bytes()).hexdigest()
+            except:return ''
+          runners=list(P.rglob('run_final_regression_windows.py'))
+          if not runners:sys.exit('FULLREG_RUNNER_NOT_FOUND_IN_ARTIFACT_POOL')
+          # Score each runner's artifact tree.
+          choices=[]
+          for r in runners:
+            root=r
+            while root.parent!=P and not root.name.startswith('a_'):root=root.parent
+            tree=root if root.name.startswith('a_') else r.parent
+            fs=[p for p in tree.rglob('*') if p.is_file()];hs={sha(p) for p in fs if p.suffix.lower() in ('.dll','.exe')};gh=sum(p.suffix.lower()=='.ghf' for p in fs)
+            choices.append((gh+100*(BASE in hs)+100*(C63 in hs)+50*(SM in hs),r,tree))
+          choices.sort(reverse=True,key=lambda x:x[0]);score,runner,tree=choices[0];dst=Path(os.environ['RUNNER_TEMP'])/'regroot';shutil.rmtree(dst,ignore_errors=True);shutil.copytree(tree,dst)
+          # Supplement references, GHF, validators and runtime assets from the entire pool.
+          sup=dst/'_supplement';sup.mkdir(exist_ok=True)
+          wanted_names={'filter_brth','filter_hrt3','file_sig','file_bed_model_v1','validate_windows_results.py','validate_seq_targets.py'}
+          seen=set()
+          for p in P.rglob('*'):
+            if not p.is_file():continue
+            h=sha(p) if p.suffix.lower() in ('.dll','.exe') else ''
+            if p.suffix.lower()=='.ghf' or p.name.lower() in wanted_names or h in (BASE,C63,SM):
+              key=(p.name,p.stat().st_size,h)
+              if key in seen:continue
+              seen.add(key);q=sup/f'{len(seen):04d}_{p.name}';shutil.copy2(p,q)
+          # Replace only known candidate hashes/names; preserve reference DLLs.
+          oldcand={BAD,'8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326','53125ffb964fead6f113b602bbd5e2c21ba40987b6061ef2ae74fdfbbe3524c7'}
+          rep=0
+          for p in dst.rglob('*.dll'):
+            h=sha(p)
+            if h in oldcand or (p.name.lower()=='sigprocdll-64hf.dll' and h not in (BASE,C63)):
+              shutil.copy2(C,p);rep+=1
+          if rep==0:shutil.copy2(C,dst/'SigProcDll-64HF.dll')
+          # Textual lock/path rebinding, deliberately limited to known candidate SHAs.
+          win=str(dst).replace('\\','/')
+          for p in dst.rglob('*'):
+            if not p.is_file() or p.suffix.lower() not in ('.py','.txt','.json','.ps1','.cmd','.bat'):continue
+            try:t=p.read_text(encoding='utf-8',errors='ignore')
+            except:continue
+            u=t.replace('/mnt/data',win)
+            for h in oldcand:u=u.replace(h,cur)
+            if u!=t:p.write_text(u,encoding='utf-8')
+          rr=next(dst.rglob('run_final_regression_windows.py'));print('RUNNER',rr,'SCORE',score,'GHF_TOTAL',len(list(dst.rglob('*.ghf'))),'REPLACED',rep)
+          proc=subprocess.run([sys.executable,str(rr)],cwd=str(rr.parent),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+          Path('fullreg_exact.log').write_text(proc.stdout,encoding='utf-8',errors='ignore');print(proc.stdout)
+          if proc.returncode:sys.exit(proc.returncode)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\full.py
+          python $env:RUNNER_TEMP\full.py 2>&1 | Tee-Object fullreg_wrapper.log
+      - name: Hard enforce complete regression evidence
+        shell: powershell
+        run: |
+          $t=Get-Content fullreg_exact.log -Raw
+          if($t -notmatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS'){throw 'SEQ_TARGET_PASS_MISSING'}
+          foreach($x in @('2000','20000','determin','performance','inner','outer','C63','HostCompat')){if($t -notmatch [regex]::Escape($x)){throw "FULLREG_REQUIRED_MARKER_MISSING:$x"}}
+          $sha=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($sha -ne (Get-Content native_locked_sha.txt -Raw).Trim()){throw 'POST_FULLREG_SHA_MISMATCH'}
+          "STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS SHA256=$sha`nSEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS"|Out-File STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock -Encoding ascii
+      - name: Commit exact full-regression PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          $sha=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch origin main;git checkout -B main origin/main;New-Item -ItemType Directory -Force evidence_summary|Out-Null;"STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS SHA256=$sha`nSEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS"|Out-File evidence_summary/STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock -Encoding ascii;git add evidence_summary/STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock;git commit -m 'Record exact stackprobe full regression PASS';git push origin HEAD:main
+      - name: Upload exact tested DLL and complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackprobe-fixed-complete-fullreg-${{ github.run_id }}
+          path: |
+            SigProcDll-64HF.dll
+            native_locked_sha.txt
+            fullreg_exact_sha.txt
+            pool_harvest.log
+            fullreg_exact.log
+            fullreg_wrapper.log
+            STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 7
