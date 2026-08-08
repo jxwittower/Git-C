@@ -13,7 +13,6 @@ defaults:
 env:
   BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
   FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
-  KEY_BRIDGE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
   PAYLOAD9_REF: 50389db4873509be1507a40f7a86d68dbf48b6c3
 
 jobs:
@@ -68,23 +67,25 @@ jobs:
           test "$ok" = 1
           echo PAYLOAD9_MULTI_RSA_PUBLIC_KEY_PUBLISHED
 
-      - name: Receive RSA-wrapped password candidate bundle
+      - name: Receive RSA-wrapped password candidates from GitHub handoff
         run: |
           set -euo pipefail
-          url="https://drive.google.com/uc?export=download&id=$KEY_BRIDGE_ID"
           ok=0
           for i in $(seq 1 600); do
-            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/candidates.try"
-            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
-              sz=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
-              if [ "$sz" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/candidates.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
-                if test -s "$RUNNER_TEMP/candidates.try"; then mv "$RUNNER_TEMP/candidates.try" "$RUNNER_TEMP/pass_candidates.txt"; ok=1; break; fi
+            rm -f "$RUNNER_TEMP/wrapped.b64" "$RUNNER_TEMP/wrapped.bin" "$RUNNER_TEMP/candidates.try"
+            git fetch -q origin main || true
+            if git show origin/main:.native7c305_p9_handoff/wrapped.bin.b64 > "$RUNNER_TEMP/wrapped.b64" 2>/dev/null; then
+              if base64 -d "$RUNNER_TEMP/wrapped.b64" > "$RUNNER_TEMP/wrapped.bin" 2>/dev/null; then
+                sz=$(wc -c < "$RUNNER_TEMP/wrapped.bin" | tr -d '[:space:]')
+                if [ "$sz" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/wrapped.bin" -out "$RUNNER_TEMP/candidates.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  if test -s "$RUNNER_TEMP/candidates.try"; then mv "$RUNNER_TEMP/candidates.try" "$RUNNER_TEMP/pass_candidates.txt"; ok=1; break; fi
+                fi
               fi
             fi
             sleep 2
           done
-          test "$ok" = 1 || { echo FAIL_STAGE=P9_MULTIKEY_PUBLIC_BRIDGE; exit 20; }
-          echo PAYLOAD9_MULTIKEY_HANDOFF_PASS
+          test "$ok" = 1 || { echo FAIL_STAGE=P9_GITHUB_RSA_HANDOFF; exit 20; }
+          echo PAYLOAD9_GITHUB_RSA_HANDOFF_PASS
 
       - name: Recover exact revoked base and native assets with candidate passwords
         shell: powershell
