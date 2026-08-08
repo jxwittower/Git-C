@@ -1,0 +1,20 @@
+name: test-drive-gdown-v4
+on:
+  push:
+    paths:
+      - '.github/workflows/test_drive_gdown_v4.yml'
+jobs:
+  fetch:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch encrypted small V4 payload with gdown
+        shell: powershell
+        run: |
+          python -m pip install --disable-pip-version-check -q gdown
+          python -m gdown 'https://drive.google.com/uc?id=1KAWO5bi3ks-neguoLUzwX1YkeSZfKO8e' -O "$env:RUNNER_TEMP\v4small.enc"
+          Get-Item "$env:RUNNER_TEMP\v4small.enc" | Format-List Length
+          $h=(Get-FileHash "$env:RUNNER_TEMP\v4small.enc" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "SHA256=$h"
+          if($h -ne '117185bc864ce05849acab5ae4d812668140df594d2f9ec1278604597ce54bd3'){ throw 'HASH_MISMATCH' }
+          Write-Host V4_GDOWN_TRANSPORT_PASS
