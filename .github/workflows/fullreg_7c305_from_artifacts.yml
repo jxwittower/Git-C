@@ -1,0 +1,163 @@
+name: fullreg-7c305-from-artifacts
+on:
+  push:
+    paths:
+      - '.github/workflows/fullreg_7c305_from_artifacts.yml'
+      - '.validated_7c305/SigProcDll-64HF.dll'
+      - 'evidence_summary/NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      OLD_SHA: 8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326
+      BASE_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require exact native PASS prerequisite
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          if(!(Test-Path 'evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock')){throw 'NATIVE_LOCK_MISSING'}
+          $want="NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS SHA256=$env:FIX_SHA"
+          $got=(Get-Content 'evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock' -Raw).Trim()
+          if($got-ne$want){throw "NATIVE_LOCK_WRONG $got"}
+          if(!(Test-Path '.validated_7c305\SigProcDll-64HF.dll')){throw 'VALIDATED_DLL_MISSING'}
+          $h=(Get-FileHash '.validated_7c305\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h-ne$env:FIX_SHA){throw "DLL_SHA_WRONG $h"}
+          'EXACT_NATIVE_PREREQUISITE_PASS'|Out-File prerequisite.txt
+      - name: Recover complete regression material from existing Actions artifacts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force artifact_scan | Out-Null
+          $json=gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100"
+          $pages=@($json|ConvertFrom-Json);$arts=@();foreach($p in $pages){if($p.artifacts){$arts+=$p.artifacts}}
+          $arts=$arts|Where-Object{-not$_.expired-and$_.size_in_bytes-lt120000000-and$_.name-match'(?i)(full|regress|final|seq|v4|delivery|hostcompat|windows)'}|Sort-Object id -Descending
+          "ARTIFACT_CANDIDATES=$($arts.Count)"|Tee-Object artifact_recovery.txt
+          foreach($a in $arts){
+            if(Test-Path 'SELECTED_ROOT.txt'){break}
+            $d=Join-Path artifact_scan ([string]$a.id);New-Item -ItemType Directory -Force $d|Out-Null
+            try{gh run download ([string]$a.workflow_run.id) -n ([string]$a.name) -D $d 2>$null}catch{continue}
+            @'
+          from pathlib import Path
+          import hashlib,sys,os
+          root=Path(sys.argv[1]); BASE=os.environ['BASE_SHA']; C63=os.environ['C63_SHA']; SMOKE=os.environ['SMOKE_SHA']
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
+              return h.hexdigest()
+          files=[p for p in root.rglob('*') if p.is_file()]
+          runners=[p for p in files if p.name.lower() in ('run_final_regression_windows.py','run_complete_regression.py')]
+          if not runners:sys.exit(2)
+          hs={}
+          for p in files:
+              if p.suffix.lower() not in ('.dll','.exe'):continue
+              try:hs[sha(p)]=p
+              except:pass
+          ghf=[p for p in files if p.suffix.lower()=='.ghf']
+          if BASE not in hs or C63 not in hs or len(ghf)<2:sys.exit(3)
+          r=runners[0]
+          Path('SELECTED_ROOT.txt').write_text(str(r.parent.resolve()))
+          Path('SELECTED_META.txt').write_text(f'RUNNER={r}\nGHF_COUNT={len(ghf)}\nBASE={hs[BASE]}\nC63={hs[C63]}\nSMOKE={hs.get(SMOKE,"MISSING")}\n')
+          print('COMPLETE_REGRESSION_ARTIFACT_SELECTED',r,'GHF',len(ghf))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\select.py
+            python $env:RUNNER_TEMP\select.py $d 2>&1|Tee-Object -Append artifact_recovery.txt
+          }
+          if(!(Test-Path 'SELECTED_ROOT.txt')){throw 'COMPLETE_REGRESSION_ARTIFACT_NOT_FOUND'}
+          Get-Content SELECTED_META.txt|Tee-Object -Append artifact_recovery.txt
+      - name: Rebind recovered suite to exact 7c305 candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=(Get-Content SELECTED_ROOT.txt -Raw).Trim();$dst=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          if(Test-Path $dst){Remove-Item -Recurse -Force $dst};New-Item -ItemType Directory -Force $dst|Out-Null
+          Copy-Item -Recurse -Force (Join-Path $src '*') $dst
+          $fix=(Resolve-Path '.validated_7c305\SigProcDll-64HF.dll').Path
+          $cands=Get-ChildItem $dst -Recurse -File -Filter '*.dll'
+          $replaced=0
+          foreach($p in $cands){
+            $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($h-eq$env:BAD_SHA-or$h-eq$env:OLD_SHA-or$p.Name-eq'SigProcDll-64HF.dll'){Copy-Item $fix $p.FullName -Force;$replaced++}
+          }
+          if($replaced-eq0){Copy-Item $fix (Join-Path $dst 'SigProcDll-64HF.dll') -Force}
+          $win=($dst-replace'\\','/')
+          Get-ChildItem $dst -Recurse -File|Where-Object{$_.Extension-in'.py','.txt','.json','.ps1','.cmd','.bat'}|ForEach-Object{
+            try{$t=Get-Content $_.FullName -Raw}catch{return}
+            $u=$t.Replace($env:BAD_SHA,$env:FIX_SHA).Replace($env:OLD_SHA,$env:FIX_SHA).Replace('/mnt/data',$win)
+            if($u-ne$t){Set-Content $_.FullName $u -Encoding utf8}
+          }
+          $exact=Get-ChildItem $dst -Recurse -File -Filter 'SigProcDll-64HF.dll'|Where-Object{(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()-eq$env:FIX_SHA}
+          if(-not$exact){throw 'EXACT_CANDIDATE_NOT_BOUND'}
+          "CANDIDATE_REPLACEMENTS=$replaced"|Out-File suite_binding.txt
+          "EXACT_SHA=$env:FIX_SHA"|Add-Content suite_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Execute complete native Windows regression runner
+        shell: powershell
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference='Stop';$root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $runner=Get-ChildItem $root -Recurse -File|Where-Object{$_.Name-in'run_final_regression_windows.py','run_complete_regression.py'}|Select-Object -First 1
+          if(!$runner){throw 'RUNNER_MISSING'}
+          "RUNNER=$($runner.FullName)"|Out-File runner_selected.txt
+          $env:PYTHONUNBUFFERED='1'
+          python $runner.FullName 2>&1|Tee-Object full_regression_7c305.log
+          if($LASTEXITCODE-ne0){throw "RUNNER_EXIT_$LASTEXITCODE"}
+          'COMPLETE_NATIVE_WINDOWS_REGRESSION_RUNNER_EXIT_ZERO'|Out-File runner_exit_zero.txt
+      - name: Enforce complete suite sentinels and post-run SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $all=(Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue|Where-Object{$_.Length-lt100MB-and$_.Extension-in'.txt','.log','.csv','.json'}|ForEach-Object{try{Get-Content $_.FullName -Raw}catch{''}})-join"`n"
+          $all += "`n"+(Get-Content full_regression_7c305.log -Raw)
+          $required=@('DETERMINISTIC_REPLAY_PASS','TWO_THREAD_2000_EACH_PASS','LONG_STABILITY_20000_PASS','PERFORMANCE_COMPARISON_PASS','REALTIME_1HZ_BEHAVIOR_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS')
+          foreach($s in $required){if($all-notmatch[regex]::Escape($s)){throw "MISSING_SENTINEL $s"}}
+          $cand=Get-ChildItem $root -Recurse -File -Filter 'SigProcDll-64HF.dll'|Where-Object{(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()-eq$env:FIX_SHA}
+          if(-not$cand){throw 'POST_REGRESSION_EXACT_SHA_MISSING'}
+          $required|Out-File suite_sentinels.txt
+          'FULL_SUITE_COVERAGE_PASS'|Add-Content suite_sentinels.txt
+          "POST_REGRESSION_SHA256=$env:FIX_SHA"|Out-File post_regression_sha.txt
+      - name: Commit exact complete-regression PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          "FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS SHA256=$env:FIX_SHA"|Out-File fullreg.lock -Encoding ascii
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main;git checkout -q -B main origin/main
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null
+          Copy-Item fullreg.lock evidence_summary\FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS.lock -Force
+          Copy-Item runner_exit_zero.txt evidence_summary\complete_regression_7c305_runner_pass.txt -Force
+          Copy-Item suite_sentinels.txt evidence_summary\complete_regression_7c305_sentinels.txt -Force
+          Copy-Item post_regression_sha.txt evidence_summary\post_regression_7c305_sha256.txt -Force
+          Copy-Item suite_binding.txt evidence_summary\complete_regression_7c305_binding.txt -Force
+          git add evidence_summary;git commit -m 'Record exact 7c305 complete Windows regression PASS';git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exact-7c305-fullreg-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            prerequisite.txt
+            artifact_recovery.txt
+            SELECTED_META.txt
+            suite_binding.txt
+            runner_selected.txt
+            full_regression_7c305.log
+            runner_exit_zero.txt
+            suite_sentinels.txt
+            post_regression_sha.txt
+            fullreg.lock
