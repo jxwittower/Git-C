@@ -1,0 +1,257 @@
+name: native-7c305-exact-blob-gate
+on:
+  push:
+    paths:
+      - '.github/workflows/native_7c305_exact_blob_gate.yml'
+permissions:
+  contents: write
+
+env:
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+  ENC_SHA: b2b22b64b1aa95353ef4cd488346b38bc766abd31db2068b0150e150e9eb0ff4
+  XZ_SHA: c253704f88391d694dc4473cb1698f4473c0b2dd2f5b8e76dc9b9981650a8399
+
+jobs:
+  native-exact:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct exact encrypted payload from immutable Git blobs
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import os,json,base64,urllib.request,hashlib,pathlib
+          shas='''
+          d5053a862ccf7c245314bb2c2733b0fb262614eb
+          ec84caa07134e3e108b19537d064b9b78a92e1e6
+          43ae3532e3de9050d25537c0ae06841f938cf85b
+          9a2d278bd9219b303b0e9be67376634f5ea3add4
+          d78d42f3b9143d2f7d30746743eca41fb3669ccc
+          7911a8147fc5bc50bc62041d012d1fbd5b6dd796
+          e3fb65a316cb2e20b3bf9109ba5abfa31e4ff38b
+          385ace944b9c2cc280af9d595eeb254072c396f3
+          e80651ee4887ab0006ef8dd065f8bde825bceecf
+          8716dfd017d359023dcb28150688b4b116bf645f
+          f237e973641e2d2c260f88667f3cece9cb49184b
+          9bfac9769fc8c28f22d65e5c6a07202b1439dd3c
+          dbc5e164436686dcc3aae4db3d9e9ced5e844eb1
+          8bd8363752d42c28152b8ff5add2adfda9f062b5
+          b0b4dd42f0fbb7a2bced7d243e3034e40a4b5d95
+          57d0716871d6ce820cc45acad9284dacbcac8042
+          fec4d6d8408d54af8c2e514e71f53a0a2f6ac00e
+          60b9eb4a6fb8efdfa4a6a0b5201fd5416cc84fc3
+          088e43698ea2f5afb822736252db43573d23540c
+          c32dffcfc200a0bcf85af118ccb35b99d4fd862e
+          '''.split()
+          repo=os.environ['GITHUB_REPOSITORY']; token=os.environ['GH_TOKEN']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          chunks=[]
+          for i,sha in enumerate(shas):
+              req=urllib.request.Request(f'https://api.github.com/repos/{repo}/git/blobs/{sha}',headers=headers)
+              with urllib.request.urlopen(req,timeout=30) as r: d=json.load(r)
+              raw=base64.b64decode(d['content'])
+              gitsha=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
+              if gitsha!=sha: raise SystemExit(f'BLOB_SHA_MISMATCH index={i} got={gitsha} want={sha}')
+              chunks.append(raw)
+          b64=b''.join(chunks)
+          pathlib.Path('reconstructed_payload.b64').write_bytes(b64)
+          enc=base64.b64decode(b64,validate=True)
+          pathlib.Path(os.environ['RUNNER_TEMP'],'native_repo_payload.enc').write_bytes(enc)
+          h=hashlib.sha256(enc).hexdigest()
+          pathlib.Path('blob_reconstruction.txt').write_text(f'BLOB_COUNT={len(shas)}\nB64_BYTES={len(b64)}\nENC_SHA256={h}\n')
+          if h!=os.environ['ENC_SHA']: raise SystemExit(f'ENC_SHA_MISMATCH {h}')
+          print('EXACT_GIT_BLOB_PAYLOAD_RECONSTRUCTION_PASS',h)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\rebuild.py
+          python $env:RUNNER_TEMP\rebuild.py
+
+      - name: Publish one-time RSA public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .native7c305_blobgate_handoff
+            mkdir -p .native7c305_blobgate_handoff
+            cp "$RUNNER_TEMP/public.pem" .native7c305_blobgate_handoff/public.pem
+            printf '%s\n' "$FIX_SHA" > .native7c305_blobgate_handoff/target_sha256.txt
+            printf '%s\n' "$ENC_SHA" > .native7c305_blobgate_handoff/cipher_sha256.txt
+            git add .native7c305_blobgate_handoff
+            git commit -qm 'Publish exact 7c305 blob-gate RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo EXACT_BLOB_GATE_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Receive RSA-wrapped payload password
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://raw.githubusercontent.com/jxwittower/Git-C/main/.native7c305_blobgate_handoff/wrapped.bin.b64'
+          ok=0
+          for i in $(seq 1 900); do
+            rm -f "$RUNNER_TEMP/w.b64" "$RUNNER_TEMP/w.bin" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -H 'Cache-Control: no-cache' -o "$RUNNER_TEMP/w.b64" "${url}?run=${GITHUB_RUN_ID}&i=${i}"; then
+              if base64 -d "$RUNNER_TEMP/w.b64" > "$RUNNER_TEMP/w.bin" 2>/dev/null; then
+                sz=$(wc -c < "$RUNNER_TEMP/w.bin" | tr -d '[:space:]')
+                if [ "$sz" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/w.bin" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  test -s "$RUNNER_TEMP/pass.try" && { mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"; ok=1; break; }
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=BLOB_GATE_RSA_HANDOFF; exit 20; }
+          echo EXACT_BLOB_GATE_RSA_HANDOFF_PASS
+
+      - name: Decrypt and bind exact native package
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $enc=Join-Path $env:RUNNER_TEMP 'native_repo_payload.enc'
+          $xz=Join-Path $env:RUNNER_TEMP 'native_repo_payload.tar.xz'
+          & openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in $enc -out $xz -pass "file:$env:RUNNER_TEMP\pass.txt"
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAILED'}
+          $xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($xh -ne $env:XZ_SHA){throw "XZ_SHA_MISMATCH $xh"}
+          New-Item -ItemType Directory -Force native_stage | Out-Null
+          tar -xJf $xz -C native_stage
+          if($LASTEXITCODE -ne 0){throw 'TAR_EXTRACT_FAILED'}
+          $dll=Get-ChildItem native_stage -Recurse -Filter 'SigProcDll-64HF.dll' | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:FIX_SHA } | Select-Object -First 1
+          if(!$dll){throw 'EXACT_7C305_DLL_NOT_FOUND'}
+          $src=Get-ChildItem native_stage -Recurse -Filter 'native_nonzero_smoke.c' | Select-Object -First 1
+          $ghf=Get-ChildItem native_stage -Recurse -Filter '*.ghf' | Select-Object -First 1
+          if(!$src -or !$ghf){throw 'NATIVE_TEST_ASSETS_MISSING'}
+          $dll.FullName | Out-File -Encoding ascii exact_dll_path.txt
+          $src.FullName | Out-File -Encoding ascii exact_src_path.txt
+          $ghf.FullName | Out-File -Encoding ascii exact_ghf_path.txt
+          "XZ_SHA256=$xh`nDLL_SHA256=$env:FIX_SHA`nDLL=$($dll.FullName)`nSRC=$($src.FullName)`nGHF=$($ghf.FullName)" | Out-File package_binding.txt
+          Write-Host EXACT_7C305_PACKAGE_BIND_PASS
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI import stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Get-Content exact_dll_path.txt -Raw).Trim()
+          dumpbin /headers $dll | Out-File native_headers.txt
+          dumpbin /exports $dll | Out-File native_exports.txt
+          dumpbin /imports $dll | Out-File native_imports.txt
+          $hdr=Get-Content native_headers.txt -Raw; $exp=Get-Content native_exports.txt -Raw; $imp=Get-Content native_imports.txt -Raw
+          if($hdr -notmatch '14C machine' -and $hdr -notmatch 'machine \(x86\)'){throw 'NOT_X86'}
+          if($hdr -notmatch '\.stkfix'){throw 'STACKFIX_SECTION_MISSING'}
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if($exp -notmatch [regex]::Escape($e)){throw "MISSING_EXPORT $e"}}
+          if($imp -match '(?im)^\s*ucrtbase\.dll\s*$'){throw 'DIRECT_UCRTBASE_IMPORT_FORBIDDEN'}
+          if((Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:FIX_SHA){throw 'PRE_DYNAMIC_SHA_DRIFT'}
+          'EXACT_7C305_PE_ABI_IMPORT_STACKFIX_PASS' | Out-File native_static_gate.txt
+
+      - name: Compile and execute real nonzero native path twice
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Get-Content exact_dll_path.txt -Raw).Trim()
+          $src=(Get-Content exact_src_path.txt -Raw).Trim()
+          $ghf=(Get-Content exact_ghf_path.txt -Raw).Trim()
+          $work=Split-Path $dll -Parent
+          $exe=Join-Path $env:RUNNER_TEMP 'native_nonzero_smoke.exe'
+          cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS $src /Fe:$exe 2>&1 | Tee-Object native_compile.txt
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_HOST_COMPILE_FAILED'}
+          Push-Location $work
+          try {
+            & $exe $dll $ghf 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero_first.log"
+            $r1=$LASTEXITCODE
+            & $exe $dll $ghf 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero_repeat.log"
+            $r2=$LASTEXITCODE
+          } finally { Pop-Location }
+          if($r1 -ne 0){throw "FIRST_NATIVE_NONZERO_EXIT_$r1"}
+          if($r2 -ne 0){throw "REPEAT_NATIVE_NONZERO_EXIT_$r2"}
+          $t1=Get-Content native_nonzero_first.log -Raw; $t2=Get-Content native_nonzero_repeat.log -Raw
+          if($t1 -notmatch '(?i)PASS'){throw 'FIRST_PASS_SENTINEL_MISSING'}
+          if($t2 -notmatch '(?i)PASS'){throw 'REPEAT_PASS_SENTINEL_MISSING'}
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FIX_SHA){throw 'POST_DYNAMIC_SHA_DRIFT'}
+          "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$h" | Out-File exact_native_pass.lock
+          'REAL_NONZERO_WINDOWS_X86_FRESH_PROCESS_REPEAT_PASS' | Out-File native_dynamic_gate.txt
+
+      - name: Commit exact native PASS lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$FIX_SHA" exact_native_pass.lock
+          cp exact_native_pass.lock "$RUNNER_TEMP/lock"
+          cp native_static_gate.txt "$RUNNER_TEMP/static"
+          cp native_dynamic_gate.txt "$RUNNER_TEMP/dynamic"
+          cp package_binding.txt "$RUNNER_TEMP/binding"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock
+            cp "$RUNNER_TEMP/static" evidence_summary/stackprobe_7c305_native_static_gate.txt
+            cp "$RUNNER_TEMP/dynamic" evidence_summary/stackprobe_7c305_native_dynamic_gate.txt
+            cp "$RUNNER_TEMP/binding" evidence_summary/stackprobe_7c305_package_binding.txt
+            git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock evidence_summary/stackprobe_7c305_native_static_gate.txt evidence_summary/stackprobe_7c305_native_dynamic_gate.txt evidence_summary/stackprobe_7c305_package_binding.txt
+            git commit -qm 'PASS exact 7c305 native Windows nonzero gate' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo EXACT_7C305_NATIVE_PASS_LOCK_COMMITTED
+
+      - name: Upload exact tested DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-7c305-native-blob-gate
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            native_stage/**/SigProcDll-64HF.dll
+            blob_reconstruction.txt
+            package_binding.txt
+            native_headers.txt
+            native_exports.txt
+            native_imports.txt
+            native_static_gate.txt
+            native_dynamic_gate.txt
+            exact_native_pass.lock
+            native_nonzero_first.log
+            native_nonzero_repeat.log
+
+      - name: Remove one-time RSA handoff
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git fetch -q origin main
+          git checkout -q -B main origin/main
+          if test -d .native7c305_blobgate_handoff; then
+            git config user.name windows-dll-test-bot
+            git config user.email windows-dll-test-bot@users.noreply.github.com
+            git rm -r -q .native7c305_blobgate_handoff
+            git commit -qm 'Remove exact 7c305 blob-gate RSA handoff'
+            git push -q origin HEAD:main
+          fi
+          true
