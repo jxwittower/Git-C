@@ -24,7 +24,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -L --fail --retry 5 --retry-delay 2 -o fixed.xz 'https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          python -m pip install -q gdown
+          gdown --id '1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov' -O fixed.xz
+          echo "DOWNLOADED_BYTES=$(wc -c < fixed.xz) SHA=$(sha256sum fixed.xz|awk '{print $1}')"
           test "$(sha256sum fixed.xz|awk '{print $1}')" = "$XZ_SHA"
           xz -dc fixed.xz > SigProcDll-64HF.dll
           test "$(sha256sum SigProcDll-64HF.dll|awk '{print $1}')" = "$FIX_SHA"
@@ -46,7 +48,7 @@ jobs:
           with tarfile.open(fileobj=io.BytesIO(raw),mode='r:*') as t:t.extractall(out)
           print('RUNTIME_FILES',sum(1 for x in out.rglob('*') if x.is_file()))
           '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\u.py
-          python $env:RUNNER_TEMP\u.py | Tee-Object runtime_expand.txt
+          python $env:RUNNER_TEMP\u.py
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
@@ -65,8 +67,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference='Stop';$ghf=(Resolve-Path 'a\ghf\real.ghf').Path;$dll=(Resolve-Path '.\SigProcDll-64HF.dll').Path
-          $dirs=Get-ChildItem a\rt\u -Directory -Recurse|Where-Object{(Test-Path(Join-Path $_.FullName 'filter_brth'))-and(Test-Path(Join-Path $_.FullName 'filter_hrt3'))-and(Test-Path(Join-Path $_.FullName 'file_sig')}
-          if(-not$dirs){throw 'NO_RUNTIME'};$n=0
+          $dirs=Get-ChildItem a\rt\u -Directory -Recurse|Where-Object{(Test-Path(Join-Path $_.FullName 'filter_brth'))-and(Test-Path(Join-Path $_.FullName 'filter_hrt3'))-and(Test-Path(Join-Path $_.FullName 'file_sig')};if(-not$dirs){throw 'NO_RUNTIME'};$n=0
           foreach($d in $dirs){$n++;$root=Join-Path $PWD "env$n";$rt=Join-Path $root runtime;New-Item -ItemType Directory -Force $rt|Out-Null;Copy-Item $dll (Join-Path $root 'SigProcDll-64HF.dll');Copy-Item (Join-Path $d.FullName '*') $rt -Recurse -Force;.\smoke.exe $rt $ghf 2>&1|Tee-Object "real_$n.txt";if($LASTEXITCODE-ne0){throw "REAL $n"};if(-not(Select-String "real_$n.txt" -SimpleMatch 'NONZERO_NATIVE_SMOKE_PASS' -Quiet)){throw 'SENTINEL'}}
           $rt=(Resolve-Path 'env1\runtime').Path;1..20|%{.\smoke.exe $rt $ghf *> "rep_$_.txt";if($LASTEXITCODE-ne0){throw "REPEAT $_"}}
           "REAL_RUNTIME_COUNT=$n"|Out-File native_runtime_count.txt;'NATIVE_REAL_GHF_REPEAT20_PASS'|Out-File native_dynamic_pass.txt
