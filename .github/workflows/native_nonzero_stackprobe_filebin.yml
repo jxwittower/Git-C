@@ -1,0 +1,184 @@
+name: native-nonzero-stackprobe-filebin
+on:
+  push:
+    branches: [stackprobe-native-nonzero-20260808a]
+    paths:
+      - '.github/workflows/native_nonzero_stackprobe_filebin.yml'
+permissions:
+  contents: read
+jobs:
+  native-nonzero:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      PAYLOAD_URL: https://filebin.net/ghstackfix7c305-20260808-1832-a73f9c21/native_payload.tar.xz.enc
+      PUBLIC_KEY_URL: https://filebin.net/ghstackfix7c305-handshake-20260808-b91e52d7/public.pem
+      WRAPPED_KEY_URL: https://filebin.net/ghstackfix7c305-handshake-20260808-b91e52d7/key.enc
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      GHF_SHA: 721a76e73a790829ac145e3cece90e045ed9ef6ae948dc45e636b165e179340d
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download AES ciphertext payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 4 --retry-delay 2 --max-time 120 -o "$RUNNER_TEMP/native_payload.enc" "$PAYLOAD_URL"
+          test -s "$RUNNER_TEMP/native_payload.enc"
+          echo PAYLOAD_CIPHERTEXT_DOWNLOAD_PASS
+
+      - name: Generate ephemeral RSA key and publish only public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/native_private.pem"
+          openssl pkey -in "$RUNNER_TEMP/native_private.pem" -pubout -out "$RUNNER_TEMP/native_public.pem"
+          curl -fsS --max-time 60 -X POST -H 'Content-Type: application/octet-stream' --data-binary @"$RUNNER_TEMP/native_public.pem" "$PUBLIC_KEY_URL" > "$RUNNER_TEMP/pub_upload_response.txt"
+          echo EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for RSA-OAEP wrapped AES password
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 450); do
+            if curl -L -fsS --max-time 15 "$WRAPPED_KEY_URL" -o "$RUNNER_TEMP/key.try" 2>/dev/null; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/native_private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=RSA_FILEBIN_HANDOFF; exit 20; }
+          echo RSA_FILEBIN_HANDOFF_PASS
+
+      - name: Decrypt and bind exact binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/native_payload.enc" -out "$RUNNER_TEMP/native_payload.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          python - <<'PY'
+          import os, tarfile, hashlib, pathlib, sys
+          temp=pathlib.Path(os.environ['RUNNER_TEMP'])
+          out=pathlib.Path('native_payload'); out.mkdir(exist_ok=True)
+          with tarfile.open(temp/'native_payload.tar.xz','r:xz') as t: t.extractall(out)
+          root=out/'payload'
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+              return h.hexdigest()
+          checks=[
+            (root/'SigProcDll-crashing-66a44.dll',os.environ['BAD_SHA']),
+            (root/'SigProcDll-stackfix-7c305.dll',os.environ['FIX_SHA']),
+            (root/'inner_oneframe.ghf',os.environ['GHF_SHA'])]
+          for p,want in checks:
+              got=sha(p); print(p.name,got)
+              if got.lower()!=want.lower(): sys.exit('EXACT_SHA_BINDING_FAIL '+p.name)
+          print('EXACT_BINARY_SHA_BINDING_PASS')
+          PY
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Audit PE32 ABI and imports
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $fix='native_payload\payload\SigProcDll-stackfix-7c305.dll'
+          dumpbin /headers $fix | Out-File pe_headers.txt
+          dumpbin /exports $fix | Out-File pe_exports.txt
+          dumpbin /imports $fix | Out-File pe_imports.txt
+          foreach($x in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')) { if(-not (Select-String pe_exports.txt -SimpleMatch $x -Quiet)){ throw "MISSING_EXPORT_$x" } }
+          if(Select-String pe_imports.txt -SimpleMatch 'ucrtbase.dll' -Quiet){ throw 'DIRECT_UCRTBASE_IMPORT' }
+          'PE_ABI_IMPORT_AUDIT_PASS' | Out-File pe_gate_pass.txt
+
+      - name: Compile genuine nonzero x86 harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location 'native_payload\payload'
+          cl /nologo /O2 /W4 native_nonzero_smoke.c /Fe:native_nonzero_smoke.exe
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Run fixed exact algorithm with genuine n=632 sample block
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Resolve-Path 'native_payload\payload').Path
+          $exe=Join-Path $root 'native_nonzero_smoke.exe'; $fix=Join-Path $root 'SigProcDll-stackfix-7c305.dll'; $ghf=Join-Path $root 'inner_oneframe.ghf'; $rt=Join-Path $root 'runtime'
+          $tries=@(@($fix,$ghf,$rt),@($fix,$rt,$ghf),@($rt,$fix,$ghf),@($ghf,$fix,$rt),@($fix,$ghf),@($ghf,$fix))
+          $winner=-1
+          for($i=0;$i -lt $tries.Count;$i++){
+            & $exe @($tries[$i]) *> "fixed_try_$i.log"; $rc=$LASTEXITCODE
+            if($rc -eq 0 -and (Select-String "fixed_try_$i.log" -SimpleMatch 'NATIVE_NONZERO_SMOKE_PASS' -Quiet)){ $winner=$i; break }
+          }
+          if($winner -lt 0){ throw 'FIXED_GENUINE_NONZERO_INVOCATION_FAILED' }
+          $winner | Out-File invocation_index.txt
+          "FIXED_GENUINE_NONZERO_PASS_INDEX=$winner" | Out-File fixed_nonzero_pass.txt
+
+      - name: Repeat 25 cold-process genuine nonzero calls
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Resolve-Path 'native_payload\payload').Path
+          $exe=Join-Path $root 'native_nonzero_smoke.exe'; $fix=Join-Path $root 'SigProcDll-stackfix-7c305.dll'; $ghf=Join-Path $root 'inner_oneframe.ghf'; $rt=Join-Path $root 'runtime'
+          $winner=[int](Get-Content invocation_index.txt)
+          $tries=@(@($fix,$ghf,$rt),@($fix,$rt,$ghf),@($rt,$fix,$ghf),@($ghf,$fix,$rt),@($fix,$ghf),@($ghf,$fix))
+          for($i=1;$i -le 25;$i++){
+            & $exe @($tries[$winner]) *> "fixed_cold_$i.log"
+            if($LASTEXITCODE -ne 0){ throw "FIXED_COLD_$i`_EXIT_$LASTEXITCODE" }
+            if(-not (Select-String "fixed_cold_$i.log" -SimpleMatch 'NATIVE_NONZERO_SMOKE_PASS' -Quiet)){ throw "FIXED_COLD_$i`_MARKER_MISSING" }
+          }
+          'FIXED_25_COLD_PROCESS_GENUINE_NONZERO_PASS' | Out-File fixed_25_cold_pass.txt
+
+      - name: A-B crashing parent on identical genuine input
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $root=(Resolve-Path 'native_payload\payload').Path
+          $exe=Join-Path $root 'native_nonzero_smoke.exe'; $bad=Join-Path $root 'SigProcDll-crashing-66a44.dll'; $ghf=Join-Path $root 'inner_oneframe.ghf'; $rt=Join-Path $root 'runtime'
+          $winner=[int](Get-Content invocation_index.txt)
+          $tries=@(@($bad,$ghf,$rt),@($bad,$rt,$ghf),@($rt,$bad,$ghf),@($ghf,$bad,$rt),@($bad,$ghf),@($ghf,$bad))
+          & $exe @($tries[$winner]) *> parent_ab.log; $rc=$LASTEXITCODE
+          "PARENT_EXIT_CODE=$rc" | Out-File parent_ab_result.txt
+          if(Select-String parent_ab.log -SimpleMatch 'NATIVE_NONZERO_SMOKE_PASS' -Quiet){ 'PARENT_NONZERO_MARKER_PRESENT' | Add-Content parent_ab_result.txt } else { 'PARENT_NONZERO_MARKER_ABSENT' | Add-Content parent_ab_result.txt }
+          exit 0
+
+      - name: Exact-SHA native nonzero pass lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $fix='native_payload\payload\SigProcDll-stackfix-7c305.dll'
+          $sha=(Get-FileHash $fix -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne $env:FIX_SHA){ throw 'POST_TEST_SHA_CHANGED' }
+          if(!(Test-Path fixed_25_cold_pass.txt)){ throw 'COLD_PASS_LOCK_MISSING' }
+          "NATIVE_WINDOWS_GENUINE_NONZERO_STACKPROBE_PASS SHA256=$sha N=632 COLD_PROCESSES=25" | Out-File native_nonzero_exact_pass.lock
+          Get-Content native_nonzero_exact_pass.lock
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackprobe-filebin-native-nonzero-evidence
+          path: |
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            pe_gate_pass.txt
+            fixed_try_*.log
+            fixed_cold_*.log
+            fixed_nonzero_pass.txt
+            fixed_25_cold_pass.txt
+            parent_ab.log
+            parent_ab_result.txt
+            native_nonzero_exact_pass.lock
+          if-no-files-found: ignore
