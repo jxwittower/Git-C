@@ -1,0 +1,200 @@
+name: native-windows-final-candidate-v5
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_final_candidate_v5.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-gate:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Publish one-time RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .final_native_handoff_v5
+            mkdir -p .final_native_handoff_v5
+            cp "$RUNNER_TEMP/public.pem" .final_native_handoff_v5/public.pem
+            git add .final_native_handoff_v5/public.pem
+            git commit -qm 'Publish final native v5 one-time RSA key' || true
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep 2
+          done
+          exit 19
+
+      - name: Acquire exact encrypted payload
+        run: |
+          set -euo pipefail
+          expected=e327b99a22fb670dc2384afdb3f8a189d2b9197a37d610e619a118c1291b91ab
+          drive='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
+          files=(chunk_00 chunk_01 chunk_02_03 chunk_04_05 chunk_06_07 chunk_08_09 chunk_10_11 chunk_12_13 chunk_14_15 chunk_16_17 chunk_18_19 chunk_20_21 chunk_22_23 chunk_24_25 chunk_26_27 chunk_28_29 chunk_30_31 chunk_32)
+          ok=0
+          for attempt in $(seq 1 240); do
+            rm -f "$RUNNER_TEMP/native.enc"
+            if curl -L -sS --fail --max-time 20 -o "$RUNNER_TEMP/native.try" "$drive"; then
+              got=$(sha256sum "$RUNNER_TEMP/native.try" | awk '{print $1}')
+              if [ "$got" = "$expected" ]; then mv "$RUNNER_TEMP/native.try" "$RUNNER_TEMP/native.enc"; ok=1; echo PAYLOAD_SOURCE=DRIVE; break; fi
+            fi
+            git fetch -q origin main || true
+            complete=1
+            for f in "${files[@]}"; do if ! git cat-file -e "origin/main:.final_native_payload_v3/$f" 2>/dev/null; then complete=0; break; fi; done
+            if [ "$complete" = 1 ]; then
+              : > "$RUNNER_TEMP/payload.b64"
+              for f in "${files[@]}"; do git show "origin/main:.final_native_payload_v3/$f" >> "$RUNNER_TEMP/payload.b64"; done
+              tr -d '\r\n\t ' < "$RUNNER_TEMP/payload.b64" > "$RUNNER_TEMP/payload.clean.b64"
+              if [ "$(wc -c < "$RUNNER_TEMP/payload.clean.b64" | tr -d '[:space:]')" = 261056 ]; then
+                if base64 -d "$RUNNER_TEMP/payload.clean.b64" > "$RUNNER_TEMP/native.try" 2>/dev/null; then
+                  got=$(sha256sum "$RUNNER_TEMP/native.try" | awk '{print $1}')
+                  if [ "$got" = "$expected" ]; then mv "$RUNNER_TEMP/native.try" "$RUNNER_TEMP/native.enc"; ok=1; echo PAYLOAD_SOURCE=GITHUB_CHUNKS; break; fi
+                fi
+              fi
+            fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=PAYLOAD_ACQUIRE; exit 20; }
+          test "$(sha256sum "$RUNNER_TEMP/native.enc" | awk '{print $1}')" = "$expected"
+          echo EXACT_CIPHERTEXT_PASS
+
+      - name: Wait for matching wrapped AES key
+        run: |
+          set -euo pipefail
+          drive='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$drive"; then
+              if [ "$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/key.enc"; mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"; ok=1; echo KEY_SOURCE=DRIVE; break
+                fi
+              fi
+            fi
+            git fetch -q origin main || true
+            if git show origin/main:.final_native_handoff_v5/key.enc.b64 > "$RUNNER_TEMP/key.b64" 2>/dev/null; then
+              if base64 -d "$RUNNER_TEMP/key.b64" > "$RUNNER_TEMP/key.try" 2>/dev/null && [ "$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/key.enc"; mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"; ok=1; echo KEY_SOURCE=GITHUB; break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=RSA_KEY_TIMEOUT; exit 23; }
+          echo RSA_KEY_HANDOFF_PASS
+
+      - name: Decrypt and verify exact candidate
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -in "$RUNNER_TEMP/native.enc" -out "$RUNNER_TEMP/native.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          rm -rf payload && mkdir payload
+          tar -xJf "$RUNNER_TEMP/native.tar.xz" -C payload
+          cd payload/native_gate_min
+          sha256sum -c NATIVE_SHA256SUMS.txt
+          cand=$(sha256sum SigProcDll-64HF.dll | awk '{print $1}')
+          test "$cand" = 8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326
+          echo "$cand" > ../../candidate_sha256.txt
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/native.enc" "$RUNNER_TEMP/native.tar.xz"
+          echo EXACT_CANDIDATE_SHA_PASS
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native PE ABI and import gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers payload\native_gate_min\SigProcDll-64HF.dll | Out-File candidate_headers.txt
+          dumpbin /exports payload\native_gate_min\SigProcDll-64HF.dll | Out-File candidate_exports.txt
+          dumpbin /imports payload\native_gate_min\SigProcDll-64HF.dll | Out-File candidate_imports.txt
+          $h=Get-Content candidate_headers.txt -Raw; $e=Get-Content candidate_exports.txt -Raw; $i=Get-Content candidate_imports.txt -Raw
+          if($h -notmatch 'machine \(x86\)'){ throw 'PE_MACHINE_NOT_X86' }
+          foreach($x in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){ if($e -notmatch [regex]::Escape($x)){ throw "MISSING_EXPORT=$x" } }
+          if($i -match '(?i)ucrtbase\.dll'){ throw 'DIRECT_UCRTBASE_IMPORT' }
+          $allowed=@('kernel32.dll','vcruntime140.dll','api-ms-win-crt-stdio-l1-1-0.dll','api-ms-win-crt-filesystem-l1-1-0.dll','api-ms-win-crt-environment-l1-1-0.dll','api-ms-win-crt-heap-l1-1-0.dll','api-ms-win-crt-convert-l1-1-0.dll','api-ms-win-crt-math-l1-1-0.dll','api-ms-win-crt-string-l1-1-0.dll','api-ms-win-crt-utility-l1-1-0.dll','api-ms-win-crt-runtime-l1-1-0.dll','api-ms-win-crt-time-l1-1-0.dll')
+          $found=@(); foreach($line in Get-Content candidate_imports.txt){ if($line -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$'){ $found += $Matches[1].ToLowerInvariant() } }
+          $found=@($found|Sort-Object -Unique); $extra=@($found|Where-Object{$_ -notin $allowed})
+          "CANDIDATE_IMPORTS=$($found -join ',')" | Out-File import_subset.txt
+          "EXTRA_IMPORTS=$($extra -join ',')" | Add-Content import_subset.txt
+          if($extra.Count -ne 0){ throw "EXTRA_IMPORTS=$($extra -join ',')" }
+          'NATIVE_PE_ABI_IMPORT_GATE_PASS' | Add-Content import_subset.txt
+
+      - name: Exact native loader contract
+        shell: cmd
+        working-directory: payload\native_gate_min
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\..\loader_smoke.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\..\loader_smoke.txt
+          if not %RC%==0 exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\..\loader_smoke.txt > nul
+          if errorlevel 1 exit /b 47
+          echo FINAL_NATIVE_WINDOWS_V5_GATE_PASS
+
+      - name: Repeated native loader stability
+        shell: powershell
+        working-directory: payload\native_gate_min
+        run: |
+          $ErrorActionPreference='Stop'
+          1..100 | ForEach-Object {
+            $p=Start-Process -FilePath '.\SigProcLoaderContractSmoke.exe' -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\smoke_out.txt" -RedirectStandardError "$env:RUNNER_TEMP\smoke_err.txt"
+            if($p.ExitCode -ne 0){ throw "SMOKE_LOOP_FAIL=$_ RC=$($p.ExitCode)" }
+            if(-not (Select-String -Quiet -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' "$env:RUNNER_TEMP\smoke_out.txt")){ throw "SMOKE_SENTINEL_FAIL=$_" }
+          }
+          'NATIVE_REPEATED_LOADER_100_PASS' | Out-File ..\..\native_repeat.txt
+
+      - name: Publish native pass lock
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            printf 'FINAL_NATIVE_WINDOWS_V5_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326 RUN_ID=%s\n' "$GITHUB_RUN_ID" > evidence_summary/FINAL_NATIVE_V5_PASS.lock
+            git add evidence_summary/FINAL_NATIVE_V5_PASS.lock
+            git commit -qm 'Record final native v5 pass' || true
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep 2
+          done
+          exit 60
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-native-v5-evidence
+          path: |
+            candidate_sha256.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_imports.txt
+            import_subset.txt
+            loader_smoke.txt
+            native_repeat.txt
+          if-no-files-found: ignore
+          retention-days: 7
