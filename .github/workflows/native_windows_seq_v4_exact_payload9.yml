@@ -1,0 +1,213 @@
+name: native-windows-seq-v4-exact-payload9
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_seq_v4_exact_payload9.yml'
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  native-exact:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct encrypted payload9 transport
+        run: |
+          set -euo pipefail
+          test -f .payload9/manifest.txt
+          mapfile -t chunks < <(find .payload9 -maxdepth 1 -type f -name 'chunk_*' | sort)
+          test "${#chunks[@]}" -gt 0
+          cat "${chunks[@]}" > "$RUNNER_TEMP/payload9.b64"
+          base64 -d "$RUNNER_TEMP/payload9.b64" > "$RUNNER_TEMP/payload9.enc"
+          test -s "$RUNNER_TEMP/payload9.enc"
+          sha256sum "$RUNNER_TEMP/payload9.enc" > payload9_cipher_sha256.txt
+          echo "PAYLOAD9_ENCRYPTED_TRANSPORT_RECONSTRUCTED chunks=${#chunks[@]} bytes=$(wc -c < "$RUNNER_TEMP/payload9.enc" | tr -d '[:space:]')"
+
+      - name: Publish one-time RSA public key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .seq_v4_exact_handoff
+            mkdir -p .seq_v4_exact_handoff
+            cp "$RUNNER_TEMP/public.pem" .seq_v4_exact_handoff/public.pem
+            git add .seq_v4_exact_handoff/public.pem
+            git commit -qm 'Publish V4 exact native one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo V4_EXACT_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for matching wrapped AES password
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=V4_EXACT_RSA_HANDOFF; exit 20; }
+          echo V4_EXACT_RSA_HANDOFF_PASS
+
+      - name: Decrypt payload9 and bind exact candidate SHA
+        run: |
+          set -euo pipefail
+          rm -rf payload
+          ok=0
+          for iter in 200000 250000 100000; do
+            rm -f "$RUNNER_TEMP/payload9.zip"
+            if openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iter" -in "$RUNNER_TEMP/payload9.enc" -out "$RUNNER_TEMP/payload9.zip" -pass file:"$RUNNER_TEMP/pass.txt" >/dev/null 2>&1; then
+              if 7z t "$RUNNER_TEMP/payload9.zip" >/dev/null 2>&1; then
+                rm -rf payload && mkdir payload
+                7z x -y "$RUNNER_TEMP/payload9.zip" -opayload >/dev/null
+                if [ -f payload/SigProcDll-64HF.dll ]; then
+                  cand=$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')
+                  if [ "$cand" = '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c' ]; then
+                    echo "PAYLOAD9_ITER=$iter" > payload9_decrypt_info.txt
+                    ok=1
+                    break
+                  fi
+                fi
+              fi
+            fi
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=PAYLOAD9_DECRYPT_OR_EXACT_SHA; exit 21; }
+          sha256sum payload/SigProcDll-64HF.dll | tee candidate_v4_exact_sha256.txt
+          smoke=$(sha256sum payload/SigProcLoaderContractSmoke.exe | awk '{print $1}')
+          test "$smoke" = 'a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+          base=$(find payload -type f -iname '*HostCompat*baseline*.dll' | head -1 || true)
+          test -n "$base" && test -f "$base"
+          test "$(sha256sum "$base" | awk '{print $1}')" = '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+          printf '%s\n' "$base" > baseline_dll_path.txt
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/payload9.enc" "$RUNNER_TEMP/payload9.b64" "$RUNNER_TEMP/payload9.zip"
+          echo V4_EXACT_PAYLOAD_HASH_BINDING_PASS
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native PE ABI and import gate
+        shell: cmd
+        run: |
+          dumpbin /headers payload\SigProcDll-64HF.dll > candidate_v4_exact_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > candidate_v4_exact_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > candidate_v4_exact_imports.txt
+          findstr /C:"machine (x86)" candidate_v4_exact_headers.txt > nul || exit /b 40
+          findstr /C:"_SigProc_Init@8" candidate_v4_exact_exports.txt > nul || exit /b 41
+          findstr /C:"_SigProc@24" candidate_v4_exact_exports.txt > nul || exit /b 42
+          findstr /C:"_SigProc_Stat@0" candidate_v4_exact_exports.txt > nul || exit /b 43
+          findstr /C:"_SigProc_Fini@0" candidate_v4_exact_exports.txt > nul || exit /b 44
+          findstr /I /C:"ucrtbase.dll" candidate_v4_exact_imports.txt > nul && exit /b 45 || exit /b 0
+
+      - name: Verify import DLL set is HostCompat subset
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $base=(Get-Content 'baseline_dll_path.txt' -Raw).Trim()
+          dumpbin /imports $base | Out-File hostcompat_baseline_imports.txt -Encoding ascii
+          function Get-Dlls($p) {
+            $a=@()
+            foreach($l in Get-Content $p) {
+              if($l -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $a += $Matches[1].ToLowerInvariant() }
+            }
+            @($a | Sort-Object -Unique)
+          }
+          $cand=Get-Dlls 'candidate_v4_exact_imports.txt'
+          $baseSet=Get-Dlls 'hostcompat_baseline_imports.txt'
+          $extra=@($cand | Where-Object { $_ -notin $baseSet })
+          "CANDIDATE_IMPORTS=$($cand -join ',')" | Out-File import_subset_v4_exact.txt
+          "BASELINE_IMPORTS=$($baseSet -join ',')" | Add-Content import_subset_v4_exact.txt
+          "EXTRA_IMPORTS=$($extra -join ',')" | Add-Content import_subset_v4_exact.txt
+          if($extra.Count -ne 0) { Get-Content import_subset_v4_exact.txt; exit 46 }
+          'IMPORT_SUBSET_PASS' | Add-Content import_subset_v4_exact.txt
+
+      - name: Execute loader contract on native Windows inner and outer runtimes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $runtimes=@('runtime_inner','runtime_outer')
+          foreach($rt in $runtimes) {
+            $dir=Join-Path 'payload' $rt
+            if(!(Test-Path $dir)) { throw "MISSING_RUNTIME_$rt" }
+            Copy-Item 'payload\SigProcDll-64HF.dll' (Join-Path $dir 'SigProcDll-64HF.dll') -Force
+            Copy-Item 'payload\SigProcLoaderContractSmoke.exe' (Join-Path $dir 'SigProcLoaderContractSmoke.exe') -Force
+            Push-Location $dir
+            .\SigProcLoaderContractSmoke.exe 2>&1 | Tee-Object (Join-Path $env:RUNNER_TEMP "$rt-smoke.txt")
+            $rc=$LASTEXITCODE
+            Pop-Location
+            if($rc -ne 0) { exit $rc }
+            if(-not (Select-String -Path (Join-Path $env:RUNNER_TEMP "$rt-smoke.txt") -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS')) { exit 47 }
+            Copy-Item (Join-Path $env:RUNNER_TEMP "$rt-smoke.txt") "$rt-smoke.txt"
+          }
+          'NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_FREELIBRARY_PASS' | Out-File native_v4_exact_gate.txt
+
+      - name: Commit exact native PASS lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'ALL_LOADER_CONTRACT_TESTS_PASS' runtime_inner-smoke.txt
+          grep -Fq 'ALL_LOADER_CONTRACT_TESTS_PASS' runtime_outer-smoke.txt
+          grep -Fq 'IMPORT_SUBSET_PASS' import_subset_v4_exact.txt
+          sha=$(awk '{print $1}' candidate_v4_exact_sha256.txt)
+          test "$sha" = '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main
+          git checkout -q -B main origin/main
+          mkdir -p evidence_summary
+          printf 'NATIVE_WINDOWS_V4_EXACT_PASS SHA256=%s\n' "$sha" > evidence_summary/V4_EXACT_NATIVE_PASS.lock
+          cp "$GITHUB_WORKSPACE/native_v4_exact_gate.txt" evidence_summary/native_v4_exact_gate.txt
+          cp "$GITHUB_WORKSPACE/import_subset_v4_exact.txt" evidence_summary/import_subset_v4_exact.txt
+          cp "$GITHUB_WORKSPACE/runtime_inner-smoke.txt" evidence_summary/runtime_inner_smoke_v4_exact.txt
+          cp "$GITHUB_WORKSPACE/runtime_outer-smoke.txt" evidence_summary/runtime_outer_smoke_v4_exact.txt
+          git add evidence_summary/V4_EXACT_NATIVE_PASS.lock evidence_summary/native_v4_exact_gate.txt evidence_summary/import_subset_v4_exact.txt evidence_summary/runtime_inner_smoke_v4_exact.txt evidence_summary/runtime_outer_smoke_v4_exact.txt
+          git commit -qm 'Record exact V4 native Windows pass' || true
+          git push -q origin HEAD:main
+
+      - name: Upload exact DLL and native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-exact-native-windows-evidence
+          path: |
+            payload/SigProcDll-64HF.dll
+            candidate_v4_exact_sha256.txt
+            candidate_v4_exact_headers.txt
+            candidate_v4_exact_exports.txt
+            candidate_v4_exact_imports.txt
+            hostcompat_baseline_imports.txt
+            import_subset_v4_exact.txt
+            runtime_inner-smoke.txt
+            runtime_outer-smoke.txt
+            native_v4_exact_gate.txt
+            payload9_cipher_sha256.txt
+            payload9_decrypt_info.txt
+          if-no-files-found: ignore
+          retention-days: 7
