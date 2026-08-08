@@ -1,0 +1,187 @@
+name: native-7c305-direct-bridge-final
+on:
+  push:
+    paths:
+      - '.github/workflows/native_7c305_direct_bridge_final.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  native-real:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      XZ_SHA: 4bf11ca9105e66d1743607892dbe48b54eddae9fa28052b23720d7c821e45365
+      GHF_SHA: f5e507d88d181923b774abb2ac51e5b2e26034e53199b111f1de7e50e8e4e8eb
+      GHF_XZ_SHA: 4e8a9a69d015a960dc2c91a313637011401b677c7c564cd5160911d6540a7579
+      RUNTIME_XZ_SHA: 9f467fd7f70e04d387d7bf7c8455d2ecf5f4bee91ad12c7522cae3ab1d7870b6
+      ASSET_COMMIT: c3e59360fecf87fe66a1c1a8366c3fa8eabd446e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Recover exact fixed DLL from persistent Drive bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 2 -o fixed.xz 'https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          test "$(sha256sum fixed.xz | awk '{print $1}')" = "$XZ_SHA"
+          xz -dc fixed.xz > SigProcDll-64HF.dll
+          test "$(sha256sum SigProcDll-64HF.dll | awk '{print $1}')" = "$FIX_SHA"
+          test -s SigProcDll-64HF.dll
+          echo "EXACT_7C305_DLL_RECOVERED SHA256=$FIX_SHA" | tee exact_dll_recovered.txt
+
+      - name: Recover real GHF and runtime assets from bound repository commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "$ASSET_COMMIT^{commit}"
+          rm -rf bound_assets
+          mkdir -p bound_assets/realghf bound_assets/runtime bound_assets/native
+          for i in 00 01 02 03; do git show "$ASSET_COMMIT:.release7c305_realghf/chunk_$i"; done | tr -d '\r\n' | base64 -d > bound_assets/realghf/real.ghf.xz
+          test "$(sha256sum bound_assets/realghf/real.ghf.xz | awk '{print $1}')" = "$GHF_XZ_SHA"
+          xz -dc bound_assets/realghf/real.ghf.xz > bound_assets/realghf/real.ghf
+          test "$(sha256sum bound_assets/realghf/real.ghf | awk '{print $1}')" = "$GHF_SHA"
+          for i in 00 01 02 03; do git show "$ASSET_COMMIT:.release7c305_runtime/chunk_$i"; done | tr -d '\r\n' | base64 -d > bound_assets/runtime/runtime.xz
+          test "$(sha256sum bound_assets/runtime/runtime.xz | awk '{print $1}')" = "$RUNTIME_XZ_SHA"
+          git show "$ASSET_COMMIT:.release7c305_native/native_nonzero_smoke.c" > bound_assets/native/native_nonzero_smoke.c
+          echo BOUND_REAL_ASSETS_RECOVERED
+
+      - name: Expand runtime tree
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import lzma, tarfile, io, shutil
+          p=Path('bound_assets/runtime/runtime.xz')
+          raw=lzma.decompress(p.read_bytes())
+          out=Path('bound_assets/runtime/unpacked'); shutil.rmtree(out,ignore_errors=True); out.mkdir(parents=True)
+          try:
+              with tarfile.open(fileobj=io.BytesIO(raw), mode='r:*') as tf:
+                  tf.extractall(out)
+                  print('RUNTIME_FORMAT=TAR_XZ')
+          except tarfile.ReadError:
+              q=out/'runtime_payload.bin'; q.write_bytes(raw); print('RUNTIME_FORMAT=RAW_XZ')
+          print('RUNTIME_UNPACKED_BYTES',len(raw))
+          for x in out.rglob('*'):
+              if x.is_file(): print('RUNTIME_FILE',x)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\expand_runtime.py
+          python $env:RUNNER_TEMP\expand_runtime.py | Tee-Object runtime_inventory.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI stackfix and import gate
+        run: |
+          $ErrorActionPreference='Stop'
+          $sha=(Get-FileHash .\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne $env:FIX_SHA){ throw "SHA_MISMATCH $sha" }
+          dumpbin /headers .\SigProcDll-64HF.dll | Out-File pe_headers.txt
+          dumpbin /exports .\SigProcDll-64HF.dll | Out-File pe_exports.txt
+          dumpbin /imports .\SigProcDll-64HF.dll | Out-File pe_imports.txt
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){
+            if(-not (Select-String -Path pe_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" }
+          }
+          if(-not (Select-String -Path pe_headers.txt -SimpleMatch '.stkfix' -Quiet)){ throw 'STKFIX_SECTION_MISSING' }
+          if(Select-String -Path pe_imports.txt -SimpleMatch 'ucrtbase.dll' -Quiet){ throw 'DIRECT_UCRTBASE_IMPORT_FORBIDDEN' }
+          'PE32_X86_ABI_STACKFIX_IMPORT_GATE_PASS' | Out-File static_gate_pass.txt
+
+      - name: Compile real nonzero native host
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /W4 /O2 /EHsc /Fe:native_nonzero_smoke.exe bound_assets\native\native_nonzero_smoke.c
+          if($LASTEXITCODE -ne 0){ throw 'NATIVE_HOST_COMPILE_FAILED' }
+
+      - name: Execute exact DLL on every usable real runtime directory
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Resolve-Path 'bound_assets\runtime\unpacked').Path
+          $ghf=(Resolve-Path 'bound_assets\realghf\real.ghf').Path
+          $cand=(Resolve-Path '.\SigProcDll-64HF.dll').Path
+          $dirs=Get-ChildItem -Path $root -Directory -Recurse | Where-Object {
+            (Test-Path (Join-Path $_.FullName 'filter_brth')) -and
+            (Test-Path (Join-Path $_.FullName 'filter_hrt3')) -and
+            (Test-Path (Join-Path $_.FullName 'file_sig'))
+          }
+          if(-not $dirs){
+            $dirs=Get-ChildItem -Path $root -Directory -Recurse | Where-Object {
+              (Get-ChildItem -Path $_.FullName -File -ErrorAction SilentlyContinue | Measure-Object).Count -ge 3
+            } | Select-Object -First 1
+          }
+          if(-not $dirs){ throw 'NO_USABLE_RUNTIME_DIRECTORY' }
+          $i=0
+          foreach($d in $dirs){
+            $i++
+            $envDir=Join-Path $PWD ("native_env_"+$i)
+            $rt=Join-Path $envDir 'runtime'
+            New-Item -ItemType Directory -Force -Path $rt | Out-Null
+            Copy-Item -Path $cand -Destination (Join-Path $envDir 'SigProcDll-64HF.dll') -Force
+            Copy-Item -Path (Join-Path $d.FullName '*') -Destination $rt -Recurse -Force
+            $log="native_nonzero_runtime_$i.txt"
+            .\native_nonzero_smoke.exe $rt $ghf 2>&1 | Tee-Object $log
+            if($LASTEXITCODE -ne 0){ throw "NONZERO_NATIVE_RUNTIME_FAILED index=$i rc=$LASTEXITCODE" }
+            if(-not (Select-String -Path $log -SimpleMatch 'NONZERO_NATIVE_SMOKE_PASS' -Quiet)){ throw "NONZERO_SENTINEL_MISSING index=$i" }
+          }
+          if($i -lt 1){ throw 'NO_NATIVE_RUNTIME_EXECUTED' }
+          "REAL_RUNTIME_COUNT=$i" | Out-File native_runtime_count.txt
+          'NATIVE_WINDOWS_REAL_GHF_NONZERO_PASS' | Out-File native_real_nonzero_pass.txt
+
+      - name: Repeat real nonzero path and verify lifecycle stability
+        run: |
+          $ErrorActionPreference='Stop'
+          $ghf=(Resolve-Path 'bound_assets\realghf\real.ghf').Path
+          $rt=(Resolve-Path 'native_env_1\runtime').Path
+          1..20 | ForEach-Object {
+            .\native_nonzero_smoke.exe $rt $ghf *> ("repeat_"+$_+".txt")
+            if($LASTEXITCODE -ne 0){ throw "REPEAT_FAILED $_ rc=$LASTEXITCODE" }
+          }
+          'NATIVE_REAL_NONZERO_REPEAT20_PASS' | Out-File repeat20_pass.txt
+
+      - name: Rebind exact SHA after all native execution and commit PASS lock
+        run: |
+          $ErrorActionPreference='Stop'
+          $sha=(Get-FileHash .\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne $env:FIX_SHA){ throw "POST_NATIVE_SHA_MISMATCH $sha" }
+          "NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS SHA256=$sha" | Out-File NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock -Encoding ascii
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main
+          git checkout -q -B main origin/main
+          New-Item -ItemType Directory -Force -Path evidence_summary | Out-Null
+          Copy-Item NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock -Force
+          Copy-Item native_real_nonzero_pass.txt evidence_summary\native_7c305_real_nonzero_pass.txt -Force
+          Copy-Item repeat20_pass.txt evidence_summary\native_7c305_repeat20_pass.txt -Force
+          Copy-Item native_runtime_count.txt evidence_summary\native_7c305_runtime_count.txt -Force
+          Copy-Item static_gate_pass.txt evidence_summary\native_7c305_static_gate_pass.txt -Force
+          git add evidence_summary
+          git commit -m 'Record exact 7c305 real native Windows PASS' || exit 0
+          git push origin HEAD:main
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-7c305-real-final-${{ github.run_id }}
+          path: |
+            NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock
+            exact_dll_recovered.txt
+            pe_headers.txt
+            pe_exports.txt
+            pe_imports.txt
+            static_gate_pass.txt
+            native_real_nonzero_pass.txt
+            native_runtime_count.txt
+            repeat20_pass.txt
+            native_nonzero_runtime_*.txt
+            repeat_*.txt
+            runtime_inventory.txt
+          if-no-files-found: ignore
+          retention-days: 14
