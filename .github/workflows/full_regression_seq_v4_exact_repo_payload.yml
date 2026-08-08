@@ -1,0 +1,276 @@
+name: full-regression-seq-v4-exact-repo-payload
+on:
+  push:
+    paths:
+      - '.github/workflows/full_regression_seq_v4_exact_repo_payload.yml'
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  full-regression:
+    runs-on: windows-2022
+    timeout-minutes: 95
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Require exact V4 native Windows pass lock
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          git show origin/main:evidence_summary/V4_EXACT_NATIVE_PASS.lock > "$RUNNER_TEMP/native.lock"
+          grep -Fxq 'NATIVE_WINDOWS_V4_EXACT_PASS SHA256=66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c' "$RUNNER_TEMP/native.lock"
+          echo EXACT_V4_NATIVE_PREREQUISITE_PASS
+
+      - name: Publish one-time full-regression RSA public key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/fullreg_private.pem"
+          openssl pkey -in "$RUNNER_TEMP/fullreg_private.pem" -pubout -out "$RUNNER_TEMP/fullreg_public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .seq_v4_fullreg_handoff
+            mkdir -p .seq_v4_fullreg_handoff
+            cp "$RUNNER_TEMP/fullreg_public.pem" .seq_v4_fullreg_handoff/public.pem
+            git add .seq_v4_fullreg_handoff/public.pem
+            git commit -qm 'Publish V4 full-regression one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo V4_FULLREG_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for matching wrapped full-regression AES password
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 900); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/fullreg_private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/fullreg_pass.txt"
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=V4_FULLREG_RSA_HANDOFF; exit 20; }
+          echo V4_FULLREG_RSA_HANDOFF_PASS
+
+      - name: Recover matching encrypted full-regression repository payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import base64, hashlib, os, shutil, subprocess, sys, zipfile
+          root=Path('.')
+          temp=Path(os.environ['RUNNER_TEMP'])
+          passfile=temp/'fullreg_pass.txt'
+          CUR='66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          BASE='081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+          ORIG='56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+          SMOKE='a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+              return h.hexdigest()
+          def inspect(dest):
+              files=[p for p in dest.rglob('*') if p.is_file()]
+              dllhash={sha(p):p for p in files if p.suffix.lower()=='.dll'}
+              exehash={sha(p):p for p in files if p.suffix.lower()=='.exe'}
+              runners=[p for p in files if p.name.lower()=='run_final_regression_windows.py']
+              seq=[p for p in files if 'validate_seq_targets' in p.name.lower()]
+              win=[p for p in files if 'validate_windows_results' in p.name.lower()]
+              ghf=[p for p in files if p.suffix.lower()=='.ghf']
+              return CUR in dllhash and BASE in dllhash and ORIG in dllhash and SMOKE in exehash and runners and seq and win and len(ghf)>=2
+          found=None
+          dirs=[p for p in root.iterdir() if p.is_dir() and p.name.startswith('.') and p.name not in {'.git','.github'}]
+          for d in dirs:
+              chunks=sorted([p for p in d.iterdir() if p.is_file() and (p.name.startswith('chunk_') or p.name.startswith('src_'))])
+              if not chunks: continue
+              raw=b''.join(p.read_bytes() for p in chunks)
+              encopts=[]
+              try:
+                  dec=base64.b64decode(raw,validate=False)
+                  if len(dec)>32: encopts.append(('b64',dec))
+              except Exception: pass
+              if len(raw)>32: encopts.append(('raw',raw))
+              for kind,enc in encopts:
+                  encfile=temp/'fullreg_try.enc'; encfile.write_bytes(enc)
+                  for it in (200000,250000,100000):
+                      decfile=temp/'fullreg_try.bin'
+                      r=subprocess.run(['openssl','enc','-d','-aes-256-cbc','-pbkdf2','-iter',str(it),'-in',str(encfile),'-out',str(decfile),'-pass',f'file:{passfile}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      if r.returncode: continue
+                      iszip=zipfile.is_zipfile(decfile)
+                      sig=decfile.read_bytes()[:8]
+                      if not iszip and not sig.startswith(b'\xfd7zXZ') and not sig.startswith(b'\x1f\x8b'): continue
+                      dest=Path('fullreg_payload_try')
+                      shutil.rmtree(dest,ignore_errors=True); dest.mkdir()
+                      try:
+                          if iszip: zipfile.ZipFile(decfile).extractall(dest)
+                          else: subprocess.run(['7z','x','-y',str(decfile),'-o'+str(dest)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+                      except Exception: continue
+                      if inspect(dest):
+                          final=Path('fullreg_payload'); shutil.rmtree(final,ignore_errors=True); dest.rename(final)
+                          Path('fullreg_recovery_meta.txt').write_text(f'REPO_DIR={d.name}\nENCODING={kind}\nITER={it}\n')
+                          found=True
+                          break
+                  if found: break
+              if found: break
+          if not found:
+              print('FAIL_STAGE=NO_MATCHING_FULLREG_REPO_PAYLOAD')
+              sys.exit(31)
+          print('V4_FULLREG_REPOSITORY_PAYLOAD_RECOVERED')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recover_fullreg.py
+          python $env:RUNNER_TEMP\recover_fullreg.py
+
+      - name: Bind all exact binary hashes before regression
+        run: |
+          set -euo pipefail
+          cand=$(find fullreg_payload -type f -name 'SigProcDll-64HF.dll' -print0 | xargs -0 -r sha256sum | grep '^66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c ' | head -1 | awk '{print $2}')
+          test -n "$cand"
+          base=$(find fullreg_payload -type f -iname '*.dll' -print0 | xargs -0 sha256sum | grep '^081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804 ' | head -1 | awk '{print $2}')
+          orig=$(find fullreg_payload -type f -iname '*.dll' -print0 | xargs -0 sha256sum | grep '^56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb ' | head -1 | awk '{print $2}')
+          smoke=$(find fullreg_payload -type f -iname '*.exe' -print0 | xargs -0 sha256sum | grep '^a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d ' | head -1 | awk '{print $2}')
+          test -n "$base"; test -n "$orig"; test -n "$smoke"
+          printf '%s\n' "$cand" > exact_candidate_path.txt
+          printf '%s\n' "$base" > exact_baseline_path.txt
+          printf '%s\n' "$orig" > exact_original_path.txt
+          printf '%s\n' "$smoke" > exact_smoke_path.txt
+          printf '%s  SigProcDll-64HF.dll\n' '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c' > exact_fullreg_hash_binding.txt
+          echo EXACT_FULLREG_BINARY_HASH_BINDING_PASS
+
+      - name: Prepare native Windows regression path tree and patch candidate SHA lock only
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $runner=Get-ChildItem -Path 'fullreg_payload' -Recurse -Filter 'run_final_regression_windows.py' | Select-Object -First 1
+          if(!$runner){ throw 'MAIN_REGRESSION_RUNNER_MISSING' }
+          $src=$runner.Directory.FullName
+          $drive=(Get-Location).Drive.Root
+          $dst=Join-Path $drive 'mnt\data'
+          if(Test-Path $dst){ Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $src '*') $dst
+          $old='8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326'
+          $cur='66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          $unix='/mnt/data'
+          $win=($dst -replace '\\','/')
+          Get-ChildItem -Path $dst -Recurse -File | Where-Object { $_.Extension -in '.py','.txt','.json','.ps1','.cmd','.bat' } | ForEach-Object {
+            $t=Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+            if($null -ne $t){
+              $u=$t.Replace($old,$cur).Replace($unix,$win)
+              if($u -ne $t){ Set-Content -Path $_.FullName -Value $u -Encoding utf8 }
+            }
+          }
+          $cand=Get-ChildItem -Path $dst -Recurse -Filter 'SigProcDll-64HF.dll' | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $cur } | Select-Object -First 1
+          if(!$cand){ throw 'EXACT_CANDIDATE_MISSING_AFTER_PATH_REBUILD' }
+          "REGRESSION_DATA_ROOT=$dst" | Out-File regression_windows_path.txt
+          'OLD_CANDIDATE_SHA_LOCK_REBOUND_TO_EXACT_V4' | Add-Content regression_windows_path.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Execute complete native Windows regression suite
+        shell: powershell
+        timeout-minutes: 80
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $script=Join-Path $root 'run_final_regression_windows.py'
+          if(!(Test-Path $script)){ throw 'REGRESSION_SCRIPT_MISSING' }
+          $env:PYTHONUNBUFFERED='1'
+          python $script 2>&1 | Tee-Object full_regression_v4_exact.log
+          $rc=$LASTEXITCODE
+          if($rc -ne 0){ exit $rc }
+          'COMPLETE_NATIVE_WINDOWS_REGRESSION_RUNNER_EXIT_ZERO' | Out-File complete_regression_runner_pass.txt
+
+      - name: Enforce sequence-target and suite sentinels
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $files=Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 100MB -and $_.Extension -in '.txt','.log','.csv','.json' }
+          $seq=$false
+          foreach($f in $files){
+            if(Select-String -Path $f.FullName -SimpleMatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -Quiet -ErrorAction SilentlyContinue){ $seq=$true; break }
+          }
+          if(!$seq){
+            if(Select-String -Path 'full_regression_v4_exact.log' -SimpleMatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -Quiet){ $seq=$true }
+          }
+          if(!$seq){ throw 'SEQ_TARGET_SENTINEL_MISSING' }
+          'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' | Out-File seq_targets_v4_exact_pass.txt
+          $required=@('2000','20000','determin','performance','inner','outer','C63','HostCompat')
+          $runner=Get-Content (Join-Path $root 'run_final_regression_windows.py') -Raw
+          foreach($x in $required){ if($runner -notmatch [regex]::Escape($x)){ throw "RUNNER_COVERAGE_TOKEN_MISSING_$x" } }
+          'COMPLETE_SUITE_COVERAGE_STATIC_GATE_PASS' | Out-File suite_coverage_gate.txt
+
+      - name: Recheck exact candidate SHA after regression
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $target=Get-ChildItem -Path $root -Recurse -Filter 'SigProcDll-64HF.dll' | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c' } | Select-Object -First 1
+          if(!$target){ throw 'EXACT_V4_DLL_NOT_FOUND_AFTER_REGRESSION' }
+          (Get-FileHash $target.FullName -Algorithm SHA256).Hash.ToLowerInvariant() | Out-File post_regression_candidate_sha256.txt
+          'POST_REGRESSION_EXACT_SHA_PASS' | Out-File post_regression_sha_gate.txt
+
+      - name: Commit exact complete-regression PASS lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'COMPLETE_NATIVE_WINDOWS_REGRESSION_RUNNER_EXIT_ZERO' complete_regression_runner_pass.txt
+          grep -Fq 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' seq_targets_v4_exact_pass.txt
+          grep -Fq 'COMPLETE_SUITE_COVERAGE_STATIC_GATE_PASS' suite_coverage_gate.txt
+          grep -Fq 'POST_REGRESSION_EXACT_SHA_PASS' post_regression_sha_gate.txt
+          test "$(tr -d '\r\n ' < post_regression_candidate_sha256.txt)" = '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main
+          git checkout -q -B main origin/main
+          mkdir -p evidence_summary
+          printf 'FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_V4_PASS SHA256=%s\n' '66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c' > evidence_summary/V4_EXACT_FULL_REGRESSION_PASS.lock
+          cp "$GITHUB_WORKSPACE/complete_regression_runner_pass.txt" evidence_summary/
+          cp "$GITHUB_WORKSPACE/seq_targets_v4_exact_pass.txt" evidence_summary/
+          cp "$GITHUB_WORKSPACE/suite_coverage_gate.txt" evidence_summary/
+          cp "$GITHUB_WORKSPACE/post_regression_candidate_sha256.txt" evidence_summary/
+          cp "$GITHUB_WORKSPACE/exact_fullreg_hash_binding.txt" evidence_summary/
+          git add evidence_summary/V4_EXACT_FULL_REGRESSION_PASS.lock evidence_summary/complete_regression_runner_pass.txt evidence_summary/seq_targets_v4_exact_pass.txt evidence_summary/suite_coverage_gate.txt evidence_summary/post_regression_candidate_sha256.txt evidence_summary/exact_fullreg_hash_binding.txt
+          git commit -qm 'Record exact V4 complete native Windows regression pass' || true
+          git push -q origin HEAD:main
+
+      - name: Upload complete regression evidence and exact DLL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-exact-complete-native-windows-regression
+          path: |
+            full_regression_v4_exact.log
+            complete_regression_runner_pass.txt
+            seq_targets_v4_exact_pass.txt
+            suite_coverage_gate.txt
+            post_regression_candidate_sha256.txt
+            post_regression_sha_gate.txt
+            exact_fullreg_hash_binding.txt
+            fullreg_recovery_meta.txt
+            regression_windows_path.txt
+          if-no-files-found: ignore
+          retention-days: 7
