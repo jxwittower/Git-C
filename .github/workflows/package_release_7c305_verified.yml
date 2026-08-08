@@ -1,0 +1,84 @@
+name: package-release-7c305-verified
+on:
+  push:
+    paths:
+      - '.github/workflows/package_release_7c305_verified.yml'
+      - 'evidence_summary/FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS.lock'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      TAG: guanhu-sigproc-7c305-verified
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require both exact PASS locks and exact DLL
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $n="NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS SHA256=$env:FIX_SHA"
+          $f="FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS SHA256=$env:FIX_SHA"
+          if((Get-Content evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock -Raw).Trim()-ne$n){throw 'NATIVE_LOCK'}
+          if((Get-Content evidence_summary\FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS.lock -Raw).Trim()-ne$f){throw 'FULLREG_LOCK'}
+          $dll='.validated_7c305\SigProcDll-64HF.dll';if(!(Test-Path $dll)){throw 'DLL_MISSING'}
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne$env:FIX_SHA){throw "DLL_SHA $h"}
+          'BOTH_EXACT_RELEASE_GATES_PASS'|Out-File release_gate.txt
+      - name: Build and independently re-read package
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$d='GuanHu_SigProc_Verified_7c305';Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue;New-Item -ItemType Directory $d|Out-Null
+          Copy-Item '.validated_7c305\SigProcDll-64HF.dll' "$d\SigProcDll-64HF.dll"
+          Copy-Item 'evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock' "$d\NATIVE_WINDOWS_PASS.lock"
+          Copy-Item 'evidence_summary\FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_7C305_PASS.lock' "$d\FULL_REGRESSION_PASS.lock"
+          "$env:FIX_SHA  SigProcDll-64HF.dll"|Out-File "$d\SHA256SUMS.txt" -Encoding ascii
+          @"
+          GuanHu SigProc verified Windows x86 release
+          Exact DLL SHA256: $env:FIX_SHA
+          Release gates: real native Windows nonzero-GHF PASS; complete Windows regression PASS.
+          Do not substitute older 66a44c88 builds.
+          "@|Out-File "$d\RELEASE_README.txt" -Encoding utf8
+          $zip='GuanHu_SigProc_Verified_7c305.zip';Remove-Item $zip -Force -ErrorAction SilentlyContinue;Compress-Archive -Path "$d\*" -DestinationPath $zip -CompressionLevel Optimal
+          if(!(Test-Path $zip)){throw 'ZIP_MISSING'}
+          $x='zipcheck';Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue;Expand-Archive $zip $x -Force
+          $h=(Get-FileHash "$x\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne$env:FIX_SHA){throw "ZIP_DLL_SHA $h"}
+          $zh=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant();"$zh  $zip"|Out-File "$zip.sha256" -Encoding ascii
+          "ZIP_SHA256=$zh"|Out-File zip_audit.txt;"ZIP_DLL_SHA256=$h"|Add-Content zip_audit.txt;'ZIP_ROOT_CONTAINS_EXACT_DLL_PASS'|Add-Content zip_audit.txt
+      - name: Publish immutable verified GitHub release
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $zip='GuanHu_SigProc_Verified_7c305.zip';$dll='.validated_7c305\SigProcDll-64HF.dll'
+          gh release delete $env:TAG --yes --cleanup-tag 2>$null; $global:LASTEXITCODE=0
+          gh release create $env:TAG $dll $zip "$zip.sha256" 'GuanHu_SigProc_Verified_7c305\SHA256SUMS.txt' 'GuanHu_SigProc_Verified_7c305\RELEASE_README.txt' --title 'GuanHu SigProc 7c305 Verified' --notes "Exact SHA256 $env:FIX_SHA. Passed real native Windows nonzero-GHF gate and complete Windows regression; ZIP independently re-read and exact DLL hash rechecked."
+          if($LASTEXITCODE-ne0){throw 'RELEASE_CREATE'}
+          gh release view $env:TAG --json url,tagName,name | Tee-Object release_url.json
+      - name: Commit release-ready lock
+        shell: powershell
+        run: |
+          $zh=((Get-FileHash 'GuanHu_SigProc_Verified_7c305.zip' -Algorithm SHA256).Hash.ToLowerInvariant())
+          "RELEASE_READY_7C305 SHA256=$env:FIX_SHA ZIP_SHA256=$zh"|Out-File release_ready.lock -Encoding ascii
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main;git checkout -q -B main origin/main
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;Copy-Item release_ready.lock evidence_summary\RELEASE_READY_7C305.lock -Force
+          git add evidence_summary\RELEASE_READY_7C305.lock;git commit -m 'Mark exact 7c305 verified release ready';git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verified-release-7c305-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            GuanHu_SigProc_Verified_7c305.zip
+            GuanHu_SigProc_Verified_7c305.zip.sha256
+            .validated_7c305/SigProcDll-64HF.dll
+            release_gate.txt
+            zip_audit.txt
+            release_url.json
+            release_ready.lock
