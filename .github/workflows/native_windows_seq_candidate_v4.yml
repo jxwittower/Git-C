@@ -26,7 +26,7 @@ jobs:
       - name: Fetch encrypted V4 payload
         run: |
           set -euo pipefail
-          url='https://drive.google.com/uc?export=download&id=1svsKtH1yigBHhQwaE9nnDBcOHQ8F2KU7'
+          url='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
           curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/v4.enc" "$url"
           test -s "$RUNNER_TEMP/v4.enc"
           sha256sum "$RUNNER_TEMP/v4.enc" | tee v4_cipher_sha.txt
@@ -43,29 +43,32 @@ jobs:
           for n in 1 2 3 4 5; do
             git fetch origin main
             git checkout -B main origin/main
+            rm -rf .seq_candidate_v4_handoff
             mkdir -p .seq_candidate_v4_handoff
             cp "$RUNNER_TEMP/public.pem" .seq_candidate_v4_handoff/public.pem
-            git add .seq_candidate_v4_handoff/public.pem
+            git add -A .seq_candidate_v4_handoff
             git commit -m 'Publish one-time RSA key for seq candidate v4' || true
             if git push origin HEAD:main; then ok=1; break; fi
             sleep 2
           done
           [ "$ok" = 1 ]
 
-      - name: Wait for V4 wrapped key
+      - name: Wait for matching wrapped V4 AES key
         run: |
           set -euo pipefail
-          url='https://drive.google.com/uc?export=download&id=1F2HgZfWosVNzqNd5X9hiPEsKDGeNlqsj'
+          url='https://raw.githubusercontent.com/jxwittower/Git-C/main/.seq_candidate_v4_handoff/wrapped_key.b64'
           ok=0
           for i in $(seq 1 600); do
-            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
-            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
-              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
-              if [ "$size" = 384 ]; then
-                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
-                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
-                  ok=1
-                  break
+            rm -f "$RUNNER_TEMP/key.b64" "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.b64" "$url"; then
+              if base64 -d "$RUNNER_TEMP/key.b64" > "$RUNNER_TEMP/key.try" 2>/dev/null; then
+                size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+                if [ "$size" = 384 ]; then
+                  if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                    mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                    ok=1
+                    break
+                  fi
                 fi
               fi
             fi
