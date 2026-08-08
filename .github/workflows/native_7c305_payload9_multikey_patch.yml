@@ -67,14 +67,14 @@ jobs:
           test "$ok" = 1
           echo PAYLOAD9_MULTI_RSA_PUBLIC_KEY_PUBLISHED
 
-      - name: Receive RSA-wrapped password candidates from GitHub handoff
+      - name: Receive RSA-wrapped password candidates from raw GitHub
         run: |
           set -euo pipefail
+          base='https://raw.githubusercontent.com/jxwittower/Git-C/main/.native7c305_p9_handoff/wrapped.bin.b64'
           ok=0
           for i in $(seq 1 600); do
             rm -f "$RUNNER_TEMP/wrapped.b64" "$RUNNER_TEMP/wrapped.bin" "$RUNNER_TEMP/candidates.try"
-            git fetch -q origin main || true
-            if git show origin/main:.native7c305_p9_handoff/wrapped.bin.b64 > "$RUNNER_TEMP/wrapped.b64" 2>/dev/null; then
+            if curl -L -sS --fail --max-time 15 -H 'Cache-Control: no-cache' -o "$RUNNER_TEMP/wrapped.b64" "${base}?run=${GITHUB_RUN_ID}&i=${i}"; then
               if base64 -d "$RUNNER_TEMP/wrapped.b64" > "$RUNNER_TEMP/wrapped.bin" 2>/dev/null; then
                 sz=$(wc -c < "$RUNNER_TEMP/wrapped.bin" | tr -d '[:space:]')
                 if [ "$sz" = 384 ] && openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/wrapped.bin" -out "$RUNNER_TEMP/candidates.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
@@ -84,8 +84,8 @@ jobs:
             fi
             sleep 2
           done
-          test "$ok" = 1 || { echo FAIL_STAGE=P9_GITHUB_RSA_HANDOFF; exit 20; }
-          echo PAYLOAD9_GITHUB_RSA_HANDOFF_PASS
+          test "$ok" = 1 || { echo FAIL_STAGE=P9_RAW_GITHUB_RSA_HANDOFF; exit 20; }
+          echo PAYLOAD9_RAW_GITHUB_RSA_HANDOFF_PASS
 
       - name: Recover exact revoked base and native assets with candidate passwords
         shell: powershell
