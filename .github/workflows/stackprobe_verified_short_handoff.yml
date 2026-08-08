@@ -1,0 +1,106 @@
+name: stackprobe-verified-short-handoff
+on:
+  push:
+    paths:
+      - '.github/workflows/stackprobe_verified_short_handoff.yml'
+      - 'evidence_summary/STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  handoff:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      HANDOFF_TAG: spfix-handoff-a67d42b1-20260808
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require verified full regression lock
+        shell: powershell
+        run: |
+          $p='evidence_summary/STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock';if(!(Test-Path $p)){throw 'FULLREG_LOCK_NOT_AVAILABLE'};$t=Get-Content $p -Raw;if($t -notmatch 'SHA256=([0-9a-f]{64})'){throw 'LOCK_SHA_MISSING'};$matches[1]|Out-File verified_sha.txt -NoNewline -Encoding ascii
+      - name: Recover unsafe parent from private Actions artifacts
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @'
+          import os,json,hashlib,zipfile,io,urllib.request,pathlib,subprocess,sys
+          BAD=os.environ['BAD_SHA'];H={'Authorization':f"Bearer {os.environ['GH_TOKEN']}",'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'};repo=os.environ['GITHUB_REPOSITORY']
+          def sh(b):return hashlib.sha256(b).hexdigest()
+          found=None;arts=[]
+          for pg in range(1,6):
+            q=urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={pg}',headers=H)
+            with urllib.request.urlopen(q,timeout=30) as r:d=json.load(r)
+            x=d.get('artifacts',[]);arts+=x
+            if len(x)<100:break
+          arts=[a for a in arts if not a.get('expired') and a.get('size_in_bytes',0)<120_000_000];arts.sort(key=lambda a:(0 if any(k in a['name'].lower() for k in ['native','full','regress','stack','final'])else 1,-int(a['id'])))
+          for a in arts[:220]:
+            try:
+              q=urllib.request.Request(a['archive_download_url'],headers=H)
+              with urllib.request.urlopen(q,timeout=60) as r:z=zipfile.ZipFile(io.BytesIO(r.read()))
+              for n in z.namelist():
+                if n.lower().endswith('.dll'):
+                  b=z.read(n)
+                  if sh(b)==BAD:found=b;break
+              if found:break
+            except:pass
+          if found is None:
+            for ln in subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='ignore').splitlines():
+              oid=ln.split()[0]
+              try:
+                if subprocess.check_output(['git','cat-file','-t',oid],text=True,stderr=subprocess.DEVNULL).strip()!='blob':continue
+                sz=int(subprocess.check_output(['git','cat-file','-s',oid],text=True).strip())
+                if 100000<=sz<=5000000:
+                  b=subprocess.check_output(['git','cat-file','-p',oid])
+                  if sh(b)==BAD:found=b;break
+              except:pass
+          if found is None:sys.exit('PARENT_NOT_FOUND')
+          pathlib.Path('bad.dll').write_bytes(found)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recover.py
+          python $env:RUNNER_TEMP\recover.py
+      - name: Deterministically regenerate verified stackprobe DLL
+        shell: powershell
+        run: |
+          @'
+          import struct,hashlib,sys
+          from pathlib import Path
+          b=bytearray(Path('bad.dll').read_bytes());u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          def p16(o,v):struct.pack_into('<H',b,o,v)
+          def p32(o,v):struct.pack_into('<I',b,o,v)
+          A=lambda x,a:(x+a-1)//a*a;pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);opt=pe+24;s0=opt+osz;sa=u32(opt+32);fa=u32(opt+36);sh=u32(opt+60);sec=[]
+          for i in range(n):o=s0+40*i;sec.append((u32(o+8),u32(o+12),u32(o+16),u32(o+20),u32(o+36),o))
+          vs,tva,trs,trp,_,_=max((s for s in sec if s[4]&0x20000000),key=lambda s:s[2]);sites=[]
+          for x in range(trp,trp+trs-6):
+            if b[x:x+2]==b'\x81\xec':
+              z=u32(x+2)
+              if 0x1000<=z<0x100000:sites.append((x,tva+x-trp,z))
+          if len(sites)!=12:sys.exit(f'SITE_COUNT={len(sites)}')
+          chk=bytearray(b'\x51\x8d\x4c\x24\x04\x29\xc1\x19\xc0\xf7\xd0\x21\xc1\x89\xe0\x25\x00\xf0\xff\xff');loop=len(chk);chk+=b'\x39\xc1\x72\x00';jb=len(chk)-1;chk+=b'\x89\xc8\x59\x94\x8b\x00\x89\x04\x24\xc3';probe=len(chk);chk+=b'\x2d\x00\x10\x00\x00\x85\x00\xeb\x00';jm=len(chk)-1;chk[jb]=(probe-jb-1)&255;chk[jm]=(loop-jm-1)&255
+          nh=s0+40*n;rp=A(max(s[3]+s[2] for s in sec),fa);va=A(max(s[1]+max(s[0],s[2]) for s in sec),sa);pay=bytearray(b'\x90'*120)+chk;rs=A(len(pay),fa)
+          if len(b)<rp+rs:b.extend(b'\0'*(rp+rs-len(b)))
+          b[rp:rp+len(pay)]=pay;cr=va+120
+          for i,(x,r,z) in enumerate(sites):tr=va+10*i;to=rp+10*i;b[to]=0xb8;struct.pack_into('<I',b,to+1,z);b[to+5]=0xe9;struct.pack_into('<i',b,to+6,cr-(tr+10));b[x]=0xe8;struct.pack_into('<i',b,x+1,tr-(r+5));b[x+5]=0x90
+          b[nh:nh+8]=b'.stkfix\0';p32(nh+8,len(pay));p32(nh+12,va);p32(nh+16,rs);p32(nh+20,rp);p32(nh+24,0);p32(nh+28,0);p16(nh+32,0);p16(nh+34,0);p32(nh+36,0x60000020);p16(pe+6,n+1);p32(opt+56,A(va+len(pay),sa));p32(opt+64,0)
+          Path('SigProcDll-64HF.dll').write_bytes(b);h=hashlib.sha256(b).hexdigest();v=Path('verified_sha.txt').read_text().strip();print(h,v)
+          if h!=v:sys.exit('HANDOFF_SHA_NOT_FULLREG_SHA')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\regen.py
+          python $env:RUNNER_TEMP\regen.py
+      - name: Publish short-lived verified binary handoff
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete $env:HANDOFF_TAG --cleanup-tag -y 2>$null
+          gh release create $env:HANDOFF_TAG .\SigProcDll-64HF.dll --prerelease --title 'Temporary verified stackprobe DLL handoff' --notes 'Exact SHA is bound to STACKPROBE_FIXED_COMPLETE_REGRESSION_PASS.lock. This release is automatically removed.'
+          "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:HANDOFF_TAG/SigProcDll-64HF.dll" | Out-File handoff_url.txt -Encoding ascii
+      - name: Keep handoff briefly then remove
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Start-Sleep -Seconds 900
+          gh release delete $env:HANDOFF_TAG --cleanup-tag -y
