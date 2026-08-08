@@ -1,0 +1,39 @@
+name: probe-v4-key-channel-v2
+on:
+  push:
+    paths:
+      - '.github/workflows/probe_v4_key_channel_v2.yml'
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Probe legacy wrapped-key Drive channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          curl -L --fail --retry 3 --retry-delay 1 -o "$RUNNER_TEMP/probe.bin" "$url"
+          size=$(wc -c < "$RUNNER_TEMP/probe.bin" | tr -d '[:space:]')
+          echo "PROBE_BYTES=$size"
+          test "$size" = 10
+          grep -Fxq 'identical' "$RUNNER_TEMP/probe.bin"
+          echo V4_KEY_CHANNEL_ANON_READ_PASS
+      - name: Commit PASS lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch origin main
+          git checkout -B main origin/main
+          mkdir -p evidence_summary
+          printf '%s\n' 'V4_KEY_CHANNEL_ANON_READ_PASS' > evidence_summary/V4_KEY_CHANNEL_PASS.lock
+          git add evidence_summary/V4_KEY_CHANNEL_PASS.lock
+          git commit -m 'Record V4 key channel pass' || true
+          git push origin HEAD:main
