@@ -1,0 +1,163 @@
+name: recover-7c305-artifact-native-gate
+on: push
+permissions:
+  contents: write
+  actions: read
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      ASSET: c3e59360fecf87fe66a1c1a8366c3fa8eabd446e
+      GHF_SHA: f5e507d88d181923b774abb2ac51e5b2e26034e53199b111f1de7e50e8e4e8eb
+      GHF_XZ_SHA: 4e8a9a69d015a960dc2c91a313637011401b677c7c564cd5160911d6540a7579
+      RT_XZ_SHA: 9f467fd7f70e04d387d7bf7c8455d2ecf5f4bee91ad12c7522cae3ab1d7870b6
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Recover exact 7c305 DLL from existing Actions artifacts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force scan | Out-Null
+          $json = gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100"
+          $pages = @($json | ConvertFrom-Json)
+          $arts = @()
+          foreach($p in $pages){ if($p.artifacts){ $arts += $p.artifacts } }
+          $arts = $arts | Where-Object { -not $_.expired -and $_.size_in_bytes -lt 120000000 -and $_.name -match '(?i)(7c305|stack|fixed|native|final|regress|seq|v4|payload|delivery)' } | Sort-Object id -Descending
+          "ARTIFACT_CANDIDATES=$($arts.Count)" | Tee-Object artifact_scan.txt
+          foreach($a in $arts){
+            if(Test-Path .\SigProcDll-64HF.dll){ break }
+            $d = Join-Path scan ([string]$a.id)
+            New-Item -ItemType Directory -Force $d | Out-Null
+            try { gh run download ([string]$a.workflow_run.id) -n ([string]$a.name) -D $d 2>$null } catch { continue }
+            @'
+          import hashlib,lzma,zipfile,tarfile,io,sys,os
+          from pathlib import Path
+          FIX=os.environ['FIX_SHA']; root=Path(sys.argv[1]); out=Path('SigProcDll-64HF.dll')
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          def hit(b,src):
+              if sha(b)==FIX:
+                  out.write_bytes(b); print('FOUND_EXACT_7C305',src); return True
+              return False
+          for p in root.rglob('*'):
+              if not p.is_file(): continue
+              try:b=p.read_bytes()
+              except:continue
+              if hit(b,str(p)): sys.exit(0)
+              if p.suffix.lower()=='.xz':
+                  try:
+                      d=lzma.decompress(b)
+                      if hit(d,str(p)+'::xz'): sys.exit(0)
+                      if zipfile.is_zipfile(io.BytesIO(d)):
+                          z=zipfile.ZipFile(io.BytesIO(d))
+                          for n in z.namelist():
+                              try:q=z.read(n)
+                              except:continue
+                              if hit(q,str(p)+'::'+n): sys.exit(0)
+                  except: pass
+              if p.suffix.lower()=='.zip' or zipfile.is_zipfile(p):
+                  try:
+                      z=zipfile.ZipFile(p)
+                      for n in z.namelist():
+                          try:q=z.read(n)
+                          except:continue
+                          if hit(q,str(p)+'::'+n): sys.exit(0)
+                  except: pass
+          sys.exit(2)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\scan_one.py
+            python $env:RUNNER_TEMP\scan_one.py $d 2>&1 | Tee-Object -Append artifact_scan.txt
+            if($LASTEXITCODE -eq 0 -and (Test-Path .\SigProcDll-64HF.dll)){ break }
+          }
+          if(!(Test-Path .\SigProcDll-64HF.dll)){ throw 'EXACT_7C305_NOT_FOUND_IN_ARTIFACTS' }
+          $h=(Get-FileHash .\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h-ne$env:FIX_SHA){throw "RECOVERED_SHA_MISMATCH $h"}
+          "EXACT_7C305_ARTIFACT_RECOVERY_PASS SHA256=$h" | Tee-Object recovered_sha.txt
+      - name: Recover bound real GHF/runtime/source assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p a/ghf a/rt a/src
+          for i in 00 01 02 03; do git show "$ASSET:.release7c305_realghf/chunk_$i"; done | tr -d '\r\n' | base64 -d > a/ghf/x.xz
+          test "$(sha256sum a/ghf/x.xz|awk '{print $1}')" = "$GHF_XZ_SHA"
+          xz -dc a/ghf/x.xz > a/ghf/real.ghf
+          test "$(sha256sum a/ghf/real.ghf|awk '{print $1}')" = "$GHF_SHA"
+          for i in 00 01 02 03; do git show "$ASSET:.release7c305_runtime/chunk_$i"; done | tr -d '\r\n' | base64 -d > a/rt/x.xz
+          test "$(sha256sum a/rt/x.xz|awk '{print $1}')" = "$RT_XZ_SHA"
+          git show "$ASSET:.release7c305_native/native_nonzero_smoke.c" > a/src/smoke.c
+          echo BOUND_REAL_ASSETS_PASS
+      - name: Expand runtime
+        shell: powershell
+        run: |
+          @'
+          import lzma,tarfile,io,pathlib
+          raw=lzma.decompress(pathlib.Path('a/rt/x.xz').read_bytes());out=pathlib.Path('a/rt/u');out.mkdir(parents=True,exist_ok=True)
+          with tarfile.open(fileobj=io.BytesIO(raw),mode='r:*') as t:t.extractall(out)
+          print('RUNTIME_FILES',sum(1 for x in out.rglob('*') if x.is_file()))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\expand.py
+          python $env:RUNNER_TEMP\expand.py | Tee-Object runtime_expand.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Static PE ABI and stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash .\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne$env:FIX_SHA){throw 'SHA'}
+          dumpbin /headers .\SigProcDll-64HF.dll > headers.txt
+          dumpbin /exports .\SigProcDll-64HF.dll > exports.txt
+          dumpbin /imports .\SigProcDll-64HF.dll > imports.txt
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if(-not(Select-String exports.txt -SimpleMatch $e -Quiet)){throw "EXPORT $e"}}
+          if(-not(Select-String headers.txt -SimpleMatch '.stkfix' -Quiet)){throw 'NO_STKFIX'}
+          if(Select-String imports.txt -SimpleMatch 'ucrtbase.dll' -Quiet){throw 'UCRT'}
+          cl /nologo /O2 /EHsc /Fe:smoke.exe a\src\smoke.c
+          if($LASTEXITCODE-ne0){throw 'COMPILE'}
+          'STATIC_ABI_STACKPROBE_PASS'|Out-File static_pass.txt
+      - name: Execute real nonzero GHF across all bound runtimes and repeat20
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$ghf=(Resolve-Path 'a\ghf\real.ghf').Path;$dll=(Resolve-Path '.\SigProcDll-64HF.dll').Path
+          $dirs=Get-ChildItem a\rt\u -Directory -Recurse|Where-Object{(Test-Path(Join-Path $_.FullName 'filter_brth'))-and(Test-Path(Join-Path $_.FullName 'filter_hrt3'))-and(Test-Path(Join-Path $_.FullName 'file_sig')}
+          if(-not$dirs){throw 'NO_RUNTIME'};$n=0
+          foreach($d in $dirs){$n++;$root=Join-Path $PWD "env$n";$rt=Join-Path $root runtime;New-Item -ItemType Directory -Force $rt|Out-Null;Copy-Item $dll (Join-Path $root 'SigProcDll-64HF.dll');Copy-Item (Join-Path $d.FullName '*') $rt -Recurse -Force;.\smoke.exe $rt $ghf 2>&1|Tee-Object "real_$n.txt";if($LASTEXITCODE-ne0){throw "REAL $n"};if(-not(Select-String "real_$n.txt" -SimpleMatch 'NONZERO_NATIVE_SMOKE_PASS' -Quiet)){throw 'SENTINEL'}}
+          $rt=(Resolve-Path 'env1\runtime').Path
+          1..20|%{.\smoke.exe $rt $ghf *> "rep_$_.txt";if($LASTEXITCODE-ne0){throw "REPEAT $_"}}
+          "REAL_RUNTIME_COUNT=$n"|Out-File native_runtime_count.txt
+          'NATIVE_REAL_GHF_REPEAT20_PASS'|Out-File native_dynamic_pass.txt
+      - name: Bind exact native PASS and persist exact DLL
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash .\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne$env:FIX_SHA){throw 'POST_SHA'}
+          "NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS SHA256=$h"|Out-File native.lock -Encoding ascii
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin main;git checkout -q -B main origin/main
+          New-Item -ItemType Directory -Force evidence_summary,.validated_7c305 | Out-Null
+          Copy-Item native.lock evidence_summary\NATIVE_WINDOWS_7C305_REAL_NONZERO_PASS.lock -Force
+          Copy-Item static_pass.txt evidence_summary\native_7c305_static_pass.txt -Force
+          Copy-Item native_dynamic_pass.txt evidence_summary\native_7c305_dynamic_pass.txt -Force
+          Copy-Item native_runtime_count.txt evidence_summary\native_7c305_runtime_count.txt -Force
+          Copy-Item .\SigProcDll-64HF.dll .validated_7c305\SigProcDll-64HF.dll -Force
+          git add evidence_summary .validated_7c305\SigProcDll-64HF.dll
+          git commit -m 'Persist exact 7c305 DLL after native real-GHF PASS'
+          git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exact-7c305-native-artifact-gate-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            native.lock
+            recovered_sha.txt
+            artifact_scan.txt
+            static_pass.txt
+            native_dynamic_pass.txt
+            native_runtime_count.txt
+            headers.txt
+            exports.txt
+            imports.txt
+            real_*.txt
