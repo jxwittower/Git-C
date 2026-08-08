@@ -1,0 +1,21 @@
+name: probe-v4-key-channel
+on:
+  push:
+    paths:
+      - '.github/workflows/probe_v4_key_channel.yml'
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - name: Probe legacy wrapped-key Drive channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          curl -L --fail --retry 3 --retry-delay 1 -o "$RUNNER_TEMP/probe.bin" "$url"
+          size=$(wc -c < "$RUNNER_TEMP/probe.bin" | tr -d '[:space:]')
+          echo "PROBE_BYTES=$size"
+          cat "$RUNNER_TEMP/probe.bin"
+          test "$size" = 10
+          grep -Fxq 'identical' "$RUNNER_TEMP/probe.bin"
+          echo V4_KEY_CHANNEL_ANON_READ_PASS
