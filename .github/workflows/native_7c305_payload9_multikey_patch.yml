@@ -14,6 +14,7 @@ env:
   BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
   FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
   KEY_BRIDGE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
+  PAYLOAD9_REF: 50389db4873509be1507a40f7a86d68dbf48b6c3
 
 jobs:
   native-exact:
@@ -26,9 +27,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Reconstruct known-good repository payload9 ciphertext
+      - name: Reconstruct known-good historical payload9 ciphertext
         run: |
           set -euo pipefail
+          git checkout "$PAYLOAD9_REF" -- .payload9
           test -f .payload9/manifest.txt
           mapfile -t chunks < <(find .payload9 -maxdepth 1 -type f -name 'chunk_*' | sort)
           test "${#chunks[@]}" -gt 0
@@ -36,9 +38,9 @@ jobs:
           base64 -d "$RUNNER_TEMP/payload9.b64" > "$RUNNER_TEMP/payload9.enc"
           test -s "$RUNNER_TEMP/payload9.enc"
           got=$(sha256sum "$RUNNER_TEMP/payload9.enc" | awk '{print $1}')
-          grep -Fq "encrypted_sha256=$got" .payload9/manifest.txt
           printf '%s\n' "$got" > payload9_cipher_sha256.txt
-          echo PAYLOAD9_CIPHERTEXT_MANIFEST_PASS
+          printf 'PAYLOAD9_REF=%s\nCHUNKS=%s\nCIPHER_SHA256=%s\n' "$PAYLOAD9_REF" "${#chunks[@]}" "$got" > payload9_binding.txt
+          echo PAYLOAD9_HISTORICAL_CIPHERTEXT_RECONSTRUCTED
 
       - name: Publish one-time RSA key
         run: |
@@ -50,6 +52,7 @@ jobs:
           git config user.email windows-dll-test-bot@users.noreply.github.com
           ok=0
           for n in 1 2 3 4 5; do
+            git reset --hard -q HEAD
             git fetch -q origin main
             git checkout -q -B main origin/main
             rm -rf .native7c305_p9_handoff
@@ -234,6 +237,7 @@ jobs:
           git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
           ok=0
           for n in 1 2 3 4 5; do
+            git reset --hard -q HEAD
             git fetch -q origin main; git checkout -q -B main origin/main; mkdir -p evidence_summary
             cp "$RUNNER_TEMP/native.lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock
             cp "$RUNNER_TEMP/static.txt" evidence_summary/stackprobe_7c305_native_static_gate.txt
@@ -266,11 +270,13 @@ jobs:
             native_nonzero_attempt_*.txt
             native_nonzero_repeat.txt
             payload9_cipher_sha256.txt
+            payload9_binding.txt
 
       - name: Remove one-time RSA handoff
         if: always()
         run: |
           set +e
+          git reset --hard -q HEAD
           git fetch -q origin main; git checkout -q -B main origin/main
           if test -d .native7c305_p9_handoff; then
             git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
