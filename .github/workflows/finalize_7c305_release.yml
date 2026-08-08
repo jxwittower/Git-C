@@ -1,0 +1,174 @@
+name: finalize-7c305-release
+on:
+  push:
+    paths:
+      - '.github/workflows/finalize_7c305_release.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+  TAG: guanhu-sigproc-final-fixed-20260809
+
+jobs:
+  finalize:
+    runs-on: windows-2022
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Wait for and require both exact SHA release locks
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $native="STACKPROBE_NATIVE_NONZERO_PASS SHA256=$env:FIX_SHA"
+          $full="FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_STACKPROBE_PASS SHA256=$env:FIX_SHA"
+          $ok=$false
+          for($i=0;$i -lt 360;$i++){
+            git fetch -q origin main
+            try {
+              $n=(git show origin/main:evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock 2>$null).Trim()
+              $f=(git show origin/main:evidence_summary/STACKPROBE_FULL_REGRESSION_PASS.lock 2>$null).Trim()
+              if($n -eq $native -and $f -eq $full){$ok=$true;break}
+            } catch {}
+            Start-Sleep -Seconds 10
+          }
+          if(!$ok){throw 'EXACT_NATIVE_AND_FULLREG_LOCKS_NOT_BOTH_PRESENT'}
+          'BOTH_EXACT_7C305_WINDOWS_RELEASE_LOCKS_PASS' | Out-File both_release_locks_pass.txt
+
+      - name: Download exact fully tested artifact from successful gate run
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import os,json,subprocess,zipfile,pathlib,hashlib,shutil,sys
+          repo=os.environ['GITHUB_REPOSITORY']; FIX=os.environ['FIX_SHA']; out=pathlib.Path('tested_artifact'); shutil.rmtree(out,ignore_errors=True); out.mkdir()
+          # Find newest nonexpired artifact from the combined gate, then fallback to native exact gate.
+          arts=[]
+          for page in range(1,5):
+              d=json.loads(subprocess.check_output(['gh','api',f'/repos/{repo}/actions/artifacts?per_page=100&page={page}'],text=True))
+              arts += d.get('artifacts',[])
+              if len(d.get('artifacts',[]))<100: break
+          names=('exact-7c305-native-complete-regression','exact-7c305-native-artifact-gate')
+          cand=[a for a in arts if not a.get('expired') and a.get('name') in names]
+          cand.sort(key=lambda a:int(a['id']),reverse=True)
+          if not cand: raise SystemExit('NO_EXACT_TESTED_ARTIFACT')
+          picked=None
+          for a in cand:
+              zp=pathlib.Path(os.environ['RUNNER_TEMP'])/f"release_{a['id']}.zip"
+              with open(zp,'wb') as f:
+                  r=subprocess.run(['gh','api',f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],stdout=f,stderr=subprocess.PIPE)
+              if r.returncode or not zipfile.is_zipfile(zp): continue
+              d=pathlib.Path('try_art'); shutil.rmtree(d,ignore_errors=True); d.mkdir(); zipfile.ZipFile(zp).extractall(d)
+              dlls=list(d.rglob('SigProcDll-64HF.dll'))
+              for p in dlls:
+                  h=hashlib.sha256(p.read_bytes()).hexdigest()
+                  if h==FIX:
+                      shutil.copy2(p,out/'SigProcDll-64HF.dll'); picked=(a,p); break
+              if picked: break
+          if not picked: raise SystemExit('EXACT_TESTED_DLL_NOT_FOUND_IN_GATE_ARTIFACTS')
+          a,p=picked
+          (pathlib.Path('tested_artifact_provenance.txt')).write_text(f'ARTIFACT_ID={a["id"]}\nARTIFACT_NAME={a["name"]}\nSOURCE_PATH={p}\nSHA256={FIX}\n')
+          print('EXACT_TESTED_ARTIFACT_BOUND',a['id'],a['name'],FIX)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\fetch_tested.py
+          python $env:RUNNER_TEMP\fetch_tested.py
+
+      - name: Build final release and perform independent ZIP readback audit
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Resolve-Path 'tested_artifact\SigProcDll-64HF.dll').Path
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $env:FIX_SHA){throw 'TESTED_DLL_SHA_MISMATCH'}
+          New-Item -ItemType Directory -Force release\evidence | Out-Null
+          Copy-Item $dll release\SigProcDll-64HF.dll -Force
+          git fetch -q origin main
+          foreach($f in @('STACKPROBE_NATIVE_NONZERO_PASS.lock','STACKPROBE_FULL_REGRESSION_PASS.lock','native_static_pass.txt','native_dynamic_pass.txt','complete_regression_runner_pass.txt','seq_target_pass.txt','full_suite_coverage_pass.txt','post_regression_sha256.txt')){
+            git show "origin/main:evidence_summary/$f" | Out-File -Encoding ascii "release\evidence\$f"
+          }
+          @"
+GuanHu SigProc FINAL FIXED release - 2026-08-09
+
+Primary DLL: SigProcDll-64HF.dll
+SHA256: $env:FIX_SHA
+Architecture: Windows PE32 / x86
+Exports: _SigProc_Init@8, _SigProc@24, _SigProc_Stat@0, _SigProc_Fini@0
+
+Critical correction:
+- Fixed Windows x86 large-stack page probing at 12 allocation sites (.stkfix).
+- The previously unsafe 66a44 build is revoked and is not included.
+
+Exact-SHA release gates:
+- Native Windows real nonzero input in fresh processes: PASS.
+- Complete Windows regression for same SHA: PASS.
+- Full suite covers 2000/20000 stress/long stability, determinism, performance, inner/outer, C63, HostCompat, and sequential target sentinel.
+- Post-regression SHA remained identical.
+- This ZIP is independently extracted after creation and DLL bytes are compared to the tested artifact.
+"@ | Out-File -Encoding ascii release\RELEASE_README.txt
+          Copy-Item tested_artifact_provenance.txt release\evidence\tested_artifact_provenance.txt
+          Push-Location release
+          Get-ChildItem -Recurse -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.FullName.Substring((Get-Location).Path.Length+1).Replace('\','/'))" } | Out-File -Encoding ascii SHA256SUMS.txt
+          Compress-Archive -Path SigProcDll-64HF.dll,RELEASE_README.txt,SHA256SUMS.txt,evidence -DestinationPath ..\GuanHu_SigProc_FINAL_FIXED_20260809.zip -Force
+          Pop-Location
+          $zip=(Resolve-Path 'GuanHu_SigProc_FINAL_FIXED_20260809.zip').Path
+          $zipsha=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant(); "$zipsha  GuanHu_SigProc_FINAL_FIXED_20260809.zip" | Out-File -Encoding ascii GuanHu_SigProc_FINAL_FIXED_20260809.zip.sha256
+          Remove-Item -Recurse -Force zip_audit -ErrorAction SilentlyContinue; Expand-Archive -Path $zip -DestinationPath zip_audit -Force
+          $inside=(Resolve-Path 'zip_audit\SigProcDll-64HF.dll').Path
+          $ih=(Get-FileHash $inside -Algorithm SHA256).Hash.ToLowerInvariant(); if($ih -ne $env:FIX_SHA){throw 'ZIP_DLL_SHA_MISMATCH'}
+          $a=[IO.File]::ReadAllBytes($dll); $b=[IO.File]::ReadAllBytes($inside); if($a.Length -ne $b.Length){throw 'ZIP_DLL_SIZE_MISMATCH'}
+          for($i=0;$i -lt $a.Length;$i++){if($a[$i] -ne $b[$i]){throw "ZIP_DLL_BYTE_MISMATCH_AT_$i"}}
+          "FINAL_ZIP_EXACT_TESTED_DLL_READBACK_PASS SHA256=$env:FIX_SHA ZIP_SHA256=$zipsha" | Out-File -Encoding ascii FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt
+
+      - name: Publish final GitHub Release assets
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          gh release view $env:TAG *> $null
+          if($LASTEXITCODE -eq 0){ gh release delete $env:TAG --yes --cleanup-tag }
+          gh release create $env:TAG --title 'GuanHu SigProc FINAL FIXED 2026-08-09' --notes-file release\RELEASE_README.txt release\SigProcDll-64HF.dll#SigProcDll-64HF_FINAL_FIXED_20260809.dll GuanHu_SigProc_FINAL_FIXED_20260809.zip GuanHu_SigProc_FINAL_FIXED_20260809.zip.sha256 FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt
+          if($LASTEXITCODE -ne 0){throw 'GH_RELEASE_CREATE_FAILED'}
+          $url="https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:TAG"
+          "FINAL_RELEASE_READY`nSHA256=$env:FIX_SHA`nURL=$url`nDLL=SigProcDll-64HF_FINAL_FIXED_20260809.dll`nZIP=GuanHu_SigProc_FINAL_FIXED_20260809.zip" | Out-File -Encoding ascii FINAL_RELEASE_READY.txt
+
+      - name: Commit final release attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp FINAL_RELEASE_READY.txt "$RUNNER_TEMP/ready"
+          cp FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt "$RUNNER_TEMP/audit"
+          git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main; git checkout -q -B main origin/main; mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/ready" evidence_summary/FINAL_RELEASE_READY.txt
+            cp "$RUNNER_TEMP/audit" evidence_summary/FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt
+            git add evidence_summary/FINAL_RELEASE_READY.txt evidence_summary/FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt
+            git commit -qm 'Publish final exact 7c305 release attestation' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+
+      - name: Upload final release package as Actions artifact too
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GuanHu-SigProc-FINAL-FIXED-20260809
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            release/SigProcDll-64HF.dll
+            release/RELEASE_README.txt
+            release/SHA256SUMS.txt
+            release/evidence/**
+            GuanHu_SigProc_FINAL_FIXED_20260809.zip
+            GuanHu_SigProc_FINAL_FIXED_20260809.zip.sha256
+            FINAL_ZIP_EXACT_DLL_AUDIT_PASS.txt
+            FINAL_RELEASE_READY.txt
