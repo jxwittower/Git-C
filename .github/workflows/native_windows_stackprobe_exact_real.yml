@@ -1,0 +1,237 @@
+name: native-windows-stackprobe-exact-real
+on:
+  push:
+    paths:
+      - '.github/workflows/native_windows_stackprobe_exact_real.yml'
+permissions:
+  contents: write
+jobs:
+  exact-real:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Assemble existing encrypted p3 payload
+        run: |
+          set -euo pipefail
+          test -d .p3
+          mapfile -t chunks < <(find .p3 -maxdepth 1 -type f -name 'chunk_*' | sort)
+          test "${#chunks[@]}" -ge 1
+          cat "${chunks[@]}" > "$RUNNER_TEMP/p3.enc"
+          test -s "$RUNNER_TEMP/p3.enc"
+          sha256sum "$RUNNER_TEMP/p3.enc" | tee p3_cipher_sha256.txt
+          echo "P3_ASSEMBLED chunks=${#chunks[@]} bytes=$(wc -c < "$RUNNER_TEMP/p3.enc" | tr -d '[:space:]')"
+
+      - name: Publish one-time RSA public key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p .stackprobe_exact_handoff
+            rm -f .stackprobe_exact_handoff/wrapped_candidates.b64
+            cp "$RUNNER_TEMP/public.pem" .stackprobe_exact_handoff/public.pem
+            git add .stackprobe_exact_handoff/public.pem .stackprobe_exact_handoff/wrapped_candidates.b64 2>/dev/null || true
+            git commit -qm 'Publish exact stackprobe one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo STACKPROBE_EXACT_RSA_PUBLISHED
+
+      - name: Wait for RSA-wrapped local pass candidates and recover exact payload
+        run: |
+          set -euo pipefail
+          TARGET='7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'
+          ok=0
+          for poll in $(seq 1 600); do
+            git fetch -q origin main || true
+            if git show origin/main:.stackprobe_exact_handoff/wrapped_candidates.b64 > "$RUNNER_TEMP/wrapped_candidates.b64" 2>/dev/null; then
+              idx=0
+              while IFS= read -r line; do
+                idx=$((idx+1))
+                test -n "$line" || continue
+                printf '%s' "$line" | base64 -d > "$RUNNER_TEMP/key.bin" 2>/dev/null || continue
+                test "$(wc -c < "$RUNNER_TEMP/key.bin" | tr -d '[:space:]')" = 384 || continue
+                if ! openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.bin" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  continue
+                fi
+                for iter in 100000 200000 250000; do
+                  rm -rf payload_try
+                  rm -f "$RUNNER_TEMP/p3.tar.xz"
+                  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iter" -md sha256 -in "$RUNNER_TEMP/p3.enc" -out "$RUNNER_TEMP/p3.tar.xz" -pass file:"$RUNNER_TEMP/pass.try" >/dev/null 2>&1; then
+                    continue
+                  fi
+                  if ! xz -t "$RUNNER_TEMP/p3.tar.xz" >/dev/null 2>&1; then
+                    continue
+                  fi
+                  mkdir payload_try
+                  if ! tar -xJf "$RUNNER_TEMP/p3.tar.xz" -C payload_try >/dev/null 2>&1; then
+                    continue
+                  fi
+                  found=$(find payload_try -type f -iname '*.dll' -print0 | xargs -0 -r sha256sum | awk -v h="$TARGET" '$1==h{print $2; exit}')
+                  if [ -n "$found" ]; then
+                    rm -rf payload
+                    mv payload_try payload
+                    cp "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/matched_pass.txt"
+                    printf 'MATCHED_WRAPPED_CANDIDATE_INDEX=%s\nAES_ITER=%s\nEXACT_SHA256=%s\n' "$idx" "$iter" "$TARGET" | tee payload_recovery.txt
+                    ok=1
+                    break 3
+                  fi
+                done
+              done < "$RUNNER_TEMP/wrapped_candidates.b64"
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=NO_MATCHING_WRAPPED_PASS_OR_EXACT_DLL; exit 20; }
+          echo EXACT_STACKPROBE_PAYLOAD_RECOVERED
+
+      - name: Bind exact fixed DLL and discover native test assets
+        run: |
+          set -euo pipefail
+          TARGET='7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'
+          dll=$(find payload -type f -iname '*.dll' -print0 | xargs -0 -r sha256sum | awk -v h="$TARGET" '$1==h{print $2; exit}')
+          test -n "$dll"
+          printf '%s\n' "$dll" > exact_dll_path.txt
+          sha256sum "$dll" | tee exact_dll_sha256.txt
+          file "$dll" | tee exact_dll_file.txt
+          find payload -type f -maxdepth 8 | sort | tee payload_file_list.txt
+          test -n "$(find payload -type f -name 'filter_brth' -print -quit)"
+          test -n "$(find payload -type f -name 'filter_hrt3' -print -quit)"
+          test -n "$(find payload -type f -name 'file_sig' -print -quit)"
+          echo EXACT_BINARY_AND_RUNTIME_BOUND
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: PE ABI import and stackfix section gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Get-Content exact_dll_path.txt -Raw).Trim()
+          dumpbin /headers $dll | Tee-Object exact_headers.txt
+          dumpbin /exports $dll | Tee-Object exact_exports.txt
+          dumpbin /imports $dll | Tee-Object exact_imports.txt
+          $h=Get-FileHash $dll -Algorithm SHA256
+          if($h.Hash.ToLowerInvariant() -ne '7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'){ throw 'HASH_DRIFT' }
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){
+            if(-not (Select-String -Path exact_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" }
+          }
+          if(-not (Select-String -Path exact_headers.txt -SimpleMatch '.stkfix' -Quiet)){ throw 'STACKFIX_SECTION_MISSING' }
+          if(Select-String -Path exact_imports.txt -SimpleMatch 'ucrtbase.dll' -Quiet){ throw 'DIRECT_UCRTBASE_IMPORT' }
+          'PE_ABI_IMPORT_STACKFIX_GATE_PASS' | Out-File pe_gate_pass.txt
+
+      - name: Compile every available x86 DLL smoke or regression host
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $patterns=@('native_nonzero_smoke.c','sigproc_loader_contract_smoke.c','sigproc_regression_host.c')
+          $compiled=@()
+          foreach($p in $patterns){
+            $src=Get-ChildItem payload -Recurse -Filter $p -File | Select-Object -First 1
+            if($src){
+              $out=Join-Path $env:RUNNER_TEMP (($p -replace '\.c$','')+'.exe')
+              & cl.exe /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS $src.FullName /Fe:$out
+              if($LASTEXITCODE -eq 0 -and (Test-Path $out)){ $compiled += $out; "COMPILED=$out SOURCE=$($src.FullName)" | Add-Content compiled_hosts.txt }
+            }
+          }
+          if($compiled.Count -eq 0){ throw 'NO_NATIVE_HOST_SOURCE_COMPILED' }
+
+      - name: Execute real DLL load and nonzero-capable native paths
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          $target='7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64'
+          $dll=(Resolve-Path ((Get-Content exact_dll_path.txt -Raw).Trim())).Path
+          $runtimeFile=Get-ChildItem payload -Recurse -Filter 'filter_brth' -File | Select-Object -First 1
+          if(!$runtimeFile){ throw 'RUNTIME_ROOT_MISSING' }
+          $runtime=$runtimeFile.Directory.FullName
+          Copy-Item $dll (Join-Path $runtime 'SigProcDll-64HF.dll') -Force
+          $ghf=Get-ChildItem payload -Recurse -Filter '*.ghf' -File | Select-Object -First 1
+          $ran=0; $nonzero=$false
+          foreach($line in Get-Content compiled_hosts.txt){
+            if($line -notmatch '^COMPILED=(.*?) SOURCE=(.*)$'){ continue }
+            $exe=$Matches[1]; $src=$Matches[2]; $name=[IO.Path]::GetFileName($src)
+            $log=Join-Path (Get-Location) ("native_"+$name+".log")
+            Push-Location $runtime
+            try {
+              if($name -eq 'native_nonzero_smoke.c'){
+                if(!$ghf){ throw 'NONZERO_GHF_MISSING' }
+                & $exe '.\SigProcDll-64HF.dll' $ghf.FullName 2>&1 | Tee-Object $log
+                if($LASTEXITCODE -ne 0){ throw "NONZERO_SMOKE_EXIT_$LASTEXITCODE" }
+                if(Select-String -Path $log -Pattern 'NONZERO_NATIVE_SMOKE_PASS|PASS' -Quiet){ $nonzero=$true }
+                $ran++
+              } elseif($name -eq 'sigproc_loader_contract_smoke.c') {
+                & $exe '.\SigProcDll-64HF.dll' 2>&1 | Tee-Object $log
+                if($LASTEXITCODE -ne 0){ throw "LOADER_SMOKE_EXIT_$LASTEXITCODE" }
+                $ran++
+              } elseif($name -eq 'sigproc_regression_host.c' -and $ghf) {
+                & $exe '.\SigProcDll-64HF.dll' $ghf.FullName 2>&1 | Tee-Object $log
+                if($LASTEXITCODE -ne 0){ throw "REGRESSION_HOST_EXIT_$LASTEXITCODE" }
+                $nonzero=$true
+                $ran++
+              }
+            } finally { Pop-Location }
+          }
+          if($ran -lt 1){ throw 'NO_NATIVE_EXECUTION' }
+          if(!$nonzero){ throw 'NO_CONFIRMED_NONZERO_SIGPROC_PATH' }
+          $post=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $target){ throw 'POST_EXEC_HASH_DRIFT' }
+          "EXACT_NATIVE_NONZERO_STACKPROBE_PASS SHA256=$target" | Out-File exact_native_nonzero_pass.txt
+
+      - name: Commit exact native nonzero PASS lock
+        if: success()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          printf '%s\n' 'EXACT_NATIVE_NONZERO_STACKPROBE_PASS SHA256=7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64' > evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B gate origin/main
+            mkdir -p evidence_summary
+            cp "$GITHUB_WORKSPACE/evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock" evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock 2>/dev/null || true
+            git add evidence_summary/STACKPROBE_7C305_NATIVE_NONZERO_PASS.lock
+            git commit -qm 'Record exact 7c305 native nonzero PASS' || true
+            if git push -q origin HEAD:main; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackprobe-7c305-native-real-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            p3_cipher_sha256.txt
+            payload_recovery.txt
+            payload_file_list.txt
+            exact_dll_sha256.txt
+            exact_dll_file.txt
+            exact_headers.txt
+            exact_exports.txt
+            exact_imports.txt
+            pe_gate_pass.txt
+            compiled_hosts.txt
+            native_*.log
+            exact_native_nonzero_pass.txt
