@@ -1,0 +1,186 @@
+name: native-7c305-artifact-harvest-gate
+on:
+  push:
+    paths:
+      - '.github/workflows/native_7c305_artifact_harvest_gate.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+
+jobs:
+  native-artifact:
+    runs-on: windows-2022
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Harvest exact fixed DLL and real native assets from authenticated Actions artifacts
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import os,sys,json,hashlib,zipfile,subprocess,pathlib,shutil
+          root=pathlib.Path.cwd(); out=root/'native_harvest'; shutil.rmtree(out,ignore_errors=True); out.mkdir()
+          FIX=os.environ['FIX_SHA']; repo=os.environ['GITHUB_REPOSITORY']
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+              return h.hexdigest()
+          arts=[]
+          for page in range(1,8):
+              r=subprocess.run(['gh','api',f'/repos/{repo}/actions/artifacts?per_page=100&page={page}'],capture_output=True,text=True,check=True)
+              batch=json.loads(r.stdout).get('artifacts',[]); arts += batch
+              if len(batch)<100: break
+          arts=[a for a in arts if not a.get('expired') and 0<a.get('size_in_bytes',0)<120_000_000]
+          keys=('7c305','stack','native','nonzero','final','full','regress','seq','v4','delivery','fixed')
+          arts.sort(key=lambda a:(0 if any(k in a['name'].lower() for k in keys) else 1,-int(a['id'])))
+          print('ARTIFACT_COUNT',len(arts))
+          got_dll=got_src=got_ghf=False; collected=set(); provenance=[]
+          for idx,a in enumerate(arts):
+              if got_dll and got_src and got_ghf and {'file_sig','filter_brth','filter_hrt3'} <= collected: break
+              if idx>180 and not any(k in a['name'].lower() for k in keys): continue
+              zpath=pathlib.Path(os.environ['RUNNER_TEMP'])/f"art_{a['id']}.zip"
+              try:
+                  with open(zpath,'wb') as f:
+                      rr=subprocess.run(['gh','api',f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],stdout=f,stderr=subprocess.PIPE)
+                  if rr.returncode or not zipfile.is_zipfile(zpath): continue
+                  with zipfile.ZipFile(zpath) as z:
+                      for n in z.namelist():
+                          if n.endswith('/'): continue
+                          base=pathlib.PurePosixPath(n).name
+                          low=base.lower()
+                          if not (low.endswith('.dll') or low.endswith('.c') or low.endswith('.ghf') or base in {'file_sig','filter_brth','filter_hrt3','file_bed_model_v1'}): continue
+                          try: data=z.read(n)
+                          except: continue
+                          if low.endswith('.dll'):
+                              h=hashlib.sha256(data).hexdigest()
+                              if h==FIX and not got_dll:
+                                  (out/'SigProcDll-64HF.dll').write_bytes(data); got_dll=True; provenance.append(f'DLL artifact={a["id"]} name={a["name"]} path={n}')
+                          elif low=='native_nonzero_smoke.c' and not got_src:
+                              (out/'native_nonzero_smoke.c').write_bytes(data); got_src=True; provenance.append(f'SRC artifact={a["id"]} name={a["name"]} path={n}')
+                          elif low.endswith('.ghf') and not got_ghf:
+                              (out/'prefix20.ghf').write_bytes(data); got_ghf=True; provenance.append(f'GHF artifact={a["id"]} name={a["name"]} path={n}')
+                          elif base in {'file_sig','filter_brth','filter_hrt3','file_bed_model_v1'} and base not in collected:
+                              (out/base).write_bytes(data); collected.add(base); provenance.append(f'RUNTIME {base} artifact={a["id"]} name={a["name"]} path={n}')
+              except Exception as e:
+                  print('ARTIFACT_WARN',a.get('id'),type(e).__name__,str(e)[:120])
+              finally:
+                  try:zpath.unlink()
+                  except:pass
+          (root/'native_harvest_provenance.txt').write_text('\n'.join(provenance)+'\n')
+          if not got_dll: raise SystemExit('EXACT_7C305_DLL_NOT_FOUND_IN_ACTIONS_ARTIFACTS')
+          if not got_src: raise SystemExit('NATIVE_NONZERO_SMOKE_SOURCE_NOT_FOUND')
+          if not got_ghf: raise SystemExit('REAL_GHF_NOT_FOUND')
+          h=sha(out/'SigProcDll-64HF.dll')
+          if h!=FIX: raise SystemExit('HARVEST_SHA_BIND_FAIL')
+          print('EXACT_7C305_NATIVE_ARTIFACT_HARVEST_PASS',h)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\harvest.py
+          python $env:RUNNER_TEMP\harvest.py 2>&1 | Tee-Object native_harvest.log
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI imports and stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Resolve-Path 'native_harvest\SigProcDll-64HF.dll').Path
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FIX_SHA){throw 'STATIC_SHA_BIND_FAIL'}
+          dumpbin /headers $dll | Out-File native_headers.txt
+          dumpbin /exports $dll | Out-File native_exports.txt
+          dumpbin /imports $dll | Out-File native_imports.txt
+          $hdr=Get-Content native_headers.txt -Raw; $exp=Get-Content native_exports.txt -Raw; $imp=Get-Content native_imports.txt -Raw
+          if($hdr -notmatch '14C machine' -and $hdr -notmatch 'machine \(x86\)'){throw 'NOT_X86'}
+          if($hdr -notmatch '\.stkfix'){throw 'STACKFIX_SECTION_MISSING'}
+          foreach($e in @('_SigProc_Init@8','_SigProc@24','_SigProc_Stat@0','_SigProc_Fini@0')){if($exp -notmatch [regex]::Escape($e)){throw "MISSING_EXPORT $e"}}
+          if($imp -match '(?im)^\s*ucrtbase\.dll\s*$'){throw 'DIRECT_UCRTBASE_IMPORT_FORBIDDEN'}
+          'EXACT_7C305_PE_ABI_IMPORT_STACKFIX_PASS' | Out-File native_static_gate.txt
+
+      - name: Compile and execute real nonzero path in two fresh processes
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          $work=(Resolve-Path 'native_harvest').Path
+          $src=Join-Path $work 'native_nonzero_smoke.c'
+          $dll=Join-Path $work 'SigProcDll-64HF.dll'
+          $ghf=Join-Path $work 'prefix20.ghf'
+          $exe=Join-Path $work 'native_nonzero_smoke.exe'
+          cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS $src /Fe:$exe 2>&1 | Tee-Object native_compile.txt
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_HOST_COMPILE_FAILED'}
+          Push-Location $work
+          try {
+            & .\native_nonzero_smoke.exe '.\SigProcDll-64HF.dll' '.\prefix20.ghf' 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero_first.log"
+            $r1=$LASTEXITCODE
+            & .\native_nonzero_smoke.exe '.\SigProcDll-64HF.dll' '.\prefix20.ghf' 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\native_nonzero_repeat.log"
+            $r2=$LASTEXITCODE
+          } finally { Pop-Location }
+          if($r1 -ne 0){throw "FIRST_NATIVE_NONZERO_EXIT_$r1"}
+          if($r2 -ne 0){throw "REPEAT_NATIVE_NONZERO_EXIT_$r2"}
+          $t1=Get-Content native_nonzero_first.log -Raw; $t2=Get-Content native_nonzero_repeat.log -Raw
+          if($t1 -notmatch '(?i)PASS'){throw 'FIRST_PASS_SENTINEL_MISSING'}
+          if($t2 -notmatch '(?i)PASS'){throw 'REPEAT_PASS_SENTINEL_MISSING'}
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FIX_SHA){throw 'POST_DYNAMIC_SHA_DRIFT'}
+          "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$h" | Out-File exact_native_pass.lock
+          'REAL_NONZERO_WINDOWS_X86_FRESH_PROCESS_REPEAT_PASS' | Out-File native_dynamic_gate.txt
+
+      - name: Commit exact native PASS lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fxq "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$FIX_SHA" exact_native_pass.lock
+          cp exact_native_pass.lock "$RUNNER_TEMP/lock"
+          cp native_static_gate.txt "$RUNNER_TEMP/static"
+          cp native_dynamic_gate.txt "$RUNNER_TEMP/dynamic"
+          cp native_harvest_provenance.txt "$RUNNER_TEMP/provenance"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/lock" evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock
+            cp "$RUNNER_TEMP/static" evidence_summary/stackprobe_7c305_native_static_gate.txt
+            cp "$RUNNER_TEMP/dynamic" evidence_summary/stackprobe_7c305_native_dynamic_gate.txt
+            cp "$RUNNER_TEMP/provenance" evidence_summary/stackprobe_7c305_native_artifact_provenance.txt
+            git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock evidence_summary/stackprobe_7c305_native_static_gate.txt evidence_summary/stackprobe_7c305_native_dynamic_gate.txt evidence_summary/stackprobe_7c305_native_artifact_provenance.txt
+            git commit -qm 'PASS exact 7c305 native Windows nonzero gate' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          test "$ok" = 1
+          echo EXACT_7C305_NATIVE_ARTIFACT_GATE_PASS_LOCK_COMMITTED
+
+      - name: Upload exact tested DLL and native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-7c305-native-artifact-gate
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            native_harvest/SigProcDll-64HF.dll
+            native_harvest_provenance.txt
+            native_harvest.log
+            native_headers.txt
+            native_exports.txt
+            native_imports.txt
+            native_static_gate.txt
+            native_dynamic_gate.txt
+            exact_native_pass.lock
+            native_nonzero_first.log
+            native_nonzero_repeat.log
