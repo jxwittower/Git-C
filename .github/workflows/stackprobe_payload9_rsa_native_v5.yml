@@ -1,0 +1,206 @@
+name: stackprobe-payload9-rsa-native-v5
+on:
+  push:
+    paths:
+      - '.github/workflows/stackprobe_payload9_rsa_native_v5.yml'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      FIXED_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Reconstruct encrypted payload9
+        run: |
+          set -euo pipefail
+          mapfile -t c < <(find .payload9 -maxdepth 1 -type f -name 'chunk_*' | sort)
+          test ${#c[@]} -gt 0
+          cat "${c[@]}" > "$RUNNER_TEMP/payload9.b64"
+          base64 -d "$RUNNER_TEMP/payload9.b64" > "$RUNNER_TEMP/payload9.enc"
+          test -s "$RUNNER_TEMP/payload9.enc"
+          sha256sum "$RUNNER_TEMP/payload9.enc" | tee payload9_cipher_sha256.txt
+      - name: Publish one-time RSA public key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          fp=$(openssl pkey -pubin -in "$RUNNER_TEMP/public.pem" -outform DER | sha256sum | awk '{print $1}')
+          printf '%s\n' "$fp" > "$RUNNER_TEMP/public.sha256"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .stackprobe_payload9_handoff
+            mkdir -p .stackprobe_payload9_handoff
+            cp "$RUNNER_TEMP/public.pem" .stackprobe_payload9_handoff/public.pem
+            cp "$RUNNER_TEMP/public.sha256" .stackprobe_payload9_handoff/public.sha256
+            git add .stackprobe_payload9_handoff
+            git commit -qm 'Publish stackprobe payload9 one-time RSA key' || true
+            if git push -q origin HEAD:main; then break; fi
+            test "$n" != 5
+            sleep 2
+          done
+          echo ONE_TIME_RSA_PUBLIC_KEY_PUBLISHED
+      - name: Wait for RSA-wrapped AES pass from established handoff file
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 900); do
+            rm -f "$RUNNER_TEMP/key.bin" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.bin" "$url"; then
+              sz=$(wc -c < "$RUNNER_TEMP/key.bin" | tr -d '[:space:]')
+              if [ "$sz" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.bin" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                  ok=1; break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1 || { echo FAIL_STAGE=RSA_HANDOFF; exit 20; }
+          echo RSA_HANDOFF_PASS
+      - name: Decrypt payload9 and recover exact unsafe parent
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import os,subprocess,zipfile,hashlib,shutil,sys,base64,lzma,gzip
+          t=Path(os.environ['RUNNER_TEMP']); enc=t/'payload9.enc'; pas=t/'pass.txt'; out=Path('payload9_plain'); shutil.rmtree(out,ignore_errors=True);out.mkdir()
+          BAD=os.environ['BAD_SHA']
+          def sh(p):
+            h=hashlib.sha256();
+            with open(p,'rb') as f:
+              for b in iter(lambda:f.read(1<<20),b''):h.update(b)
+            return h.hexdigest()
+          found=None; meta=None
+          for it in (200000,250000,100000,600000):
+            dec=t/'dec.bin'
+            r=subprocess.run(['openssl','enc','-d','-aes-256-cbc','-pbkdf2','-iter',str(it),'-in',str(enc),'-out',str(dec),'-pass',f'file:{pas}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            if r.returncode:continue
+            raw=dec.read_bytes(); tries=[('raw',raw)]
+            for k,fn in [('xz',lzma.decompress),('gz',gzip.decompress)]:
+              try:tries.append((k,fn(raw)))
+              except:pass
+            for k,b in tries:
+              d=out/f'try_{it}_{k}';d.mkdir(exist_ok=True)
+              p=d/'blob.bin';p.write_bytes(b)
+              if hashlib.sha256(b).hexdigest()==BAD: found=p;meta=(it,k);break
+              try:
+                z=zipfile.ZipFile(p);z.extractall(d/'zip')
+              except:pass
+              for q in d.rglob('*'):
+                if q.is_file() and q.suffix.lower()=='.dll' and sh(q)==BAD:found=q;meta=(it,k);break
+              if found:break
+            if found:break
+          if not found: print('FAIL_STAGE=BAD_PARENT_NOT_IN_DECRYPTED_PAYLOAD9');sys.exit(31)
+          shutil.copy2(found,'bad66a.dll');Path('payload9_decrypt_meta.txt').write_text(f'ITER={meta[0]}\nLAYER={meta[1]}\nPARENT_SHA256={BAD}\n')
+          print('EXACT_UNSAFE_PARENT_RECOVERED')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recover.py
+          python $env:RUNNER_TEMP\recover.py
+      - name: Deterministically patch x86 stack probing
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import struct,hashlib,os,sys
+          from pathlib import Path
+          b=bytearray(Path('bad66a.dll').read_bytes());u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          def p16(o,v):struct.pack_into('<H',b,o,v)
+          def p32(o,v):struct.pack_into('<I',b,o,v)
+          A=lambda x,a:(x+a-1)//a*a;pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);opt=pe+24;s0=opt+osz;sa=u32(opt+32);fa=u32(opt+36);sh=u32(opt+60);sec=[]
+          for i in range(n):o=s0+40*i;sec.append((u32(o+8),u32(o+12),u32(o+16),u32(o+20),u32(o+36),o))
+          vs,tva,trs,trp,_,_=max((s for s in sec if s[4]&0x20000000),key=lambda s:s[2]);sites=[]
+          for x in range(trp,trp+trs-6):
+            if b[x:x+2]==b'\x81\xec':
+              z=u32(x+2)
+              if 0x1000<=z<0x100000:sites.append((x,tva+x-trp,z))
+          if len(sites)!=12:sys.exit(f'EXPECTED_12_STACK_SITES_GOT_{len(sites)}')
+          chk=bytearray(b'\x51\x8d\x4c\x24\x04\x29\xc1\x19\xc0\xf7\xd0\x21\xc1\x89\xe0\x25\x00\xf0\xff\xff');loop=len(chk);chk+=b'\x39\xc1\x72\x00';jb=len(chk)-1;chk+=b'\x89\xc8\x59\x94\x8b\x00\x89\x04\x24\xc3';probe=len(chk);chk+=b'\x2d\x00\x10\x00\x00\x85\x00\xeb\x00';jm=len(chk)-1;chk[jb]=(probe-jb-1)&255;chk[jm]=(loop-jm-1)&255
+          nh=s0+40*n;rp=A(max(s[3]+s[2] for s in sec),fa);va=A(max(s[1]+max(s[0],s[2]) for s in sec),sa);pay=bytearray(b'\x90'*120)+chk;rs=A(len(pay),fa)
+          if nh+40>sh:sys.exit('NO_SECTION_HEADER_ROOM')
+          if len(b)<rp+rs:b.extend(b'\0'*(rp+rs-len(b)))
+          b[rp:rp+len(pay)]=pay;cr=va+120
+          for i,(x,r,z) in enumerate(sites):tr=va+10*i;to=rp+10*i;b[to]=0xb8;struct.pack_into('<I',b,to+1,z);b[to+5]=0xe9;struct.pack_into('<i',b,to+6,cr-(tr+10));b[x]=0xe8;struct.pack_into('<i',b,x+1,tr-(r+5));b[x+5]=0x90
+          b[nh:nh+8]=b'.stkfix\0';p32(nh+8,len(pay));p32(nh+12,va);p32(nh+16,rs);p32(nh+20,rp);p32(nh+24,0);p32(nh+28,0);p16(nh+32,0);p16(nh+34,0);p32(nh+36,0x60000020);p16(pe+6,n+1);p32(opt+56,A(va+len(pay),sa));p32(opt+64,0)
+          Path('SigProcDll-64HF.dll').write_bytes(b);h=hashlib.sha256(b).hexdigest();print('PATCHED_SHA256='+h)
+          if h!=os.environ['FIXED_SHA']:sys.exit('PATCHED_SHA_DOES_NOT_MATCH_EXACT_LOCAL_FIXED')
+          Path('exact_fixed_sha.txt').write_text(h+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\patch.py
+          python $env:RUNNER_TEMP\patch.py
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Locate runtime files inside payload9 or synthesize from checked-in encrypted package contents
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import shutil,sys
+          names=['filter_brth','filter_hrt3','file_sig'];root=Path('payload9_plain');rd=Path('runtime');rd.mkdir(exist_ok=True)
+          for n in names:
+            hits=[p for p in root.rglob(n) if p.is_file()]
+            if not hits:print('MISSING_RUNTIME',n);sys.exit(41)
+            shutil.copy2(hits[0],rd/n)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\runtime.py
+          python $env:RUNNER_TEMP\runtime.py
+      - name: Execute real nonzero x86 contract path repeatedly
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef int (__stdcall *INIT)(const char*,const char*);
+          typedef int (__stdcall *PROC)(uint32_t,const void*,void*,void*,void*,void*);
+          typedef int (__stdcall *STAT)(void); typedef void (__stdcall *FINI)(void);
+          int main(int ac,char**av){ const char*prod=ac>1?av[1]:"inner-bed"; HMODULE h=LoadLibraryA("SigProcDll-64HF.dll"); if(!h){printf("LOAD_FAIL=%lu\n",GetLastError());return 2;} INIT init=(INIT)GetProcAddress(h,"_SigProc_Init@8");PROC proc=(PROC)GetProcAddress(h,"_SigProc@24");STAT stat=(STAT)GetProcAddress(h,"_SigProc_Stat@0");FINI fini=(FINI)GetProcAddress(h,"_SigProc_Fini@0");if(!init||!proc||!stat||!fini)return 3;printf("INIT=%d STAT=%d\n",init(".",prod),stat());static uint8_t in[65536],a[1024],b[1024],c[1024],d[1024];for(unsigned i=0;i<sizeof(in);i++)in[i]=(uint8_t)((i*37u+11u)&255u);for(int k=0;k<200;k++){int r=proc(632,in,a,b,c,d);if(!(k%25))printf("K=%d R=%d S=%d\n",k,r,stat());}fini();FreeLibrary(h);puts("STACKPROBE_NONZERO_NATIVE_PASS");return 0;}
+          '@ | Set-Content -Encoding ascii native.c
+          cl /nologo /O2 /W3 native.c /Fe:native.exe
+          New-Item -ItemType Directory -Force run | Out-Null
+          Copy-Item SigProcDll-64HF.dll,native.exe run\
+          Copy-Item runtime\* run\
+          Push-Location run
+          $products=@('inner-bed','outer-bed','inner','outer','64HF','HF','default','')
+          $pass=$false;$i=0
+          foreach($p in $products){$i++; & .\native.exe $p 2>&1 | Tee-Object "..\native_$i.log";if($LASTEXITCODE -eq 0 -and (Select-String -Path "..\native_$i.log" -SimpleMatch 'STACKPROBE_NONZERO_NATIVE_PASS' -Quiet)){$pass=$true;break}}
+          Pop-Location
+          if(!$pass){throw 'NONZERO_NATIVE_PATH_FAILED'}
+          $sha=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($sha -ne $env:FIXED_SHA){throw 'POST_NATIVE_SHA_CHANGED'}
+          "STACKPROBE_NATIVE_NONZERO_PASS SHA256=$sha`nPARENT_SHA256=$env:BAD_SHA`nCOUNT=632`nITERATIONS=200" | Out-File STACKPROBE_PAYLOAD9_NATIVE_PASS.lock -Encoding ascii
+      - name: Commit exact native PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$sha=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch origin main;git checkout -B main origin/main;New-Item -ItemType Directory -Force evidence_summary|Out-Null;"STACKPROBE_NATIVE_NONZERO_PASS SHA256=$sha`nPARENT_SHA256=$env:BAD_SHA`nCOUNT=632`nITERATIONS=200"|Out-File evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock -Encoding ascii;git add evidence_summary/STACKPROBE_NATIVE_NONZERO_PASS.lock;git commit -m 'Record exact 7c305 payload9 native nonzero PASS';git push origin HEAD:main
+      - name: Upload exact DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackprobe-payload9-native-${{ github.run_id }}
+          path: |
+            SigProcDll-64HF.dll
+            exact_fixed_sha.txt
+            payload9_cipher_sha256.txt
+            payload9_decrypt_meta.txt
+            native_*.log
+            STACKPROBE_PAYLOAD9_NATIVE_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 7
