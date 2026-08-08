@@ -25,7 +25,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -q gdown
-          gdown --id '1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov' -O fixed.xz
+          gdown '1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov' -O fixed.xz
           echo "DOWNLOADED_BYTES=$(wc -c < fixed.xz) SHA=$(sha256sum fixed.xz|awk '{print $1}')"
           test "$(sha256sum fixed.xz|awk '{print $1}')" = "$XZ_SHA"
           xz -dc fixed.xz > SigProcDll-64HF.dll
