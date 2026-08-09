@@ -1,0 +1,125 @@
+name: c8b8-resume-stageE-v3
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_resume_stageE_v3.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+  HANDOFF_BRANCH: c8b8-fullreg-v2-final-20260809
+
+jobs:
+  stageE:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore immutable Windows-ready payload from Stage A
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload | Out-Null
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          if($LASTEXITCODE -ne 0){throw 'PAYLOAD_RESTORE_FAIL'}
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:CAND_SHA){throw "CAND_SHA_BIND_FAIL $h"}
+          "RESTORED_PAYLOAD_RUN=$env:SOURCE_RUN`nCAND_SHA=$h`nRESTORE_PASS" | Set-Content restore_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Compile exact x86 harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS payload\HostReplayWin.c /Fe:payload\HostReplayWin.exe *> stageE_build.txt
+          if($LASTEXITCODE -ne 0){Get-Content stageE_build.txt;throw 'HARNESS_BUILD_FAIL'}
+      - name: Determinism and nonzero stress
+        shell: powershell
+        timeout-minutes: 38
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe="$env:GITHUB_WORKSPACE\payload\HostReplayWin.exe"
+          $ghf=(Resolve-Path 'payload\testdata\inner-bed\02_supine.ghf').Path
+          function New-TestDir([string]$name){
+            $d=Join-Path $env:RUNNER_TEMP $name
+            if(Test-Path $d){Remove-Item -Recurse -Force $d}
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item payload\runtime_inner\* $d -Force
+            Copy-Item payload\SigProcDll-64HF.dll "$d\SigProcDll-64HF.dll" -Force
+            return $d
+          }
+          function Invoke-HarnessProc([string]$dir,[object[]]$argv,[string]$name){
+            $out="$env:GITHUB_WORKSPACE\$name.stdout"
+            $err="$env:GITHUB_WORKSPACE\$name.stderr"
+            $log="$env:GITHUB_WORKSPACE\$name.log"
+            $p=Start-Process -FilePath $exe -ArgumentList $argv -WorkingDirectory $dir -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            Get-Content $out,$err | Set-Content $log
+            Get-Content $log
+            if($p.ExitCode -ne 0){throw "$name RC=$($p.ExitCode)"}
+          }
+          foreach($n in 1,2){
+            $d=New-TestDir "det$n"
+            Invoke-HarnessProc $d @('--dll','.\SigProcDll-64HF.dll','--mode','replay','--ghf',$ghf,'--max-frames','120','--out',"$env:GITHUB_WORKSPACE\det$n.csv") "det$n"
+          }
+          $h1=(Get-FileHash det1.csv -Algorithm SHA256).Hash.ToLowerInvariant()
+          $h2=(Get-FileHash det2.csv -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h1 -ne $h2){throw "DETERMINISM_FAIL $h1 $h2"}
+          "DETERMINISTIC_REPLAY_PASS SHA256=$h1" | Set-Content determinism_gate.txt
+
+          $d=New-TestDir 'stress2k'
+          Invoke-HarnessProc $d @('--dll','.\SigProcDll-64HF.dll','--mode','stress','--ghf',$ghf,'--loops','2000','--threads','2') 'stress_2x2000'
+          if(-not(Select-String -Path stress_2x2000.log -Pattern 'STRESS_PASS threads=2 loops_each=2000' -SimpleMatch -Quiet)){throw 'STRESS2K_MARKER_MISSING'}
+          'THREAD_STRESS_2x2000_PASS' | Set-Content stress_gate.txt
+
+          $d=New-TestDir 'stress20k'
+          Invoke-HarnessProc $d @('--dll','.\SigProcDll-64HF.dll','--mode','stress','--ghf',$ghf,'--loops','20000','--threads','2') 'stress_2x20000'
+          if(-not(Select-String -Path stress_2x20000.log -Pattern 'STRESS_PASS threads=2 loops_each=20000' -SimpleMatch -Quiet)){throw 'STRESS20K_MARKER_MISSING'}
+          'LONG_STABILITY_2x20000_PASS' | Set-Content long_stability_gate.txt
+
+          $post=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $env:CAND_SHA){throw "POST_STAGEE_SHA_FAIL $post"}
+          @('STAGE_E_V3_RESUME_PASS',"SHA256=$post",'DETERMINISM=PASS','THREAD_STRESS_2x2000=PASS','LONG_STABILITY_2x20000=PASS') | Set-Content STAGE_E_V3_RESUME_PASS.lock
+      - name: Persist Stage E PASS in branch
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          git fetch origin $env:HANDOFF_BRANCH
+          git checkout -B $env:HANDOFF_BRANCH "origin/$env:HANDOFF_BRANCH"
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item STAGE_E_V3_RESUME_PASS.lock evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/STAGE_E_V3_RESUME_PASS.lock
+          git commit -m "Record resumed c8b8 Stage E PASS"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Upload Stage E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v3-resume-stageE-${{ github.run_id }}
+          path: |
+            restore_binding.txt
+            stageE_build.txt
+            det1.log
+            det2.log
+            det1.csv
+            det2.csv
+            determinism_gate.txt
+            stress_2x2000.log
+            stress_2x20000.log
+            stress_gate.txt
+            long_stability_gate.txt
+            STAGE_E_V3_RESUME_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
