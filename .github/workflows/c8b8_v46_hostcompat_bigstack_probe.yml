@@ -1,0 +1,83 @@
+name: c8b8-v4.6-hostcompat-bigstack-probe
+on:
+  push:
+    branches: [c8b8-v4-drive-resumable-20260809]
+    paths:
+      - '.github/workflows/c8b8_v46_hostcompat_bigstack_probe.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      SOURCE_RUN: '31314728589'
+      SOURCE_ARTIFACT: c8b8-v4-plaintext-xz-31314728589
+      V45_RUN: '31315905576'
+      V45_ARTIFACT: c8b8-v45-base66a-bigstack-31315905576
+      XZ_SHA: 5a1c750b48a7d436f8ca7a011dd4d925d68891e8241a11aa42bf4bbd30afd3c0
+      XZ_BYTES: '20593840'
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      PAYLOAD_ROOT: c8b8_fullreg_payload_v4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore verified real-data checkpoint and V45 source
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP resume; New-Item -ItemType Directory -Force $d|Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D $d
+          if($LASTEXITCODE -ne 0){throw 'CHECKPOINT_DOWNLOAD_FAIL'}
+          $p=Get-ChildItem $d -Recurse -Filter payload.tar.xz|Select-Object -First 1; if(!$p){throw 'NO_XZ'}
+          $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:XZ_SHA -or $p.Length -ne [int64]$env:XZ_BYTES){throw 'XZ_BIND_FAIL'}
+          $s=Join-Path $env:RUNNER_TEMP stage;New-Item -ItemType Directory -Force $s|Out-Null;7z x -y $p.FullName "-o$s"|Out-Null;$t=Get-ChildItem $s -Filter *.tar|Select-Object -First 1;7z x -y $t.FullName '-o.'|Out-Null
+          $hh=(Get-FileHash "$env:PAYLOAD_ROOT\HostCompat.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($hh -ne $env:HOST_SHA){throw 'HOST_SHA_FAIL'}
+          $src=Join-Path $env:RUNNER_TEMP v45src;New-Item -ItemType Directory -Force $src|Out-Null
+          gh run download $env:V45_RUN -n $env:V45_ARTIFACT -D $src
+          if($LASTEXITCODE -ne 0){throw 'V45_SOURCE_DOWNLOAD_FAIL'}
+          Copy-Item (Get-ChildItem $src -Recurse -Filter base66a_probe.c|Select-Object -First 1).FullName hostcompat_probe.c
+          @'
+          from pathlib import Path
+          p=Path('hostcompat_probe.c');s=p.read_text()
+          old='char c63[1024];snprintf(c63,sizeof(c63),"%s\\\\C63.dll",av[1]);int ok=1;ok&=runone(c63,"C63",av[2],av[3]);ok&=runone("base66a.dll","BASE66A_BIGSTACK",av[2],av[3]);return ok?0:1;'
+          new='char c63[1024],host[1024];snprintf(c63,sizeof(c63),"%s\\\\C63.dll",av[1]);snprintf(host,sizeof(host),"%s\\\\HostCompat.dll",av[1]);int ok=1;ok&=runone(c63,"C63",av[2],av[3]);ok&=runone(host,"HOSTCOMPAT_BIGSTACK",av[2],av[3]);return ok?0:1;'
+          if old not in s: raise SystemExit('SOURCE_PATCH_ANCHOR_FAIL')
+          p.write_text(s.replace(old,new))
+          '@|Set-Content -Encoding ascii patch_source.py
+          python patch_source.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          "RESTORE_PASS xz=$h host=$hh"|Tee-Object restore.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build 32MB fully committed probe
+        shell: powershell
+        run: |
+          cmd.exe /d /c "cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:hostcompat_probe.exe hostcompat_probe.c /link /STACK:33554432,33554432 > hostcompat_probe_compile.txt 2>&1";$rc=$LASTEXITCODE
+          Get-Content hostcompat_probe_compile.txt;if($rc -ne 0){throw "COMPILE_FAIL $rc"}
+          dumpbin /headers hostcompat_probe.exe|Select-String -Pattern 'size of stack reserve|size of stack commit'|Set-Content -Encoding ascii stack_header.txt;Get-Content stack_header.txt
+      - name: Run C63 versus HostCompat on exact real frames
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path $env:PAYLOAD_ROOT).Path
+          cmd.exe /d /c "hostcompat_probe.exe $r $r\testdata $r\runtime > hostcompat_bigstack_probe.log 2>&1";$rc=$LASTEXITCODE
+          Get-Content hostcompat_bigstack_probe.log;"PROBE_EXIT=$rc"|Tee-Object probe_exit.txt
+          if($rc -ne 0){throw "PROBE_FAIL $rc"}
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v46-hostcompat-bigstack-${{ github.run_id }}
+          path: |
+            restore.txt
+            stack_header.txt
+            hostcompat_probe.c
+            hostcompat_probe_compile.txt
+            hostcompat_bigstack_probe.log
+            probe_exit.txt
+          if-no-files-found: ignore
+          retention-days: 30
