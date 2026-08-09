@@ -1,0 +1,100 @@
+name: c8b8-final-consumer-v5
+on:
+  push:
+    branches: [c8b8-final-consumer-v5-20260809]
+    paths: ['.github/workflows/c8b8_final_consumer_v5.yml']
+permissions: {actions: read, contents: write}
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      BRANCH: c8b8-final-consumer-v5-20260809
+      ROOT: c8b8_fullreg_v2_payload
+      ENC_SHA: 0a3f05c61deb236d0e9c6e9d7879fb0d0d84551a765e75dfad25967d6e6c70c8
+      XZ_SHA: 9e24503212064455f50e1f37d8ce15da52d0c2894b1570639ab5644199e6bfcd
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      HOST_SAFE_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+      - uses: actions/download-artifact@v4
+        with:
+          name: c8b8-staged-encrypted-fullreg-31296517289
+          path: stage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31296517289
+      - name: Bind staged ciphertext and publish ephemeral RSA key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$p='stage\c8b8_fullreg_transport.enc';$h=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "STAGE_SHA_FAIL $h"};"STAGED_SHA=$h"|Out-File cp01_stage.txt
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem;openssl pkey -in private.pem -pubout -out public.pem;if($LASTEXITCODE -ne 0){throw 'RSA_FAIL'}
+          New-Item -ItemType Directory -Force .c8b8_v5_handoff|Out-Null;Copy-Item public.pem .c8b8_v5_handoff\public.pem -Force;@("RUN_ID=$env:GITHUB_RUN_ID","CAND_SHA=$env:CAND_SHA","ENC_SHA=$env:ENC_SHA")|Set-Content .c8b8_v5_handoff\binding.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_v5_handoff/public.pem .c8b8_v5_handoff/binding.txt;git commit -m 'Publish c8b8 v5 RSA handoff';git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+      - name: Receive branch-wrapped AES recovery key
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop';$ok=$false
+          for($i=0;$i -lt 180;$i++){git fetch origin $env:BRANCH --quiet;git show "origin/$env:BRANCH`:.c8b8_v5_handoff/wrapped_key.b64" 2>$null|Out-File -Encoding ascii wrapped_key.b64;if($LASTEXITCODE -eq 0 -and (Get-Item wrapped_key.b64 -ErrorAction SilentlyContinue).Length -gt 100){$ok=$true;break};Start-Sleep 5}
+          if(-not $ok){throw 'KEY_HANDOFF_TIMEOUT'};$s=(Get-Content wrapped_key.b64 -Raw).Trim();[IO.File]::WriteAllBytes('wrapped_key.bin',[Convert]::FromBase64String($s));if((Get-Item wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'};'WRAPPED_KEY_PASS'|Out-File cp02_key.txt
+      - name: Decrypt and exact-bind complete payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';openssl pkeyutl -decrypt -inkey private.pem -in wrapped_key.bin -out aes.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256;openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in stage\c8b8_fullreg_transport.enc -out payload.tar.xz -pass file:aes.txt;if($LASTEXITCODE -ne 0){throw 'DECRYPT_FAIL'}
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"};New-Item -ItemType Directory -Force xzstage,unpacked|Out-Null;7z x -y payload.tar.xz "-o$pwd\xzstage"|Out-File 7z_xz.txt;$t=Get-ChildItem xzstage -Filter '*.tar'|Select-Object -First 1;7z x -y $t.FullName "-o$pwd\unpacked"|Out-File 7z_tar.txt;Remove-Item aes.txt -Force
+          $r="unpacked\$env:ROOT";$pairs=@(@('SigProcDll-64HF.dll',$env:CAND_SHA),@('HostCompat.dll',$env:HOST_SHA),@('C63.dll',$env:C63_SHA),@('SigProcLoaderContractSmoke.exe',$env:SMOKE_SHA));foreach($z in $pairs){$h=(Get-FileHash (Join-Path $r $z[0]) -Algorithm SHA256).Hash.ToLowerInvariant();"$h $($z[0])"|Add-Content exact_bind.txt;if($h -ne $z[1]){throw "HASH_FAIL $($z[0])"}}
+          $g=Get-ChildItem (Join-Path $r testdata) -Recurse -Filter '*.ghf';$n=$g.Count;$b=($g|Measure-Object Length -Sum).Sum;if($n -ne 13 -or $b -ne 82484656){throw "GHF_BIND_FAIL n=$n bytes=$b"};"GHF_COUNT=$n`nGHF_BYTES=$b`nEXACT_PAYLOAD_BIND_PASS"|Out-File cp03_payload.txt
+      - name: Build deterministic stack-safe HostCompat comparison baseline
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r="unpacked\$env:ROOT";python tools\c8b8\patch_stack_generic.py (Join-Path $r HostCompat.dll) (Join-Path $r HostCompat_stackprobe.dll) --report hostcompat_stackprobe_report.json|Tee-Object hostcompat_patch.log;if($LASTEXITCODE -ne 0){throw 'HOST_PATCH_FAIL'};$h=(Get-FileHash (Join-Path $r HostCompat_stackprobe.dll) -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:HOST_SAFE_SHA){throw "HOST_SAFE_SHA_FAIL $h"};"HOST_SAFE_SHA=$h"|Out-File cp04_hostsafe.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Static PE ABI and inner outer loader contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r="unpacked\$env:ROOT";$c=Join-Path $r SigProcDll-64HF.dll;dumpbin /headers $c|Out-File -Encoding ascii candidate_headers.txt;dumpbin /exports $c|Out-File -Encoding ascii candidate_exports.txt;dumpbin /dependents $c|Out-File -Encoding ascii candidate_deps.txt;if(-not(Select-String candidate_headers.txt -Pattern '14C machine \(x86\)' -Quiet)){throw 'X86_FAIL'};foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String candidate_exports.txt -SimpleMatch $e -Quiet)){throw "EXPORT_FAIL $e"}};if(Select-String candidate_deps.txt -SimpleMatch 'ucrtbase.dll' -Quiet){throw 'UCRTBASE_FAIL'}
+          foreach($kind in @('inner-bed','outer-medical-bed')){$d="loader_"+($kind-replace'-','_');New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item (Join-Path $r "runtime\$kind\*") $d -Force;Copy-Item $c (Join-Path $d SigProcDll-64HF.dll);Copy-Item (Join-Path $r SigProcLoaderContractSmoke.exe) $d;Push-Location $d;.\SigProcLoaderContractSmoke.exe *>&1|Tee-Object ("..\loader_"+$kind+'.log');$rc=$LASTEXITCODE;Pop-Location;if($rc -ne 0){throw "LOADER_FAIL $kind"}}
+          foreach($p in @('loader_inner-bed.log','loader_outer-medical-bed.log')){if(-not(Select-String $p -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){throw "LOADER_MARKER_FAIL $p"}};'STATIC_ABI_AND_INNER_OUTER_LOADER_PASS'|Out-File cp05_preflight.txt
+      - name: Compile native x86 regression host
+        shell: powershell
+        run: |
+          $r="unpacked\$env:ROOT";cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:native_fullreg_host.exe (Join-Path $r native_fullreg_host.c) 2>&1|Tee-Object compile.log;if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'}
+      - name: Run complete full-data native Windows regression
+        shell: powershell
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path "unpacked\$env:ROOT").Path;$h=(Resolve-Path native_fullreg_host.exe).Path;$ev=Join-Path (Get-Location) evidence;python tools\c8b8\run_complete_regression_v2.py $r $h $ev *>&1|Tee-Object full_regression_v5.log;if($LASTEXITCODE -ne 0){throw 'FULLREG_FAIL'}
+          foreach($m in @('EXACT_BINARY_SHA_BINDING_PASS','HOSTCOMPAT_STACKPROBE_BASELINE_BINDING_PASS','DETERMINISTIC_REPLAY_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','C63_HOSTCOMPAT_COMPARISON_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','PERFORMANCE_AND_STABILITY_PASS','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){if(-not(Select-String full_regression_v5.log -SimpleMatch $m -Quiet)){throw "MARKER_FAIL $m"}};$post=(Get-FileHash (Join-Path $r SigProcDll-64HF.dll) -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:CAND_SHA){throw "POST_SHA_FAIL $post"};"POST_TEST_SHA=$post`nEXACT_C8B8_NATIVE_COMPLETE_FULLREG_PASS"|Out-File cp06_fullreg.txt
+      - name: Commit exact final PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;@('C8B8_EXACT_NATIVE_COMPLETE_FULLREG_PASS',"SHA256=$env:CAND_SHA",'GHF_COUNT=13','GHF_BYTES=82484656',"HOSTCOMPAT_STACKSAFE_SHA=$env:HOST_SAFE_SHA",'STAGE_ARTIFACT_ID=9033124038',"RUN_ID=$env:GITHUB_RUN_ID")|Set-Content evidence_summary\C8B8_FINAL_EXACT_PASS.lock;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/C8B8_FINAL_EXACT_PASS.lock;git commit -m 'Lock exact c8b8 native complete regression PASS';git fetch origin $env:BRANCH;git rebase "origin/$env:BRANCH";git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'PASS_LOCK_PUSH_FAIL'}
+      - name: Upload tested DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-final-exact-tested-${{ github.run_id }}
+          path: |
+            unpacked/c8b8_fullreg_v2_payload/SigProcDll-64HF.dll
+            unpacked/c8b8_fullreg_v2_payload/HostCompat_stackprobe.dll
+            cp*.txt
+            exact_bind.txt
+            hostcompat_stackprobe_report.json
+            hostcompat_patch.log
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_deps.txt
+            loader_*.log
+            compile.log
+            full_regression_v5.log
+            evidence/**
+            evidence_summary/C8B8_FINAL_EXACT_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
