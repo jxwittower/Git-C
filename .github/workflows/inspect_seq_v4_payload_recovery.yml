@@ -1,0 +1,70 @@
+name: inspect-seq-v4-payload-recovery
+on:
+  push:
+    branches: [seq-v4-native-gate-20260808b]
+    paths:
+      - '.github/workflows/inspect_seq_v4_payload_recovery.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruct both historical V4 payload groups
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p recovered
+          cat .seq_candidate_v4_payload/chunk_00 .seq_candidate_v4_payload/chunk_01 > recovered/seq_candidate_v4_payload.b64
+          base64 -d recovered/seq_candidate_v4_payload.b64 > recovered/seq_candidate_v4_payload.bin
+          cat .seq_v4_native_payload/chunk_00.b64 .seq_v4_native_payload/chunk_01.b64 > recovered/seq_v4_native_payload.b64
+          base64 -d recovered/seq_v4_native_payload.b64 > recovered/seq_v4_native_payload.bin
+          {
+            echo '=== reconstructed ==='
+            for f in recovered/*.bin; do
+              echo "FILE=$f"
+              wc -c "$f"
+              sha256sum "$f"
+              file "$f"
+              xxd -l 64 "$f"
+              echo
+            done
+          } | tee recovered/inspection.txt
+      - name: Search current and historical Git for consumers and clues
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '=== current tree path references ==='
+            git grep -n -E 'seq_v4_native_payload|seq_candidate_v4_payload|SEQ_CANDIDATE_V4|candidate_v4|source_payload' HEAD -- . ':!*.lock' || true
+            echo '=== commit messages around seq/candidate/payload/key ==='
+            git log --all --date=iso --pretty=format:'%H %ad %s' --grep='seq\|candidate\|payload\|V4\|key' -i -n 200 || true
+            echo
+            echo '=== all historical file names matching seq/v4/payload/key ==='
+            git log --all --name-only --pretty=format: | grep -Ei 'seq.*v4|v4.*seq|candidate.*v4|v4.*candidate|payload|key' | sort -u | head -n 1000 || true
+          } | tee recovered/history_search.txt
+      - name: Check OpenSSL framing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee recovered/framing.txt
+          from pathlib import Path
+          import hashlib, struct
+          for p in sorted(Path('recovered').glob('*.bin')):
+              b=p.read_bytes()
+              print(p.name, 'bytes',len(b),'sha256',hashlib.sha256(b).hexdigest())
+              print('head16',b[:16].hex(), 'ascii',repr(b[:16]))
+              if b.startswith(b'Salted__') and len(b)>=16:
+                  print('OPENSSL_SALTED salt=',b[8:16].hex(),'ciphertext_bytes=',len(b)-16)
+              print()
+          PY
+      - name: Upload reconstructed small payloads and inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-v4-recovered-small-payloads-${{ github.run_id }}
+          path: recovered/
+          if-no-files-found: error
+          retention-days: 7
