@@ -1,0 +1,377 @@
+name: c8b8-exact-native-fullreg-v2-final
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_fullreg_v2_final.yml'
+permissions:
+  contents: write
+jobs:
+  exact-native-fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 282bebb05253455fca9e22a29841e2bb3d39656ccb9c782ec480c00af19ef035
+      ENC_SHA: 94a5aa9366d3a787d3946abbfc33909e9f4274ef6dd500f90ce7372cd090f364
+      XZ_SHA: 81dcfbb2144ac35fc992dda59497abc1d0694444b70cbef031cdc528e40b5834
+      GHF_COUNT: '13'
+      GHF_BYTES: '82484656'
+      HANDOFF_BRANCH: c8b8-fullreg-v2-final-20260809
+    steps:
+      - name: Checkout exact gate branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create one-time mailbox and RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, secrets, string, urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'
+          domains=req('GET',base+'/domains')
+          members=domains if isinstance(domains,list) else domains.get('hydra:member',domains.get('member',[]))
+          if not members:raise SystemExit('MAILTM_NO_DOMAIN')
+          domain=members[0]['domain']
+          alpha=string.ascii_lowercase+string.digits
+          address='ghc8v2'+''.join(secrets.choice(alpha) for _ in range(16))+'@'+domain
+          password=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(36))
+          req('POST',base+'/accounts',{'address':address,'password':password})
+          token=req('POST',base+'/token',{'address':address,'password':password})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':address,'password':password,'token':token}))
+          Path('mailbox.txt').write_text(address+'\n')
+          Path('subject_prefix.txt').write_text('GuanHu-C8B8-FullRegV2-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('ONE_TIME_MAILBOX_READY',address)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\make_mailbox.py
+          python $env:RUNNER_TEMP\make_mailbox.py
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_fullreg_v2_handoff | Out-Null
+          Copy-Item public.pem .c8b8_fullreg_v2_handoff\public.pem -Force
+          Copy-Item mailbox.txt .c8b8_fullreg_v2_handoff\mailbox.txt -Force
+          Copy-Item subject_prefix.txt .c8b8_fullreg_v2_handoff\subject_prefix.txt -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","CAND_SHA=$env:CAND_SHA") | Set-Content .c8b8_fullreg_v2_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c8b8_fullreg_v2_handoff
+          git commit -m "Publish c8b8 fullreg v2 one-time handoff"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+          'HANDOFF_PUBLISHED' | Set-Content handoff_checkpoint.txt
+
+      - name: Receive encrypted payload chunks and wrapped key
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, time, urllib.request, urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())
+          token=cfg['token'];base='https://api.mail.tm';prefix=Path('subject_prefix.txt').read_text().strip()
+          out=Path('transport');out.mkdir(exist_ok=True)
+          wanted={f'{prefix}-P{i}':i for i in range(1,5)};got=set();key_ok=False;seen=set()
+          def gj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(url):
+              r=urllib.request.Request(url);r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=90) as x:return x.read()
+          deadline=time.time()+1500
+          while time.time()<deadline and (len(got)<4 or not key_ok):
+              listing=gj(base+'/messages');members=listing if isinstance(listing,list) else listing.get('hydra:member',listing.get('member',[]))
+              for m in members:
+                  subj=m.get('subject','');mid=m.get('id')
+                  if subj not in wanted or not mid or mid in seen:continue
+                  seen.add(mid);detail=gj(base+'/messages/'+mid);idx=wanted[subj]
+                  for a in detail.get('attachments',[]):
+                      name=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      data=gb(urllib.parse.urljoin(base,u))
+                      if name==f'c8b8_v2_part{idx}.bin':(out/name).write_bytes(data);got.add(idx)
+                      elif name=='c8b8_v2_wrapped_key.bin':(out/name).write_bytes(data);key_ok=True
+              if len(got)<4 or not key_ok:time.sleep(4)
+          if len(got)!=4 or not key_ok:raise SystemExit(f'TRANSPORT_INCOMPLETE parts={sorted(got)} key={key_ok}')
+          print('MAIL_TRANSPORT_COMPLETE parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\receive_mail.py
+          python $env:RUNNER_TEMP\receive_mail.py | Tee-Object mail_transport.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Reassemble decrypt extract and bind exact assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat transport/c8b8_v2_part1.bin transport/c8b8_v2_part2.bin transport/c8b8_v2_part3.bin transport/c8b8_v2_part4.bin > payload.enc
+          echo "$ENC_SHA  payload.enc" | sha256sum -c -
+          test "$(wc -c < transport/c8b8_v2_wrapped_key.bin | tr -d '[:space:]')" = 384
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in transport/c8b8_v2_wrapped_key.bin -out "$RUNNER_TEMP/aes_pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out payload.tar.xz -pass file:"$RUNNER_TEMP/aes_pass.txt"
+          echo "$XZ_SHA  payload.tar.xz" | sha256sum -c -
+          rm -rf unpack && mkdir unpack
+          tar -xJf payload.tar.xz -C unpack
+          P=unpack/c8b8_fullreg_payload_v2
+          test -f "$P/SigProcDll-64HF.dll"
+          (cd "$P" && sha256sum -c SHA256SUMS.txt)
+          test "$(sha256sum "$P/SigProcDll-64HF.dll" | awk '{print $1}')" = "$CAND_SHA"
+          test "$(sha256sum "$P/HostCompat.dll" | awk '{print $1}')" = "$HOST_SHA"
+          test "$(sha256sum "$P/C63.dll" | awk '{print $1}')" = "$C63_SHA"
+          test "$(sha256sum "$P/SigProcLoaderContractSmoke.exe" | awk '{print $1}')" = "$SMOKE_SHA"
+          test "$(sha256sum "$P/HostReplayWin.c" | awk '{print $1}')" = "$HARNESS_SHA"
+          count=$(find "$P/testdata" -type f -iname '*.ghf' | wc -l | tr -d '[:space:]')
+          bytes=$(find "$P/testdata" -type f -iname '*.ghf' -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+          test "$count" = "$GHF_COUNT"
+          test "$bytes" = "$GHF_BYTES"
+          printf 'CAND_SHA=%s\nGHF_COUNT=%s\nGHF_BYTES=%s\nENC_SHA=%s\nXZ_SHA=%s\nASSET_BINDING_PASS\n' "$CAND_SHA" "$count" "$bytes" "$ENC_SHA" "$XZ_SHA" | tee asset_binding.txt
+          rm -f "$RUNNER_TEMP/aes_pass.txt"
+
+      - name: Upload immutable asset-binding checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v2-asset-binding-${{ github.run_id }}
+          path: |
+            asset_binding.txt
+            mail_transport.txt
+            unpack/c8b8_fullreg_payload_v2/MANIFEST.txt
+            unpack/c8b8_fullreg_payload_v2/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build x86 harness with warnings as errors and run static PE gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS "$P\HostReplayWin.c" /Fe:"$P\HostReplayWin.exe" *> harness_build.txt
+          if($LASTEXITCODE -ne 0){ Get-Content harness_build.txt; throw 'HARNESS_COMPILE_FAIL' }
+          Get-Content harness_build.txt
+          dumpbin /headers "$P\SigProcDll-64HF.dll" | Out-File candidate_headers.txt
+          dumpbin /exports "$P\SigProcDll-64HF.dll" | Out-File candidate_exports.txt
+          dumpbin /dependents "$P\SigProcDll-64HF.dll" | Out-File candidate_dependents.txt
+          dumpbin /dependents "$P\HostCompat.dll" | Out-File hostcompat_dependents.txt
+          if(-not (Select-String candidate_headers.txt -SimpleMatch 'machine (x86)' -Quiet)){ throw 'NOT_X86' }
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){ if(-not (Select-String candidate_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          @'
+          from pathlib import Path
+          import re,struct,sys
+          def deps(p):
+              s=Path(p).read_text(errors='ignore');return {x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',s,re.M|re.I)}
+          c=deps('candidate_dependents.txt');h=deps('hostcompat_dependents.txt')
+          if 'ucrtbase.dll' in c:raise SystemExit('DIRECT_UCRTBASE_FORBIDDEN')
+          extra=sorted(c-h)
+          if extra:raise SystemExit('IMPORT_EXTRA '+','.join(extra))
+          b=Path('unpack/c8b8_fullreg_payload_v2/SigProcDll-64HF.dll').read_bytes()
+          u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);s0=pe+24+osz;bad=[];stk=False
+          for i in range(n):
+              o=s0+40*i;name=b[o:o+8].split(b'\0',1)[0].decode('ascii','ignore');rs=u32(o+16);rp=u32(o+20);ch=u32(o+36)
+              if name=='.stkfix':stk=True
+              if ch&0x20000000:
+                  for off in range(rp,max(rp,rp+rs-6)):
+                      if b[off:off+2]==b'\x81\xec':
+                          imm=u32(off+2)
+                          if 0x1000<=imm<0x100000:bad.append((name,off,imm))
+          if not stk:raise SystemExit('STKFIX_SECTION_MISSING')
+          if bad:raise SystemExit('UNSAFE_DIRECT_LARGE_STACK '+repr(bad))
+          Path('static_gate.txt').write_text('PE32_X86_PASS\nEXPORTS_PASS\nIMPORT_SUBSET_PASS\nSTKFIX_PRESENT\nDIRECT_LARGE_STACK_RESERVATIONS=0\nSTATIC_GATE_PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\static_gate.py
+          python $env:RUNNER_TEMP\static_gate.py
+
+      - name: Candidate loader contract in inner and outer runtime layouts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path
+          function Run-Loader($runtime,$name){
+            $d=Join-Path $env:RUNNER_TEMP $name
+            if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null
+            Copy-Item "$runtime\*" $d -Force
+            Copy-Item "$P\SigProcDll-64HF.dll" "$d\SigProcDll-64HF.dll" -Force
+            Copy-Item "$P\SigProcLoaderContractSmoke.exe" "$d\SigProcLoaderContractSmoke.exe" -Force
+            Push-Location $d
+            try { .\SigProcLoaderContractSmoke.exe *> "$env:GITHUB_WORKSPACE\$name.log"; $rc=$LASTEXITCODE } finally { Pop-Location }
+            Get-Content "$name.log"
+            if($rc -ne 0){throw "$name RC=$rc"}
+            if(-not (Select-String "$name.log" -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){throw "$name MARKER_MISSING"}
+          }
+          Run-Loader "$P\runtime_inner" 'loader_inner'
+          Run-Loader "$P\runtime_outer" 'loader_outer'
+          'INNER_OUTER_LOADER_CONTRACT_PASS' | Out-File loader_gate.txt
+
+      - name: Upload static and loader checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v2-static-loader-${{ github.run_id }}
+          path: |
+            harness_build.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_gate.txt
+            loader_inner.log
+            loader_outer.log
+            loader_gate.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Full 13-GHF native corpus and sequential departure gate
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path
+          $exe="$P\HostReplayWin.exe"
+          function Prep($runtime,$name,$dll){
+            $d=Join-Path $env:RUNNER_TEMP $name
+            if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null
+            Copy-Item "$runtime\*" $d -Force;Copy-Item $dll "$d\SigProcDll-64HF.dll" -Force;return $d
+          }
+          function Replay($dir,$files,$log,$csv,$seq){
+            $args=@('--dll','.\SigProcDll-64HF.dll','--mode','replay')
+            foreach($f in $files){$args+=@('--ghf',$f)}
+            $args+=@('--out',$csv)
+            if($seq){$args+='--sequence-sentinel'}
+            Push-Location $dir
+            try { & $exe @args *> "$env:GITHUB_WORKSPACE\$log"; $rc=$LASTEXITCODE } finally { Pop-Location }
+            Get-Content $log
+            if($rc -ne 0){throw "$log RC=$rc"}
+          }
+          $inner=Get-ChildItem "$P\testdata\inner-bed\*.ghf" | Sort-Object Name | ForEach-Object {$_.FullName}
+          $outer=Get-ChildItem "$P\testdata\outer-medical-bed\*.ghf" | Sort-Object Name | ForEach-Object {$_.FullName}
+          if($inner.Count -ne 6 -or $outer.Count -ne 7){throw 'CORPUS_COUNT_SPLIT_FAIL'}
+          $di=Prep "$P\runtime_inner" 'full_inner' "$P\SigProcDll-64HF.dll"
+          Replay $di $inner 'full_inner.log' "$env:GITHUB_WORKSPACE\full_inner.csv" $false
+          $do=Prep "$P\runtime_outer" 'full_outer' "$P\SigProcDll-64HF.dll"
+          Replay $do $outer 'full_outer.log' "$env:GITHUB_WORKSPACE\full_outer.csv" $true
+          if(-not (Select-String full_outer.log -SimpleMatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -Quiet)){throw 'SEQ_SENTINEL_MARKER_MISSING'}
+          'FULL_13_GHF_NATIVE_CORPUS_PASS' | Out-File corpus_gate.txt
+
+      - name: Real 1Hz candidate and original C63 comparisons
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path;$exe="$P\HostReplayWin.exe"
+          function OneHz($runtime,$dll,$ghf,$name){
+            $d=Join-Path $env:RUNNER_TEMP $name;if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null
+            Copy-Item "$runtime\*" $d -Force;Copy-Item $dll "$d\SigProcDll-64HF.dll" -Force
+            Push-Location $d
+            try { & $exe --dll .\SigProcDll-64HF.dll --mode replay --ghf $ghf --max-frames 60 --sleep-ms 1000 --out "$env:GITHUB_WORKSPACE\$name.csv" *> "$env:GITHUB_WORKSPACE\$name.log"; $rc=$LASTEXITCODE } finally { Pop-Location }
+            Get-Content "$name.log";if($rc -ne 0){throw "$name RC=$rc"};if(-not (Select-String "$name.log" -SimpleMatch 'REPLAY_PASS frames=60' -Quiet)){throw "$name FRAME_MARKER_FAIL"}
+          }
+          OneHz "$P\runtime_inner" "$P\SigProcDll-64HF.dll" "$P\testdata\inner-bed\02_supine.ghf" 'cand_inner_1hz'
+          OneHz "$P\runtime_outer" "$P\SigProcDll-64HF.dll" "$P\testdata\outer-medical-bed\02_supine.ghf" 'cand_outer_1hz'
+          OneHz "$P\runtime_inner" "$P\C63.dll" "$P\testdata\inner-bed\02_supine.ghf" 'c63_inner_1hz'
+          OneHz "$P\runtime_outer" "$P\C63.dll" "$P\testdata\outer-medical-bed\02_supine.ghf" 'c63_outer_1hz'
+          'REALTIME_1HZ_CANDIDATE_AND_C63_PASS' | Out-File realtime_gate.txt
+
+      - name: Deterministic replay and nonzero multithread stability
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path;$exe="$P\HostReplayWin.exe";$ghf="$P\testdata\inner-bed\02_supine.ghf"
+          function Prep($name){$d=Join-Path $env:RUNNER_TEMP $name;if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item "$P\runtime_inner\*" $d -Force;Copy-Item "$P\SigProcDll-64HF.dll" "$d\SigProcDll-64HF.dll" -Force;return $d}
+          foreach($n in 1,2){$d=Prep "det$n";Push-Location $d;try{& $exe --dll .\SigProcDll-64HF.dll --mode replay --ghf $ghf --max-frames 120 --out "$env:GITHUB_WORKSPACE\det$n.csv" *> "$env:GITHUB_WORKSPACE\det$n.log";$rc=$LASTEXITCODE}finally{Pop-Location};if($rc -ne 0){throw "DET$n RC=$rc"}}
+          $h1=(Get-FileHash det1.csv -Algorithm SHA256).Hash;$h2=(Get-FileHash det2.csv -Algorithm SHA256).Hash;if($h1 -ne $h2){throw "DETERMINISM_FAIL $h1 $h2"}
+          "DETERMINISTIC_REPLAY_PASS SHA256=$h1" | Out-File determinism_gate.txt
+          $d=Prep 'stress2k';Push-Location $d;try{& $exe --dll .\SigProcDll-64HF.dll --mode stress --ghf $ghf --loops 2000 --threads 2 *> "$env:GITHUB_WORKSPACE\stress_2x2000.log";$rc=$LASTEXITCODE}finally{Pop-Location};Get-Content stress_2x2000.log;if($rc -ne 0){throw "STRESS2K RC=$rc"};if(-not(Select-String stress_2x2000.log -SimpleMatch 'STRESS_PASS threads=2 loops_each=2000' -Quiet)){throw 'STRESS2K_MARKER'}
+          $d=Prep 'stress20k';Push-Location $d;try{& $exe --dll .\SigProcDll-64HF.dll --mode stress --ghf $ghf --loops 20000 --threads 2 *> "$env:GITHUB_WORKSPACE\stress_2x20000.log";$rc=$LASTEXITCODE}finally{Pop-Location};Get-Content stress_2x20000.log;if($rc -ne 0){throw "STRESS20K RC=$rc"};if(-not(Select-String stress_2x20000.log -SimpleMatch 'STRESS_PASS threads=2 loops_each=20000' -Quiet)){throw 'STRESS20K_MARKER'}
+          'THREAD_STRESS_2x2000_PASS' | Out-File stress_gate.txt
+          'LONG_STABILITY_2x20000_PASS' | Out-File long_stability_gate.txt
+
+      - name: Performance regression against original C63
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path;$exe="$P\HostReplayWin.exe";$ghf="$P\testdata\inner-bed\02_supine.ghf"
+          function Perf($dll,$name){$d=Join-Path $env:RUNNER_TEMP $name;if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item "$P\runtime_inner\*" $d -Force;Copy-Item $dll "$d\SigProcDll-64HF.dll" -Force;$sw=[Diagnostics.Stopwatch]::StartNew();Push-Location $d;try{& $exe --dll .\SigProcDll-64HF.dll --mode replay --ghf $ghf --max-frames 300 --out "$env:GITHUB_WORKSPACE\$name.csv" *> "$env:GITHUB_WORKSPACE\$name.log";$rc=$LASTEXITCODE}finally{Pop-Location};$sw.Stop();if($rc -ne 0){throw "$name RC=$rc"};return $sw.ElapsedMilliseconds}
+          $cand=Perf "$P\SigProcDll-64HF.dll" 'perf_candidate';$orig=Perf "$P\C63.dll" 'perf_c63';$limit=[Math]::Max(2000,5*$orig+500)
+          @("CANDIDATE_MS=$cand","C63_MS=$orig","LIMIT_MS=$limit") | Set-Content performance.txt
+          if($cand -gt $limit){Get-Content performance.txt;throw 'PERFORMANCE_REGRESSION_FAIL'}
+          'PERFORMANCE_GATE_PASS' | Add-Content performance.txt;Get-Content performance.txt
+
+      - name: Exact post-test SHA and release PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $P=(Resolve-Path 'unpack\c8b8_fullreg_payload_v2').Path
+          $h=(Get-FileHash "$P\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:CAND_SHA){throw "POST_TEST_SHA_FAIL $h"}
+          foreach($f in @('asset_binding.txt','static_gate.txt','loader_gate.txt','corpus_gate.txt','realtime_gate.txt','determinism_gate.txt','stress_gate.txt','long_stability_gate.txt','performance.txt')){if(!(Test-Path $f)){throw "MISSING_GATE_FILE $f"}}
+          @("C8B8_EXACT_NATIVE_WINDOWS_FULLREG_V2_PASS","SHA256=$h","RUN_ID=$env:GITHUB_RUN_ID","GHF_COUNT=$env:GHF_COUNT","GHF_BYTES=$env:GHF_BYTES","POST_TEST_SHA_MATCH=PASS") | Set-Content C8B8_EXACT_NATIVE_FULLREG_V2_PASS.lock
+          Get-Content C8B8_EXACT_NATIVE_FULLREG_V2_PASS.lock
+
+      - name: Commit exact PASS lock to gate branch
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item C8B8_EXACT_NATIVE_FULLREG_V2_PASS.lock evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/C8B8_EXACT_NATIVE_FULLREG_V2_PASS.lock
+          git commit -m "Record exact c8b8 full native regression v2 PASS"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+
+      - name: Upload final exact tested DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-exact-native-fullreg-v2-${{ github.run_id }}
+          path: |
+            unpack/c8b8_fullreg_payload_v2/SigProcDll-64HF.dll
+            unpack/c8b8_fullreg_payload_v2/MANIFEST.txt
+            asset_binding.txt
+            mail_transport.txt
+            harness_build.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_gate.txt
+            loader_inner.log
+            loader_outer.log
+            loader_gate.txt
+            full_inner.log
+            full_outer.log
+            full_inner.csv
+            full_outer.csv
+            corpus_gate.txt
+            cand_inner_1hz.log
+            cand_outer_1hz.log
+            c63_inner_1hz.log
+            c63_outer_1hz.log
+            realtime_gate.txt
+            det1.log
+            det2.log
+            determinism_gate.txt
+            stress_2x2000.log
+            stress_2x20000.log
+            stress_gate.txt
+            long_stability_gate.txt
+            perf_candidate.log
+            perf_c63.log
+            performance.txt
+            C8B8_EXACT_NATIVE_FULLREG_V2_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
