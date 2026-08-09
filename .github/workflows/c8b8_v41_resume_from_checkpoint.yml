@@ -1,0 +1,226 @@
+name: c8b8-v4.1-hot-standby-from-checkpoint
+on:
+  push:
+    branches: [c8b8-v4-drive-resumable-20260809]
+    paths:
+      - '.github/workflows/c8b8_v41_resume_from_checkpoint.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      SOURCE_RUN: '31314728589'
+      SOURCE_ARTIFACT: c8b8-v4-plaintext-xz-31314728589
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      XZ_SHA: 5a1c750b48a7d436f8ca7a011dd4d925d68891e8241a11aa42bf4bbd30afd3c0
+      XZ_BYTES: '20593840'
+      GHF_FILES: '13'
+      GHF_BYTES: '82484656'
+      GHF_FRAMES: '10808'
+      PAYLOAD_ROOT: c8b8_fullreg_payload_v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore exact plaintext XZ checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP 'resume'; New-Item -ItemType Directory -Force $d | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D $d
+          if($LASTEXITCODE -ne 0){ throw 'CHECKPOINT_DOWNLOAD_FAIL' }
+          $p=Get-ChildItem $d -Recurse -Filter payload.tar.xz | Select-Object -First 1
+          if(!$p){ throw 'CHECKPOINT_FILE_MISSING' }
+          $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); $sz=$p.Length
+          if($h -ne $env:XZ_SHA -or $sz -ne [int64]$env:XZ_BYTES){ throw "CHECKPOINT_BIND_FAIL $h $sz" }
+          Copy-Item -Force $p.FullName "$env:RUNNER_TEMP\payload.tar.xz"
+          "CHECKPOINT_RESTORE_PASS artifact=$env:SOURCE_ARTIFACT sha=$h bytes=$sz" | Tee-Object checkpoint_restore.txt
+
+      - name: SevenZip extract exact self-contained payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Remove-Item -Recurse -Force $env:PAYLOAD_ROOT -ErrorAction SilentlyContinue
+          $stage=Join-Path $env:RUNNER_TEMP 'xz_stage'; Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $stage | Out-Null
+          7z x -y "$env:RUNNER_TEMP\payload.tar.xz" "-o$stage" | Tee-Object extract_xz.txt
+          if($LASTEXITCODE -ne 0){ throw "SEVENZIP_XZ_FAIL $LASTEXITCODE" }
+          $tar=Get-ChildItem $stage -File | Where-Object {$_.Extension -eq '.tar'} | Select-Object -First 1
+          if(!$tar){ throw 'TAR_STAGE_MISSING' }
+          7z x -y $tar.FullName '-o.' | Tee-Object extract_tar.txt
+          if($LASTEXITCODE -ne 0){ throw "SEVENZIP_TAR_FAIL $LASTEXITCODE" }
+          if(!(Test-Path "$env:PAYLOAD_ROOT\fullreg.c")){ throw 'PAYLOAD_ROOT_MISSING' }
+          'SEVENZIP_EXTRACT_PASS' | Tee-Object extract_gate.txt
+
+      - name: Verify manifest binaries and complete real GHF corpus
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib,os,struct
+          from pathlib import Path
+          root=Path(os.environ['PAYLOAD_ROOT'])
+          for line in (root/'MANIFEST_SHA256.txt').read_text().splitlines():
+              h,rel=line.split(None,1); rel=rel.strip(); rel=rel[2:] if rel.startswith('./') else rel
+              p=root/rel; got=hashlib.sha256(p.read_bytes()).hexdigest()
+              if got!=h: raise SystemExit(f'MANIFEST_FAIL {rel} {got} {h}')
+          expected={'SigProcDll-64HF.dll':os.environ['CAND_SHA'],'HostCompat.dll':os.environ['HOST_SHA'],'C63.dll':os.environ['C63_SHA'],'SigProcLoaderContractSmoke.exe':os.environ['SMOKE_SHA']}
+          for n,h in expected.items():
+              got=hashlib.sha256((root/n).read_bytes()).hexdigest()
+              if got!=h: raise SystemExit(f'BINARY_BIND_FAIL {n} {got}')
+          ghfs=sorted((root/'testdata').rglob('*.ghf')); total=sum(p.stat().st_size for p in ghfs); frames=0
+          for p in ghfs:
+              b=p.read_bytes(); off=0
+              while off<len(b):
+                  if off+6>len(b): raise SystemExit(f'GHF_HEADER_FAIL {p}')
+                  n,tl=struct.unpack_from('<IH',b,off); off += 6+tl+n*12; frames += 1
+                  if off>len(b): raise SystemExit(f'GHF_PARSE_FAIL {p}')
+              if off!=len(b): raise SystemExit(f'GHF_TRAILING_FAIL {p}')
+          if len(ghfs)!=int(os.environ['GHF_FILES']) or total!=int(os.environ['GHF_BYTES']) or frames!=int(os.environ['GHF_FRAMES']): raise SystemExit(f'GHF_BIND_FAIL {len(ghfs)} {total} {frames}')
+          print(f'PAYLOAD_MANIFEST_AND_CORPUS_PASS files={len(ghfs)} bytes={total} frames={frames}')
+          '@ | Set-Content -Encoding ascii "$env:RUNNER_TEMP\verify.py"
+          python "$env:RUNNER_TEMP\verify.py" | Tee-Object payload_manifest_gate.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI import and stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'; $r=$env:PAYLOAD_ROOT
+          dumpbin /headers "$r\SigProcDll-64HF.dll" | Out-File candidate_headers.txt
+          dumpbin /exports "$r\SigProcDll-64HF.dll" | Out-File candidate_exports.txt
+          dumpbin /dependents "$r\SigProcDll-64HF.dll" | Out-File candidate_dependents.txt
+          dumpbin /dependents "$r\HostCompat.dll" | Out-File hostcompat_dependents.txt
+          @'
+          import os,re,struct
+          from pathlib import Path
+          root=Path(os.environ['PAYLOAD_ROOT']); b=(root/'SigProcDll-64HF.dll').read_bytes(); u16=lambda o:struct.unpack_from('<H',b,o)[0]; u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c)
+          if b[:2]!=b'MZ' or b[pe:pe+4]!=b'PE\0\0' or u16(pe+4)!=0x14c or u16(pe+24)!=0x10b: raise SystemExit('NOT_PE32_X86')
+          n=u16(pe+6); osz=u16(pe+20); s0=pe+24+osz; names=[]; bad=[]
+          for i in range(n):
+              o=s0+40*i; name=b[o:o+8].split(b'\0',1)[0].decode('ascii','ignore'); names.append(name); rs=u32(o+16); rp=u32(o+20); ch=u32(o+36)
+              if ch&0x20000000:
+                  for x in range(rp,max(rp,rp+rs-6)):
+                      if b[x:x+2]==b'\x81\xec':
+                          imm=u32(x+2)
+                          if 0x1000<=imm<0x100000: bad.append((name,x,imm))
+          if '.stkfix' not in names: raise SystemExit('STKFIX_SECTION_MISSING')
+          if bad: raise SystemExit('UNSAFE_LARGE_DIRECT_STACK '+repr(bad))
+          exp=Path('candidate_exports.txt').read_text(errors='ignore')
+          for e in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if e not in exp: raise SystemExit('EXPORT_MISSING '+e)
+          def deps(path):
+              s=Path(path).read_text(errors='ignore'); return {m.group(1).lower() for m in re.finditer(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',s,re.M|re.I)}
+          c=deps('candidate_dependents.txt'); h=deps('hostcompat_dependents.txt')
+          if 'ucrtbase.dll' in c: raise SystemExit('DIRECT_UCRTBASE_IMPORT')
+          if c-h: raise SystemExit('IMPORT_NOT_HOSTCOMPAT_SUBSET '+repr(sorted(c-h)))
+          print('STATIC_PE_ABI_IMPORT_STACKPROBE_PASS')
+          '@ | Set-Content -Encoding ascii "$env:RUNNER_TEMP\static.py"
+          python "$env:RUNNER_TEMP\static.py" | Tee-Object static_gate.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Inner and outer loader contract gates
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'; $r=(Resolve-Path $env:PAYLOAD_ROOT).Path
+          foreach($bed in @('inner-bed','outer-medical-bed')){
+            $d="loader_$($bed.Replace('-','_'))"; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item "$r\SigProcDll-64HF.dll","$r\SigProcLoaderContractSmoke.exe" $d
+            Copy-Item "$r\runtime\$bed\*" $d
+            Push-Location $d
+            try { .\SigProcLoaderContractSmoke.exe *>&1 | Tee-Object "..\loader_$bed.log"; $rc=$LASTEXITCODE }
+            finally { Pop-Location }
+            if($rc -ne 0){ throw "LOADER_FAIL $bed $rc" }
+            if(-not (Select-String -Quiet -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' "loader_$bed.log")){ throw "LOADER_MARKER_MISSING $bed" }
+          }
+          'INNER_OUTER_LOADER_CONTRACT_PASS' | Tee-Object loader_contract_gate.txt
+
+      - name: Compile full-data regression harness x86
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'; Push-Location $env:PAYLOAD_ROOT
+          try { cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg.exe fullreg.c 2>&1 | Tee-Object ..\fullreg_compile.txt; $rc=$LASTEXITCODE }
+          finally { Pop-Location }
+          if($rc -ne 0){ throw "FULLREG_COMPILE_FAIL $rc" }
+
+      - name: Execute complete native Windows regression
+        shell: powershell
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference='Stop'; Push-Location $env:PAYLOAD_ROOT
+          try { .\fullreg.exe .\SigProcDll-64HF.dll .\HostCompat.dll .\C63.dll .\testdata .\runtime *>&1 | Tee-Object ..\full_regression_v41.log; $rc=$LASTEXITCODE }
+          finally { Pop-Location }
+          if($rc -ne 0){ throw "FULLREG_RC=$rc" }
+          foreach($m in @('HOSTCOMPAT_NONZERO_CONTRACT_PASS','C63_NONZERO_CONTRACT_PASS','CANDIDATE_NONZERO_CONTRACT_PASS','FULL_13_GHF_CORPUS_PASS files=13 frames=10808 bytes=82484656','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','DETERMINISTIC_REPLAY_PASS frames=10808','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){
+            if(-not (Select-String -Quiet -SimpleMatch $m full_regression_v41.log)){ throw "FULLREG_MARKER_MISSING $m" }
+          }
+          $h=(Get-FileHash "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $env:CAND_SHA){ throw "POSTREG_SHA_DRIFT $h" }
+          "NATIVE_WINDOWS_DYNAMIC_NONZERO_PASS SHA256=$h`nFULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_PASS SHA256=$h" | Tee-Object C8B8_V41_FULLREG_PASS.lock
+
+      - name: Build and audit final release ZIP
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'; $rel='GuanHu_C8B8_V41_FINAL_RELEASE'; Remove-Item -Recurse -Force $rel,'zip_audit' -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $rel | Out-Null
+          Copy-Item "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" "$rel\SigProcDll-64HF.dll"
+          Copy-Item C8B8_V41_FULLREG_PASS.lock,static_gate.txt,loader_contract_gate.txt,payload_manifest_gate.txt "$rel\"
+          $h=(Get-FileHash "$rel\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant(); $sz=(Get-Item "$rel\SigProcDll-64HF.dll").Length
+          if($h -ne $env:CAND_SHA -or $sz -le 0){ throw 'PREZIP_DLL_BIND_FAIL' }
+          "SHA256 $h  SigProcDll-64HF.dll`nSIZE $sz" | Set-Content "$rel\RELEASE_SHA256SUMS.txt"
+          Compress-Archive -Path "$rel\*" -DestinationPath GuanHu_SigProc_Final_Release_20260809.zip -CompressionLevel Optimal
+          Expand-Archive GuanHu_SigProc_Final_Release_20260809.zip -DestinationPath zip_audit -Force
+          $ah=(Get-FileHash 'zip_audit\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant(); $asz=(Get-Item 'zip_audit\SigProcDll-64HF.dll').Length
+          if($ah -ne $env:CAND_SHA -or $asz -ne $sz){ throw "ZIP_AUDIT_FAIL $ah $asz" }
+          "FINAL_ZIP_AUDIT_PASS SHA256=$ah DLL_BYTES=$asz ZIP_BYTES=$((Get-Item GuanHu_SigProc_Final_Release_20260809.zip).Length)" | Tee-Object C8B8_V41_RELEASE_PASS.lock
+
+      - name: Upload final exact tested package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v41-exact-final-release-${{ github.run_id }}
+          path: |
+            ${{ env.PAYLOAD_ROOT }}/SigProcDll-64HF.dll
+            GuanHu_SigProc_Final_Release_20260809.zip
+            C8B8_V41_FULLREG_PASS.lock
+            C8B8_V41_RELEASE_PASS.lock
+            checkpoint_restore.txt
+            extract_gate.txt
+            payload_manifest_gate.txt
+            static_gate.txt
+            loader_inner-bed.log
+            loader_outer-medical-bed.log
+            loader_contract_gate.txt
+            fullreg_compile.txt
+            full_regression_v41.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v41-failure-evidence-${{ github.run_id }}
+          path: |
+            checkpoint_restore.txt
+            extract_xz.txt
+            extract_tar.txt
+            extract_gate.txt
+            payload_manifest_gate.txt
+            static_gate.txt
+            loader_inner-bed.log
+            loader_outer-medical-bed.log
+            loader_contract_gate.txt
+            fullreg_compile.txt
+            full_regression_v41.log
+          if-no-files-found: ignore
+          retention-days: 30
