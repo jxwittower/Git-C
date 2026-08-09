@@ -110,13 +110,15 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
           if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
           $xh=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $xh"}
-          7z x -y payload.tar.xz -o. | Out-File 7z_xz.log
+          New-Item -ItemType Directory -Force extract_xz,extract_tar | Out-Null
+          & 7z x -y payload.tar.xz '-oextract_xz' | Out-File 7z_xz.log
           if($LASTEXITCODE -ne 0){throw '7Z_XZ_FAIL'}
-          if(!(Test-Path payload.tar)){throw 'PAYLOAD_TAR_MISSING'}
-          7z x -y payload.tar -o. | Out-File 7z_tar.log
+          $tar=(Get-ChildItem extract_xz -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'PAYLOAD_TAR_MISSING'}
+          & 7z x -y $tar '-oextract_tar' | Out-File 7z_tar.log
           if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
-          if(!(Test-Path c8b8_fullreg_payload_v2)){throw 'EXTRACTED_DIR_MISSING'}
-          Move-Item c8b8_fullreg_payload_v2 payload
+          if(!(Test-Path extract_tar\c8b8_fullreg_payload_v2)){throw 'EXTRACTED_DIR_MISSING'}
+          Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
           $rh=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant();if($rh -ne $env:RUNNER_SHA){throw "RUNNER_SHA_FAIL $rh"}
           "RESUME_EXTRACT_PASS XZ_SHA=$xh RUNNER_SHA=$rh" | Set-Content resume_extract_gate.txt
 
@@ -144,6 +146,8 @@ jobs:
             ciphertext_restore_gate.txt
             key_handoff.log
             resume_extract_gate.txt
+            7z_xz.log
+            7z_tar.log
             exact_asset_hashes.txt
             exact_asset_binding.txt
             ghf_sha_gate.txt
