@@ -1,0 +1,121 @@
+name: original-66a44-fullcommit-diag
+on:
+  push:
+    branches: [original-66a44-fullcommit-diag-20260809]
+    paths:
+      - '.github/workflows/original_66a44_fullcommit_diag.yml'
+permissions:
+  contents: write
+jobs:
+  diag:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      BRANCH: original-66a44-fullcommit-diag-20260809
+      ENC_SHA: 2939094f86f56bd23b2f8b960e83d0f1ce9bdf562f48948e7426a2c5c402ba03
+      XZ_SHA: b48c4aa9d1c6a8871b26151bf8c0dbc74e0e6f66c365bcb153004544aa61a9b9
+      BAD_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Publish mailbox and RSA public key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('NO_DOMAIN')
+          a=string.ascii_lowercase+string.digits;addr='gh66a44'+''.join(secrets.choice(a) for _ in range(14))+'@'+m[0]['domain'];pw=secrets.token_urlsafe(36)
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject.txt').write_text('GuanHu-66A44-FullCommit-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .diag_66a44_handoff | Out-Null
+          Copy-Item mailbox.txt,subject.txt,public.pem .diag_66a44_handoff\
+          @("RUN_ID=$env:GITHUB_RUN_ID","BAD_SHA=$env:BAD_SHA","ENC_SHA=$env:ENC_SHA") | Set-Content .diag_66a44_handoff\binding.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .diag_66a44_handoff;git commit -m 'Publish 66a44 fullcommit diag handoff';git push origin "HEAD:$env:BRANCH"
+      - name: Receive diagnostic payload
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';sub=Path('subject.txt').read_text().strip();out=Path('transport');out.mkdir(exist_ok=True)
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          p=k=False;deadline=time.time()+780;seen=set()
+          while time.time()<deadline and not(p and k):
+              q=gj(base+'/messages');msgs=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject','')!=sub or m['id'] in seen:continue
+                  seen.add(m['id']);d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      b=gb(urllib.parse.urljoin(base,u))
+                      if n=='diag_payload.enc':(out/n).write_bytes(b);p=True
+                      elif n=='diag_wrapped_key.bin':(out/n).write_bytes(b);k=True
+              if not(p and k):time.sleep(3)
+          if not(p and k):raise SystemExit('TRANSPORT_INCOMPLETE')
+          print('MAIL_TRANSPORT_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object mail_transport.txt
+      - name: Decrypt and bind
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $e=(Get-FileHash transport\diag_payload.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($e -ne $env:ENC_SHA){throw 'ENC_SHA_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\diag_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in transport\diag_payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw 'XZ_SHA_FAIL'}
+          New-Item -ItemType Directory -Force xzstage,unpacked | Out-Null;7z x -y payload.tar.xz "-o$pwd\xzstage" | Out-Null;$t=Get-ChildItem xzstage -Filter '*.tar' | Select-Object -First 1;7z x -y $t.FullName "-o$pwd\unpacked" | Out-Null
+          $root=(Resolve-Path unpacked\original_fullcommit_payload).Path;$b=(Get-FileHash "$root\candidate.dll" -Algorithm SHA256).Hash.ToLowerInvariant();$c=(Get-FileHash "$root\c63.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($b -ne $env:BAD_SHA -or $c -ne $env:C63_SHA){throw 'BINARY_BIND_FAIL'}
+          "BAD_SHA=$b`nC63_SHA=$c`nFULLCOMMIT_DIAG_BIND_PASS" | Set-Content diag_binding.txt
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Run original 66a44 with fully committed 8MB stack
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$root=(Resolve-Path unpacked\original_fullcommit_payload).Path;Copy-Item "$root\runtime_base" "$root\bad_rt" -Recurse;Copy-Item "$root\runtime_base" "$root\c63_rt" -Recurse;Push-Location $root
+          cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:semantic_smoke.exe semantic_smoke.c /link /STACK:8388608,8388608 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\compile.log";if($LASTEXITCODE -ne 0){Pop-Location;throw 'COMPILE_FAIL'}
+          dumpbin /headers semantic_smoke.exe | Select-String -Pattern 'size of stack reserve|size of stack commit' | Out-File "$env:GITHUB_WORKSPACE\stack_header.txt"
+          $bad=(Resolve-Path candidate.dll).Path;$c63=(Resolve-Path c63.dll).Path;$br=(Resolve-Path bad_rt).Path;$cr=(Resolve-Path c63_rt).Path;$e=(Resolve-Path testdata\01_initial_empty.ghf).Path;$s=(Resolve-Path testdata\02_supine.ghf).Path
+          .\semantic_smoke.exe $bad $c63 $br $cr $e $s 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\diag_semantic.log";$rc=$LASTEXITCODE;Pop-Location;"EXIT_CODE=$rc" | Set-Content diag_exit.txt
+          if($rc -eq 50){'ORIGINAL_ALGORITHM_OCCUPANCY_DEAD' | Set-Content ORIGINAL_66A44_DIAG_RESULT.txt;exit 0}
+          if($rc -eq 0){'ORIGINAL_ALGORITHM_SEMANTICS_ALIVE_UNDER_FULLCOMMIT_STACK' | Set-Content ORIGINAL_66A44_DIAG_RESULT.txt;exit 0}
+          throw "UNEXPECTED_DIAG_RC=$rc"
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-66a44-fullcommit-diag-${{ github.run_id }}
+          path: |
+            diag_binding.txt
+            compile.log
+            stack_header.txt
+            diag_semantic.log
+            diag_exit.txt
+            ORIGINAL_66A44_DIAG_RESULT.txt
+            mail_transport.txt
+          if-no-files-found: ignore
+          retention-days: 30
