@@ -1,0 +1,86 @@
+name: inspect-seq-v4-payload-recovery-v2
+on:
+  push:
+    branches: [seq-v4-native-gate-20260808b]
+    paths:
+      - '.github/workflows/inspect_seq_v4_payload_recovery_v2.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect raw and encoded chunk formats and build variants
+        shell: python
+        run: |
+          from pathlib import Path
+          import base64, hashlib, os
+          out=Path('recovered_v2'); out.mkdir(exist_ok=True)
+          groups={
+            'candidate':[Path('.seq_candidate_v4_payload/chunk_00'),Path('.seq_candidate_v4_payload/chunk_01')],
+            'native':[Path('.seq_v4_native_payload/chunk_00.b64'),Path('.seq_v4_native_payload/chunk_01.b64')],
+          }
+          log=[]
+          def info(label,b):
+              s=f'{label} bytes={len(b)} sha256={hashlib.sha256(b).hexdigest()} head32={b[:32].hex()} ascii={b[:16]!r}'
+              log.append(s); print(s)
+          for name,paths in groups.items():
+              chunks=[p.read_bytes() for p in paths]
+              for i,b in enumerate(chunks): info(f'{name}.raw_chunk{i}',b)
+              raw=b''.join(chunks); (out/f'{name}.rawcat.bin').write_bytes(raw); info(f'{name}.rawcat',raw)
+              decoded=[]; ok=True
+              for i,b in enumerate(chunks):
+                  try:
+                      clean=b''.join(b.split())
+                      d=base64.b64decode(clean,validate=True)
+                      decoded.append(d); info(f'{name}.decoded_chunk{i}',d)
+                  except Exception as e:
+                      ok=False; log.append(f'{name}.decoded_chunk{i} ERROR {e!r}'); print(log[-1]); break
+              if ok:
+                  dcat=b''.join(decoded); (out/f'{name}.decode_each.bin').write_bytes(dcat); info(f'{name}.decode_each',dcat)
+              try:
+                  clean=b''.join(raw.split())
+                  # tolerate internal padding by decoding segments split at padding boundaries as a second heuristic
+                  d=base64.b64decode(clean,validate=True)
+                  (out/f'{name}.decode_concat.bin').write_bytes(d); info(f'{name}.decode_concat',d)
+              except Exception as e:
+                  log.append(f'{name}.decode_concat ERROR {e!r}'); print(log[-1])
+          (out/'format_detection.txt').write_text('\n'.join(log)+'\n')
+      - name: Identify reconstructed variants
+        shell: bash
+        run: |
+          set -u
+          {
+            for f in recovered_v2/*.bin; do
+              echo "=== $f ==="
+              wc -c "$f"
+              sha256sum "$f"
+              file "$f" || true
+              xxd -l 64 "$f" || true
+            done
+          } | tee recovered_v2/file_identification.txt
+      - name: Search historical consumers and commit clues
+        shell: bash
+        run: |
+          set -u
+          {
+            echo '=== CURRENT HEAD REFERENCES ==='
+            git grep -n -E 'seq_v4_native_payload|seq_candidate_v4_payload|SEQ_CANDIDATE_V4|candidate_v4|source_payload' HEAD || true
+            echo '=== ALL REFS WORKFLOW REFERENCES ==='
+            for ref in $(git for-each-ref --format='%(refname)' refs/remotes/origin); do
+              git grep -n -E 'seq_v4_native_payload|seq_candidate_v4_payload|SEQ_CANDIDATE_V4|candidate_v4|source_payload' "$ref" -- '.github/workflows/*' 2>/dev/null || true
+            done
+            echo '=== RELEVANT COMMITS ==='
+            git log --all --date=iso --pretty=format:'%H %ad %s' --grep='seq\|candidate\|payload\|V4\|key' -i -n 300 || true
+          } | tee recovered_v2/history_search.txt
+      - name: Upload all variants and history search
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-v4-recovery-v2-${{ github.run_id }}
+          path: recovered_v2/
+          if-no-files-found: error
+          retention-days: 7
