@@ -1,0 +1,46 @@
+name: fix-c8b8-v3-gate-script
+on:
+  push:
+    branches: [c8b8-drive-v3-release-20260809]
+    paths:
+      - '.github/workflows/fix_c8b8_v3_gate.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Patch only PowerShell parsing and dumpbin text encoding
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('.github/workflows/c8b8_drive_v3_exact_release.yml')
+          s=p.read_text()
+          replacements={
+            "dumpbin /headers payload\\SigProcDll-64HF.dll | Out-File candidate_headers.txt":"dumpbin /headers payload\\SigProcDll-64HF.dll | Out-File candidate_headers.txt -Encoding ascii",
+            "dumpbin /exports payload\\SigProcDll-64HF.dll | Out-File candidate_exports.txt":"dumpbin /exports payload\\SigProcDll-64HF.dll | Out-File candidate_exports.txt -Encoding ascii",
+            "dumpbin /dependents payload\\SigProcDll-64HF.dll | Out-File candidate_dependents.txt":"dumpbin /dependents payload\\SigProcDll-64HF.dll | Out-File candidate_dependents.txt -Encoding ascii",
+            "dumpbin /dependents payload\\HostCompat.dll | Out-File hostcompat_dependents.txt":"dumpbin /dependents payload\\HostCompat.dll | Out-File hostcompat_dependents.txt -Encoding ascii",
+            "Select-String candidate_headers.txt -SimpleMatch '14C machine (x86)' -Quiet":"Select-String -Path candidate_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet",
+            "Select-String candidate_exports.txt -SimpleMatch $e -Quiet":"Select-String -Path candidate_exports.txt -Pattern $e -SimpleMatch -Quiet",
+            "Select-String candidate_dependents.txt -SimpleMatch 'ucrtbase.dll' -Quiet":"Select-String -Path candidate_dependents.txt -Pattern 'ucrtbase.dll' -SimpleMatch -Quiet",
+            "Select-String \"loader_$mode.log\" -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet":"Select-String -Path \"loader_$mode.log\" -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet",
+            "Select-String full_regression_c8b8_v3.log -SimpleMatch $m -Quiet":"Select-String -Path full_regression_c8b8_v3.log -Pattern $m -SimpleMatch -Quiet",
+          }
+          for old,new in replacements.items():
+              if old not in s:
+                  raise SystemExit('EXPECTED_TEXT_NOT_FOUND: '+old)
+              s=s.replace(old,new)
+          p.write_text(s)
+          print('V3_GATE_SCRIPT_PATCH_PASS replacements=',len(replacements))
+      - name: Commit corrected gate workflow
+        run: |
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .github/workflows/c8b8_drive_v3_exact_release.yml
+          git commit -m "Fix V3 static and marker parsing only"
+          git push origin HEAD:c8b8-drive-v3-release-20260809
