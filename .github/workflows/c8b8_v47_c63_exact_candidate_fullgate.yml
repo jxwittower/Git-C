@@ -1,0 +1,132 @@
+name: c8b8-v4.7-c63-exact-candidate-fullgate
+on:
+  push:
+    branches: [c8b8-v4-drive-resumable-20260809]
+    paths:
+      - '.github/workflows/c8b8_v47_c63_exact_candidate_fullgate.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      SOURCE_RUN: '31314728589'
+      SOURCE_ARTIFACT: c8b8-v4-plaintext-xz-31314728589
+      XZ_SHA: 5a1c750b48a7d436f8ca7a011dd4d925d68891e8241a11aa42bf4bbd30afd3c0
+      XZ_BYTES: '20593840'
+      CAND_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      PAYLOAD_ROOT: c8b8_fullreg_payload_v4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore verified full-data checkpoint and bind exact C63 candidate
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP resume; New-Item -ItemType Directory -Force $d|Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D $d
+          if($LASTEXITCODE -ne 0){throw 'CHECKPOINT_DOWNLOAD_FAIL'}
+          $p=Get-ChildItem $d -Recurse -Filter payload.tar.xz|Select-Object -First 1;if(!$p){throw 'NO_XZ'}
+          $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:XZ_SHA -or $p.Length -ne [int64]$env:XZ_BYTES){throw 'XZ_BIND_FAIL'}
+          $s=Join-Path $env:RUNNER_TEMP stage;New-Item -ItemType Directory -Force $s|Out-Null;7z x -y $p.FullName "-o$s"|Out-Null;$t=Get-ChildItem $s -Filter *.tar|Select-Object -First 1;7z x -y $t.FullName '-o.'|Out-Null
+          Copy-Item -Force "$env:PAYLOAD_ROOT\C63.dll" "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll"
+          $ch=(Get-FileHash "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($ch -ne $env:CAND_SHA){throw "CAND_BIND_FAIL $ch"}
+          "C63_EXACT_CANDIDATE_BIND_PASS SHA=$ch BYTES=$((Get-Item "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll").Length)"|Tee-Object candidate_bind.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Raw PE exports imports and dependency gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r=$env:PAYLOAD_ROOT
+          dumpbin /headers "$r\SigProcDll-64HF.dll"|Set-Content -Encoding ascii c63_candidate_headers.txt
+          dumpbin /exports "$r\SigProcDll-64HF.dll"|Set-Content -Encoding ascii c63_candidate_exports.txt
+          dumpbin /dependents "$r\SigProcDll-64HF.dll"|Set-Content -Encoding ascii c63_candidate_dependents.txt
+          @'
+          import os,struct
+          from pathlib import Path
+          p=Path(os.environ['PAYLOAD_ROOT'])/'SigProcDll-64HF.dll';b=p.read_bytes();u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c)
+          if b[:2]!=b'MZ' or b[pe:pe+4]!=b'PE\0\0' or u16(pe+4)!=0x14c or u16(pe+24)!=0x10b:raise SystemExit('NOT_PE32_X86')
+          n=u16(pe+6);osz=u16(pe+20);opt=pe+24;sec0=opt+osz;secs=[]
+          for i in range(n):
+              o=sec0+40*i;name=b[o:o+8].split(b'\0',1)[0].decode('ascii','ignore');vs,va,rs,rp=struct.unpack_from('<IIII',b,o+8);ch=u32(o+36);secs.append((name,va,max(vs,rs),rp,rs,ch))
+          def r2o(rva):
+              for name,va,span,rp,rs,ch in secs:
+                  if va<=rva<va+span:return rp+(rva-va)
+              if rva<len(b):return rva
+              raise SystemExit('RVA_FAIL')
+          def cstr(off):
+              e=b.find(b'\0',off);return b[off:e].decode('ascii','replace')
+          ex=set();er=u32(opt+96)
+          if er:
+              eo=r2o(er);nn=u32(eo+24);no=r2o(u32(eo+32))
+              for i in range(nn):ex.add(cstr(r2o(u32(no+4*i))))
+          im=set();ir=u32(opt+104)
+          if ir:
+              io=r2o(ir)
+              for i in range(1024):
+                  vals=struct.unpack_from('<IIIII',b,io+20*i)
+                  if vals==(0,0,0,0,0):break
+                  im.add(cstr(r2o(vals[3])).lower())
+          req={'_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0'}
+          if req-ex:raise SystemExit('EXPORT_MISSING '+repr(sorted(req-ex)))
+          if 'ucrtbase.dll' in im:raise SystemExit('DIRECT_UCRTBASE_IMPORT')
+          bad=[]
+          for name,va,span,rp,rs,ch in secs:
+              if ch&0x20000000:
+                  end=min(len(b),rp+rs)
+                  for x in range(rp,max(rp,end-5)):
+                      if b[x:x+2]==b'\x81\xec':
+                          imm=u32(x+2)
+                          if 0x1000<=imm<0x100000:bad.append((name,x,imm))
+          if bad:raise SystemExit('LARGE_DIRECT_STACK_FOUND '+repr(bad))
+          print('C63_RAW_PE_HOST_STATIC_PASS exports='+','.join(sorted(ex))+' imports='+','.join(sorted(im)))
+          '@|Set-Content -Encoding ascii "$env:RUNNER_TEMP\c63_static.py"
+          python "$env:RUNNER_TEMP\c63_static.py"|Tee-Object c63_static_gate.txt
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: Inner and outer loader contract with exact C63 bytes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path $env:PAYLOAD_ROOT).Path
+          foreach($bed in @('inner-bed','outer-medical-bed')){
+            $d="c63_loader_$($bed.Replace('-','_'))";Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force $d|Out-Null
+            Copy-Item "$r\SigProcDll-64HF.dll","$r\SigProcLoaderContractSmoke.exe" $d;Copy-Item "$r\runtime\$bed\*" $d
+            Push-Location $d;try{cmd.exe /d /c "SigProcLoaderContractSmoke.exe > ..\c63_loader_$bed.log 2>&1";$rc=$LASTEXITCODE}finally{Pop-Location}
+            Get-Content "c63_loader_$bed.log";if($rc -ne 0){throw "C63_LOADER_FAIL $bed rc=$rc"};if(-not(Select-String -Quiet -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' "c63_loader_$bed.log")){throw "C63_LOADER_MARKER_FAIL $bed"}
+          }
+          'C63_INNER_OUTER_LOADER_CONTRACT_PASS'|Tee-Object c63_loader_gate.txt
+      - name: Compile existing complete regression harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';Push-Location $env:PAYLOAD_ROOT;try{cmd.exe /d /c "cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg.exe fullreg.c > ..\c63_fullreg_compile.txt 2>&1";$rc=$LASTEXITCODE}finally{Pop-Location};Get-Content c63_fullreg_compile.txt;if($rc -ne 0){throw "COMPILE_FAIL $rc"}
+      - name: Execute complete full-data regression with exact C63 candidate
+        shell: powershell
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference='Stop';Push-Location $env:PAYLOAD_ROOT;try{cmd.exe /d /c "fullreg.exe SigProcDll-64HF.dll HostCompat.dll C63.dll testdata runtime > ..\c63_fullreg.log 2>&1";$rc=$LASTEXITCODE}finally{Pop-Location};Get-Content c63_fullreg.log;"C63_FULLREG_EXIT=$rc"|Tee-Object c63_fullreg_exit.txt;if($rc -ne 0){throw "C63_FULLREG_RC=$rc"}
+          $h=(Get-FileHash "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:CAND_SHA){throw "POSTREG_SHA_DRIFT $h"}
+          'C63_EXACT_CANDIDATE_COMPLETE_REGRESSION_PROCESS_PASS'|Tee-Object c63_fullreg_process_pass.txt
+      - name: Upload exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v47-c63-exact-candidate-${{ github.run_id }}
+          path: |
+            candidate_bind.txt
+            c63_candidate_headers.txt
+            c63_candidate_exports.txt
+            c63_candidate_dependents.txt
+            c63_static_gate.txt
+            c63_loader_inner-bed.log
+            c63_loader_outer-medical-bed.log
+            c63_loader_gate.txt
+            c63_fullreg_compile.txt
+            c63_fullreg.log
+            c63_fullreg_exit.txt
+            c63_fullreg_process_pass.txt
+          if-no-files-found: ignore
+          retention-days: 30
