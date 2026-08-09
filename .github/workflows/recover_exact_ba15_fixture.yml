@@ -1,0 +1,148 @@
+name: recover-exact-ba15-fixture
+on:
+  push:
+    branches: [87ec-authoritative-complete-fullreg-20260809]
+    paths:
+      - '.github/workflows/recover_exact_ba15_fixture.yml'
+permissions:
+  contents: write
+jobs:
+  recover:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      EXPECTED_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      EXPECTED_SIZE: '440320'
+      HANDOFF_BRANCH: 87ec-authoritative-complete-fullreg-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Publish one-time mailbox
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, secrets, string, urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'
+          d=req('GET',base+'/domains')
+          members=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not members:raise SystemExit('MAILTM_NO_DOMAIN')
+          domain=members[0]['domain']
+          alpha=string.ascii_lowercase+string.digits
+          user='ghba15'+''.join(secrets.choice(alpha) for _ in range(16))
+          pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32))
+          address=user+'@'+domain
+          req('POST',base+'/accounts',{'address':address,'password':pw})
+          tok=req('POST',base+'/token',{'address':address,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':address,'password':pw,'token':tok}))
+          Path('ba15_recovery_mailbox.txt').write_text(address+'\n')
+          print('BA15_RECOVERY_MAILBOX',address)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\make_mail.py
+          python $env:RUNNER_TEMP\make_mail.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          New-Item -ItemType Directory -Force .ba15_recovery_handoff | Out-Null
+          Copy-Item ba15_recovery_mailbox.txt .ba15_recovery_handoff\mailbox.txt -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","EXPECTED_SHA=$env:EXPECTED_SHA","EXPECTED_SIZE=$env:EXPECTED_SIZE") | Set-Content .ba15_recovery_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .ba15_recovery_handoff
+          git commit -m "Publish one-time ba15 recovery mailbox"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Receive seven forwarded historical chunks and reconstruct exact DLL
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import base64, hashlib, json, os, re, time, urllib.request
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())
+          token=cfg['token'];base='https://api.mail.tm'
+          def get(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          chunks={};seen=set();deadline=time.time()+1500
+          while time.time()<deadline and len(chunks)<7:
+              listing=get(base+'/messages')
+              msgs=listing if isinstance(listing,list) else listing.get('hydra:member',[])
+              for m in msgs:
+                  mid=m.get('id')
+                  if not mid or mid in seen:continue
+                  seen.add(mid)
+                  d=get(base+'/messages/'+mid)
+                  subj=d.get('subject') or m.get('subject','')
+                  mm=re.search(r'GuanHu-BA15TEXT7-31304410871-P([1-7])',subj,re.I)
+                  if not mm:continue
+                  idx=int(mm.group(1))
+                  text=d.get('text','')
+                  if isinstance(text,list):text='\n'.join(str(x) for x in text)
+                  elif not isinstance(text,str):text=str(text)
+                  # Forwarded Gmail bodies preserve the original long base64 block. Collect only long pure-base64 lines/blocks.
+                  candidates=[]
+                  for line in text.splitlines():
+                      q=''.join(line.strip().split())
+                      if len(q)>=40 and re.fullmatch(r'[A-Za-z0-9+/=]+',q):candidates.append(q)
+                  if not candidates:
+                      # fallback: locate the longest base64-looking run across wrapping whitespace
+                      runs=re.findall(r'(?:[A-Za-z0-9+/=]{20,}[\r\n ]*){2,}',text)
+                      if runs:
+                          candidates=[''.join(runs[0].split())]
+                  if not candidates:continue
+                  chunk=max(candidates,key=len)
+                  chunks[idx]=chunk
+                  print('GOT_CHUNK',idx,'B64_CHARS',len(chunk))
+              if len(chunks)<7:time.sleep(3)
+          if sorted(chunks)!=list(range(1,8)):raise SystemExit('BA15_CHUNKS_INCOMPLETE got='+repr(sorted(chunks)))
+          b64=''.join(chunks[i] for i in range(1,8))
+          raw=base64.b64decode(b64,validate=True)
+          sha=hashlib.sha256(raw).hexdigest()
+          size=len(raw)
+          print('BA15_RECOVERED_SIZE',size)
+          print('BA15_RECOVERED_SHA256',sha)
+          if size!=int(os.environ['EXPECTED_SIZE']):raise SystemExit('BA15_SIZE_FAIL')
+          if sha!=os.environ['EXPECTED_SHA']:raise SystemExit('BA15_SHA_FAIL')
+          Path('SigProcDll-HostCompat-StackProbeSafe-ba15.dll').write_bytes(raw)
+          Path('BA15_EXACT_RECOVERY_PASS.lock').write_text(f'BA15_EXACT_RECOVERY_PASS\nSHA256={sha}\nSIZE={size}\nSOURCE=Gmail historical P1-P7 for run 31304410871\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object ba15_recovery.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Static ABI and stack-probe fixture gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll=(Resolve-Path 'SigProcDll-HostCompat-StackProbeSafe-ba15.dll').Path
+          dumpbin /headers $dll | Out-File ba15_headers.txt
+          dumpbin /exports $dll | Out-File ba15_exports.txt
+          dumpbin /dependents $dll | Out-File ba15_dependents.txt
+          if(-not(Select-String -Path ba15_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet)){throw 'BA15_NOT_X86'}
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String -Path ba15_exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "BA15_EXPORT_MISSING $e"}}
+          $raw=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($dll))
+          if(-not $raw.Contains('.stkfix')){throw 'BA15_STKFIX_MISSING'}
+          'BA15_STATIC_FIXTURE_GATE_PASS' | Set-Content ba15_static_gate.txt
+      - name: Upload durable exact ba15 baseline fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: ba15-exact-baseline-fixture-${{ github.run_id }}
+          path: |
+            SigProcDll-HostCompat-StackProbeSafe-ba15.dll
+            BA15_EXACT_RECOVERY_PASS.lock
+            ba15_recovery.log
+            ba15_headers.txt
+            ba15_exports.txt
+            ba15_dependents.txt
+            ba15_static_gate.txt
+          if-no-files-found: error
+          retention-days: 30
