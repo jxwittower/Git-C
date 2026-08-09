@@ -1,0 +1,178 @@
+name: c8b8-stageC-persistent-parallel-v3c
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_resume_stageC_persistent_parallel_v3c.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  PAYLOAD_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  HARNESS_RUN: '31302697175'
+  HARNESS_ARTIFACT: c8b8-v3-resume-stageC-virtual1hz-31302697175
+  CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+  PERSIST_HARNESS_SHA: 222b7942b59fdf8c479ad22c5a4cadcb2948a95491d68b43370e560b92877e68
+  BRANCH: c8b8-fullreg-v2-final-20260809
+jobs:
+  replay:
+    name: Stage C replay ${{ matrix.case }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: inner
+            runtime: runtime_inner
+            data: testdata/inner-bed
+            expected_frames: '6294'
+          - case: outer
+            runtime: runtime_outer
+            data: testdata/outer-medical-bed
+            expected_frames: '4514'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore payload and source harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload,harness | Out-Null
+          gh run download $env:PAYLOAD_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          gh run download $env:HARNESS_RUN --repo $env:GITHUB_REPOSITORY --name $env:HARNESS_ARTIFACT --dir harness
+          if($LASTEXITCODE-ne 0){throw 'RESTORE_FAIL'}
+          $dh=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($dh-ne $env:CAND_SHA){throw "DLL_SHA_FAIL $dh"}
+      - name: Patch harness to preserve output state/result across frames
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          p=Path('harness/HostReplayWinVirtualFixed.c')
+          b=p.read_bytes()
+          old=b'state=(unsigned char*)malloc(STATE_BYTES);result=(unsigned char*)malloc(RESULT_BYTES);if(!state||!result)goto done;\r\n    if(outpath)'
+          new=b'state=(unsigned char*)malloc(STATE_BYTES);result=(unsigned char*)malloc(RESULT_BYTES);if(!state||!result)goto done;\r\n    memset(state,0,STATE_BYTES); memset(result,0,RESULT_BYTES);\r\n    if(outpath)'
+          old2=b'            memset(state,0,STATE_BYTES);memset(result,0,RESULT_BYTES);\r\n            QueryPerformanceCounter(&t0);seq=a.proc'
+          new2=b'            QueryPerformanceCounter(&t0);seq=a.proc'
+          if b.count(old)!=1 or b.count(old2)!=1: raise SystemExit('PERSIST_PATCH_NEEDLE_FAIL')
+          b=b.replace(old,new,1).replace(old2,new2,1)
+          Path('HostReplayWinVirtualPersistent.c').write_bytes(b)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\patch_persistent.py
+          python $env:RUNNER_TEMP\patch_persistent.py
+          if($LASTEXITCODE-ne 0){exit $LASTEXITCODE}
+          $hh=(Get-FileHash HostReplayWinVirtualPersistent.c -Algorithm SHA256).Hash.ToLowerInvariant();if($hh-ne $env:PERSIST_HARNESS_SHA){throw "HARNESS_SHA_FAIL $hh"}
+          "DLL_SHA=$env:CAND_SHA`nHARNESS_SHA=$hh`nPERSISTENT_STATE_BUFFER=PASS`nVIRTUAL_DLL_CLOCK=1HZ"|Set-Content binding_${{ matrix.case }}.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Compile x86 /WX
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS HostReplayWinVirtualPersistent.c /Fe:HostReplayWinVirtualPersistent.exe *> build_${{ matrix.case }}.txt;if($LASTEXITCODE-ne 0){Get-Content build_${{ matrix.case }}.txt;throw 'BUILD_FAIL'}
+      - name: Full lifecycle replay
+        shell: powershell
+        timeout-minutes: 22
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP '${{ matrix.case }}';New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item "payload\${{ matrix.runtime }}\*" $d -Force;Copy-Item payload\SigProcDll-64HF.dll "$d\SigProcDll-64HF.dll" -Force
+          $files=Get-ChildItem "payload\${{ matrix.data }}\*.ghf"|Sort-Object Name|ForEach-Object{$_.FullName}
+          $args=@('--dll','.\SigProcDll-64HF.dll','--mode','replay');foreach($f in $files){$args+=@('--ghf',$f)};$args+=@('--out',"$env:GITHUB_WORKSPACE\${{ matrix.case }}.csv",'--virtual-1hz')
+          $out="$env:GITHUB_WORKSPACE\${{ matrix.case }}.stdout";$err="$env:GITHUB_WORKSPACE\${{ matrix.case }}.stderr";$log="$env:GITHUB_WORKSPACE\${{ matrix.case }}.log"
+          $p=Start-Process -FilePath "$env:GITHUB_WORKSPACE\HostReplayWinVirtualPersistent.exe" -ArgumentList $args -WorkingDirectory $d -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          Get-Content $out,$err|Set-Content $log;Get-Content $log
+          if($p.ExitCode-ne 0){throw "REPLAY_RC=$($p.ExitCode)"}
+          if(-not(Select-String -Path $log -Pattern "REPLAY_PASS frames=${{ matrix.expected_frames }}" -SimpleMatch -Quiet)){throw 'FRAME_COUNT_MARKER_FAIL'}
+          if(-not(Select-String -Path $log -Pattern 'VIRTUAL_CLOCK_1HZ_IAT_PATCH_PASS' -SimpleMatch -Quiet)){throw 'CLOCK_PATCH_MARKER_FAIL'}
+          $post=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post-ne $env:CAND_SHA){throw "POST_SHA_FAIL $post"}
+          "STAGE_C_${{ matrix.case }}_FULL_REPLAY_PASS`nSHA256=$post`nFRAMES=${{ matrix.expected_frames }}"|Set-Content replay_${{ matrix.case }}.lock
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c8b8-v3c-stageC-${{ matrix.case }}-${{ github.run_id }}
+          path: |
+            binding_${{ matrix.case }}.txt
+            build_${{ matrix.case }}.txt
+            ${{ matrix.case }}.log
+            ${{ matrix.case }}.csv
+            replay_${{ matrix.case }}.lock
+          if-no-files-found: ignore
+          retention-days: 30
+
+  validate:
+    name: Stage C semantic validator
+    needs: replay
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c8b8-v3c-stageC-*-${{ github.run_id }}
+          path: ev
+          merge-multiple: true
+      - name: Validate complete lifecycle semantics
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import csv,collections
+          def read(p):
+              with open(p,newline='') as f:return list(csv.DictReader(f))
+          def valid(s):
+              v=int(s);return 0<v<1000 and v!=65535
+          def counts(rows):return collections.Counter(int(r['state']) for r in rows)
+          I=read('ev/inner.csv');O=read('ev/outer.csv')
+          if len(I)!=6294:raise SystemExit(f'INNER_ROWS_FAIL {len(I)}')
+          if len(O)!=4514:raise SystemExit(f'OUTER_ROWS_FAIL {len(O)}')
+          ib={i:[r for r in I if int(r['source'])==i] for i in range(6)}
+          ob={i:[r for r in O if int(r['source'])==i] for i in range(7)}
+          ic,oc=counts(I),counts(O)
+          if ic[1]<3000 or ic[0]<500:raise SystemExit(f'INNER_MAIN_STATE_FAIL {ic}')
+          if oc[1]<2000 or oc[0]<500:raise SystemExit(f'OUTER_MAIN_STATE_FAIL {oc}')
+          if ic[8]<1 or oc[8]<1:raise SystemExit(f'WARNING_STATE8_MISSING inner={ic[8]} outer={oc[8]}')
+          if any(int(r['state'])!=0 for r in ib[0]):raise SystemExit('INNER_INITIAL_EMPTY_FAIL')
+          if any(int(r['state'])!=0 for r in ob[0]):raise SystemExit('OUTER_INITIAL_EMPTY_FAIL')
+          for src in (1,2,3):
+              if not any(int(r['state'])==1 for r in ob[src]):raise SystemExit(f'OUTER_POSTURE_{src}_NO_OCCUPIED')
+              if not any(valid(r['hr']) for r in ob[src]) or not any(valid(r['rr']) for r in ob[src]):raise SystemExit(f'OUTER_POSTURE_{src}_VITALS_MISSING')
+          if not any(int(r['state'])==8 for r in ob[4]):raise SystemExit('LEAVE_WARNING_STATE8_MISSING')
+          if not any(int(r['state'])==0 for r in ob[4]) or int(ob[4][-1]['state'])!=0:raise SystemExit('LEAVE_EMPTY_FAIL')
+          bad8=[r for r in O if int(r['state'])==8 and (valid(r['hr']) or valid(r['rr']))]
+          if bad8:raise SystemExit(f'STATE8_VALID_VITAL_LEAK {len(bad8)}')
+          if not any(int(r['state'])==1 for r in ob[5]):raise SystemExit('RETURN_REENTRY_FAIL')
+          if not any(valid(r['hr']) for r in ob[5]) or not any(valid(r['rr']) for r in ob[5]):raise SystemExit('RETURN_VITALS_NOT_RECOVERED')
+          if int(ob[6][-1]['state'])!=0:raise SystemExit('OUTER_FINAL_EMPTY_FAIL')
+          if int(ib[5][-1]['state'])!=0:raise SystemExit('INNER_FINAL_EMPTY_FAIL')
+          if sum(valid(r['hr']) for r in I)<1000 or sum(valid(r['rr']) for r in I)<1000:raise SystemExit('INNER_VITAL_VOLUME_FAIL')
+          if sum(valid(r['hr']) for r in O)<1000 or sum(valid(r['rr']) for r in O)<1000:raise SystemExit('OUTER_VITAL_VOLUME_FAIL')
+          with open('semantic_summary.txt','w') as f:
+              f.write(f'INNER_STATE_COUNTS={dict(ic)}\nOUTER_STATE_COUNTS={dict(oc)}\n')
+              f.write(f'INNER_VALID_HR={sum(valid(r["hr"]) for r in I)} INNER_VALID_RR={sum(valid(r["rr"]) for r in I)}\n')
+              f.write(f'OUTER_VALID_HR={sum(valid(r["hr"]) for r in O)} OUTER_VALID_RR={sum(valid(r["rr"]) for r in O)}\n')
+              f.write(f'STATE8_VALID_VITAL_LEAK={len(bad8)}\nLEAVE_WARNING=PASS\nLEAVE_EMPTY=PASS\nRETURN_REENTRY=PASS\nRETURN_VITALS=PASS\nFINAL_EMPTY=PASS\n')
+          print('FULL_13_GHF_PERSISTENT_VIRTUAL1HZ_SEMANTIC_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\validate.py
+          python $env:RUNNER_TEMP\validate.py | Tee-Object semantic_validation.log
+          if($LASTEXITCODE-ne 0){exit $LASTEXITCODE}
+          foreach($f in @('ev\replay_inner.lock','ev\replay_outer.lock')){if(!(Test-Path $f) -or -not(Select-String -Path $f -Pattern $env:CAND_SHA -SimpleMatch -Quiet)){throw "REPLAY_LOCK_FAIL $f"}}
+          @('STAGE_C_V3C_PERSISTENT_VIRTUAL1HZ_PASS',"SHA256=$env:CAND_SHA",'INNER_FRAMES=6294','OUTER_FRAMES=4514','FULL_13_GHF=PASS','STATE8_VITAL_SUPPRESSION=PASS','LEAVE_TO_EMPTY=PASS','RETURN_VITAL_RECOVERY=PASS','FINAL_EMPTY=PASS','POST_TEST_SHA_MATCH=PASS')|Set-Content STAGE_C_V3C_PASS.lock
+      - name: Persist Stage C v3c PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';git fetch origin $env:BRANCH;git checkout -B $env:BRANCH "origin/$env:BRANCH";New-Item -ItemType Directory -Force evidence_summary|Out-Null;Copy-Item STAGE_C_V3C_PASS.lock evidence_summary\ -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/STAGE_C_V3C_PASS.lock;git commit -m "Record c8b8 Stage C persistent virtual-1Hz semantic PASS";git push origin "HEAD:$env:BRANCH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c8b8-v3c-stageC-validation-${{ github.run_id }}
+          path: |
+            semantic_summary.txt
+            semantic_validation.log
+            STAGE_C_V3C_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
