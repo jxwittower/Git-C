@@ -1,0 +1,186 @@
+name: ba15-hostcompat-stackfix-quick-semantic-gate-text
+on:
+  push:
+    branches: [ba15-hostcompat-stackfix-gate-20260809]
+    paths:
+      - '.github/workflows/ba15_quick_semantic_gate_text.yml'
+permissions:
+  contents: write
+  actions: read
+env:
+  SOURCE_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  HARNESS_RUN: '31302697175'
+  HARNESS_ARTIFACT: c8b8-v3-resume-stageC-virtual1hz-31302697175
+  CAND_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+  CAND_BYTES: '440320'
+  BRANCH: ba15-hostcompat-stackfix-gate-20260809
+jobs:
+  quick:
+    runs-on: windows-2022
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore immutable full test data and known-good diagnostic harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload,harness | Out-Null
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          gh run download $env:HARNESS_RUN --repo $env:GITHUB_REPOSITORY --name $env:HARNESS_ARTIFACT --dir harness
+          if($LASTEXITCODE -ne 0){throw 'RESTORE_FAIL'}
+      - name: Create text-only one-time mailbox
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',d.get('member',[]))
+          if not m:raise SystemExit('MAILTM_NO_DOMAIN')
+          alpha=string.ascii_lowercase+string.digits
+          addr='ghba15t'+''.join(secrets.choice(alpha) for _ in range(16))+'@'+m[0]['domain']
+          pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(36))
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}))
+          Path('mailbox_text.txt').write_text(addr+'\n');Path('subject_text.txt').write_text('GuanHu-BA15TEXT-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('TEXT_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mk.py
+          python $env:RUNNER_TEMP\mk.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          New-Item -ItemType Directory -Force .ba15_text_handoff | Out-Null
+          Copy-Item mailbox_text.txt,subject_text.txt .ba15_text_handoff\ -Force
+          @("CAND_SHA=$env:CAND_SHA","CAND_BYTES=$env:CAND_BYTES") | Set-Content .ba15_text_handoff\binding.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .ba15_text_handoff;git commit -m "Publish ba15 text mailbox";git push origin "HEAD:$env:BRANCH"
+      - name: Receive four plain-text base64 parts
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,re,time,urllib.request
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';prefix=Path('subject_text.txt').read_text().strip();wanted={f'{prefix}-P{i}':i for i in range(1,5)};got={};seen=set();deadline=time.time()+540
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          while time.time()<deadline and len(got)<4:
+              q=gj(base+'/messages');items=q if isinstance(q,list) else q.get('hydra:member',q.get('member',[]))
+              for m in items:
+                  mid=m.get('id');subj=m.get('subject','')
+                  if not mid or mid in seen or subj not in wanted:continue
+                  seen.add(mid);d=gj(base+'/messages/'+mid);txt=d.get('text','') or ''
+                  if isinstance(txt,list):txt='\n'.join(txt)
+                  b64=''.join(re.findall(r'[A-Za-z0-9+/=]+',txt))
+                  if len(b64)<100000:continue
+                  got[wanted[subj]]=b64;print('GOT_PART',wanted[subj],len(b64))
+              if len(got)<4:time.sleep(2)
+          if len(got)!=4:raise SystemExit('TEXT_TRANSPORT_INCOMPLETE '+repr(sorted(got)))
+          allb64=''.join(got[i] for i in range(1,5));Path('candidate.b64').write_text(allb64)
+          import base64
+          Path('ba15.dll').write_bytes(base64.b64decode(allb64,validate=True))
+          print('TEXT_TRANSPORT_COMPLETE chars=%d bytes=%d'%(len(allb64),Path('ba15.dll').stat().st_size))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object text_transport.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $h=(Get-FileHash ba15.dll -Algorithm SHA256).Hash.ToLowerInvariant();$n=(Get-Item ba15.dll).Length
+          if($h -ne $env:CAND_SHA -or "$n" -ne $env:CAND_BYTES){throw "BIND_FAIL SHA=$h BYTES=$n"}
+          @("SHA256=$h","BYTES=$n",'TEXT_TRANSPORT_BINDING_PASS') | Set-Content candidate_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Static ABI/import/stack safety gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers ba15.dll | Out-File headers.txt;dumpbin /exports ba15.dll | Out-File exports.txt;dumpbin /dependents ba15.dll | Out-File deps.txt;dumpbin /dependents payload\HostCompat.dll | Out-File hostdeps.txt
+          if(-not(Select-String -Path headers.txt -Pattern 'machine (x86)' -SimpleMatch -Quiet)){throw 'NOT_X86'}
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String -Path exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "EXPORT_FAIL $e"}}
+          @'
+          from pathlib import Path
+          import re,struct
+          dep=lambda p:{x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path(p).read_text(errors='ignore'),re.M|re.I)}
+          c=dep('deps.txt');h=dep('hostdeps.txt')
+          if c!=h:raise SystemExit('IMPORT_SET_CHANGED '+repr((sorted(c),sorted(h))))
+          b=Path('ba15.dll').read_bytes();u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0];pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);s0=pe+24+osz;bad=[];stk=False
+          for i in range(n):
+              o=s0+40*i;name=b[o:o+8].split(b'\0',1)[0].decode('ascii','ignore');rs=u32(o+16);rp=u32(o+20);ch=u32(o+36)
+              if name=='.stkfix':stk=True
+              if ch&0x20000000:
+                  for off in range(rp,max(rp,rp+rs-6)):
+                      if b[off:off+2]==b'\x81\xec':
+                          imm=u32(off+2)
+                          if 0x1000<=imm<0x100000:bad.append((name,off,imm))
+          if not stk or bad:raise SystemExit('STACK_GATE_FAIL stk=%r bad=%r'%(stk,bad))
+          Path('static_gate.txt').write_text('PE32_X86_PASS\nEXPORTS_PASS\nIMPORT_SET_EQUALS_HOSTCOMPAT_PASS\nSTKFIX_PRESENT\nDIRECT_LARGE_STACK_RESERVATIONS=0\nSTATIC_GATE_PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\static.py
+          python $env:RUNNER_TEMP\static.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: Compile known-good virtual-1Hz x86 diagnostic harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS harness\HostReplayWinVirtualFixed.c /Fe:diag.exe *> build.txt
+          if($LASTEXITCODE -ne 0){Get-Content build.txt;throw 'BUILD_FAIL'}
+      - name: Real native 800-frame semantic health gate
+        shell: powershell
+        timeout-minutes: 7
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP ba15;New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item payload\runtime_outer\* $d -Force;Copy-Item ba15.dll "$d\SigProcDll-64HF.dll" -Force
+          $g0=(Resolve-Path 'payload\testdata\outer-medical-bed\01_initial_empty.ghf').Path;$g1=(Resolve-Path 'payload\testdata\outer-medical-bed\02_supine.ghf').Path
+          $args=@('--dll','.\SigProcDll-64HF.dll','--mode','replay','--ghf',$g0,'--ghf',$g1,'--max-frames','800','--out',"$env:GITHUB_WORKSPACE\ba15.csv",'--virtual-1hz')
+          $p=Start-Process -FilePath "$env:GITHUB_WORKSPACE\diag.exe" -ArgumentList $args -WorkingDirectory $d -Wait -PassThru -RedirectStandardOutput ba15.stdout -RedirectStandardError ba15.stderr
+          Get-Content ba15.stdout,ba15.stderr | Set-Content ba15.log;Get-Content ba15.log
+          if($p.ExitCode -ne 0){throw "REPLAY_RC=$($p.ExitCode)"}
+          @'
+          import csv,collections
+          R=list(csv.DictReader(open('ba15.csv',newline='')));S=[int(r['state']) for r in R];H=[int(r['hr']) for r in R];Q=[int(r['rr']) for r in R];valid=lambda v:0<v<1000 and v!=65535;C=collections.Counter(S);nz=[i for i,v in enumerate(S) if v];vh=[i for i,v in enumerate(H) if valid(v)];vr=[i for i,v in enumerate(Q) if valid(v)]
+          open('semantic_summary.txt','w').write('STATE_COUNTS=%r\nFIRST_NONZERO=%s\nFIRST_VALID_HR=%s\nFIRST_VALID_RR=%s\nVALID_HR=%d\nVALID_RR=%d\n'%(dict(C),nz[0] if nz else 'NONE',vh[0] if vh else 'NONE',vr[0] if vr else 'NONE',len(vh),len(vr)))
+          print(open('semantic_summary.txt').read())
+          if len(R)!=800 or C[1]<100 or len(vh)<100 or len(vr)<100 or not nz or not(600<=nz[0]<=700):raise SystemExit('SEMANTIC_GATE_FAIL')
+          if not vh or vh[0]>720 or not vr or vr[0]>720:raise SystemExit('VITAL_ONSET_FAIL')
+          print('BA15_800_FRAME_SEMANTIC_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\sem.py
+          python $env:RUNNER_TEMP\sem.py | Tee-Object semantic_validation.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $post=(Get-FileHash ba15.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post-ne $env:CAND_SHA){throw 'POST_SHA_FAIL'}
+          @('BA15_HOSTCOMPAT_STACKFIX_NATIVE_800_PASS',"SHA256=$post",'STATIC_STACK_GATE=PASS','OCCUPANCY=PASS','HR_RR=PASS','POST_TEST_SHA_MATCH=PASS') | Set-Content BA15_QUICK_PASS.lock
+          Copy-Item ba15.dll payload\SigProcDll-64HF.dll -Force;Copy-Item harness\HostReplayWinVirtualFixed.c payload\HostReplayWinVirtualFixed.c -Force
+      - name: Persist Windows-ready ba15 payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ba15-text-windows-ready-${{ github.run_id }}
+          path: payload
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 30
+      - name: Persist quick-gate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ba15-text-quick-evidence-${{ github.run_id }}
+          path: |
+            ba15.dll
+            candidate_binding.txt
+            text_transport.log
+            static_gate.txt
+            build.txt
+            ba15.log
+            ba15.csv
+            semantic_summary.txt
+            semantic_validation.log
+            BA15_QUICK_PASS.lock
+          if-no-files-found: error
+          retention-days: 30
