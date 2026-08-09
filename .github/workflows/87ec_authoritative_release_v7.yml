@@ -1,0 +1,106 @@
+name: 87ec-authoritative-release-v7
+on:
+  push:
+    branches: [87ec-authoritative-complete-fullreg-20260809]
+    paths:
+      - '.github/workflows/87ec_authoritative_release_v7.yml'
+permissions:
+  actions: read
+  contents: write
+jobs:
+  final-release-gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      HANDOFF_BRANCH: 87ec-authoritative-complete-fullreg-20260809
+      CAND_SHA: 87ec3f9f2748d3143136c97e652b0334d63b973338b4c802aaea08e853ad226e
+      PARENT_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      RAW_HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      BA15_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 90bd3ef14c9948677f259641e15227a7d26481baf399ae61ef67d09b031ecf71
+      CHECKPOINT_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Download decrypted complete regression checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-31310246212
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31310246212
+      - name: Download exact 87ec core-native PASS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: c8b8-threadfix-v8-31298060637
+          path: core87
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31298060637
+      - name: Download exact ba15 stack-probe-safe baseline fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: ba15-exact-baseline-fixture-31323030310
+          path: ba15fixture
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31323030310
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Execute authoritative native complete regression and package audit
+        shell: powershell
+        timeout-minutes: 110
+        run: |
+          & .\tools\87ec_release_gate_v7.ps1
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          if(!(Test-Path '87ec_final_release_gate_pass.txt')){throw 'FINAL_RELEASE_GATE_PASS_FILE_MISSING'}
+      - name: Upload final exact DLL ZIP and full evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GuanHu-SigProc-87ec-FINAL-${{ github.run_id }}
+          path: |
+            release/SigProcDll-64HF.dll
+            GuanHu_SigProc_Final_Release_20260809.zip
+            87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS.lock
+            FINAL_RELEASE_MANIFEST.txt
+            FINAL_ZIP_AUDIT_PASS.txt
+            87ec_final_release_gate_pass.txt
+            exact_asset_hashes.txt
+            ghf_sha_gate.txt
+            static_pe_gate.txt
+            static_gate_python.log
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            raw_hostcompat_exports.txt
+            raw_hostcompat_dependents.txt
+            ba15_headers_final.txt
+            ba15_exports_final.txt
+            ba15_dependents_final.txt
+            loader_inner.log
+            loader_outer.log
+            baseline_fixture_gate.txt
+            hostcompat_safe_nonzero.log
+            c63_nonzero.log
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            fullreg_compile.txt
+            post_test_sha.txt
+            complete_regression_gate.txt
+            87ec_core_native_pass.lock
+            core_threadstress_v8.log
+            core_stability_v8.log
+            core_realtime_v8.log
+          if-no-files-found: error
+          retention-days: 30
