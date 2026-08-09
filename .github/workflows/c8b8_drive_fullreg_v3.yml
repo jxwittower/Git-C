@@ -89,6 +89,7 @@ jobs:
         shell: powershell
         timeout-minutes: 105
         run: |
+          $PSDefaultParameterValues['Out-File:Encoding']='ascii'
           & .\payload_root\payload\windows_gate.ps1
       - name: Commit exact PASS lock
         if: success()
