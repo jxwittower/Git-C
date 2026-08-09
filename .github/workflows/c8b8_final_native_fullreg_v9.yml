@@ -1,0 +1,171 @@
+name: c8b8-final-native-fullreg-v9-persistent
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/c8b8_final_native_fullreg_v9.yml'
+      - '.c8b8_resume_support/install_v9_harness.py'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 145
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      HOST_FIXED_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 2fac53a77568525781f4945321ca3b21b8c9bb20561d6c1f7db118a6ae8e127d
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      SOURCE_RUN: '31310246212'
+      SOURCE_ARTIFACT: c8b8-decrypted-fullreg-xz-31310246212
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore decrypted fullreg checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          $xz='recovered\c8b8_fullreg_payload_v2.tar.xz'
+          if(!(Test-Path $xz)){throw 'DECRYPTED_XZ_MISSING'}
+          $h=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:XZ_SHA){throw "DECRYPTED_XZ_SHA_FAIL $h"}
+          Copy-Item $xz payload.tar.xz -Force
+          "DECRYPTED_CHECKPOINT_RESTORE_PASS SHA256=$h SOURCE_RUN=$env:SOURCE_RUN" | Set-Content v9_decrypted_restore_gate.txt
+
+      - name: Extract and prepare base assets
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force extract_xz,extract_tar | Out-Null
+          & 7z x -y payload.tar.xz '-oextract_xz' | Out-File v9_7z_xz.log
+          if($LASTEXITCODE -ne 0){throw '7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem extract_xz -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'PAYLOAD_TAR_MISSING'}
+          & 7z x -y $tar '-oextract_tar' | Out-File v9_7z_tar.log
+          if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
+          Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
+          python .c8b8_resume_support\prepare_gate_v5.py | Tee-Object v9_prepare_base.log
+          if($LASTEXITCODE -ne 0){throw 'PREPARE_BASE_FAIL'}
+          @'
+          from pathlib import Path
+          s=Path('.c8b8_resume_support/run_windows_gate_v6.ps1').read_text().replace('\r\n','\n').replace('\r','\n')
+          Path('payload/run_windows_gate.ps1').write_bytes(s.replace('\n','\r\n').encode('utf-8'))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\install_v9_runner.py
+          python $env:RUNNER_TEMP\install_v9_runner.py
+          python .c8b8_resume_support\install_v9_harness.py | Tee-Object v9_harness_install.log
+          if($LASTEXITCODE -ne 0){throw 'V9_HARNESS_INSTALL_FAIL'}
+          $hs=(Get-FileHash payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hs -ne $env:HARNESS_SHA){throw "V9_HARNESS_SHA_FAIL $hs"}
+          if(-not (Select-String -Path payload\fullreg_c8b8.c -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V9_CALIBRATION_CODE_MISSING'}
+          if(Select-String -Path payload\fullreg_c8b8.c -Pattern 'memset(state,0,sizeof(state));memset(result,0,sizeof(result));seq=a->proc' -SimpleMatch -Quiet){throw 'V9_FRAME_RESET_REGRESSION'}
+          $hf=(Get-FileHash payload\HostCompat-stackprobe-fixed.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hf -ne $env:HOST_FIXED_SHA){throw "HOSTFIX_SHA_FAIL $hf"}
+          "V9_ASSET_PREP_PASS HARNESS_SHA=$hs HOSTFIX_SHA=$hf" | Set-Content v9_asset_prep_gate.txt
+
+      - name: Persist V9 prepared metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v9-prepared-assets-${{ github.run_id }}
+          path: |
+            v9_decrypted_restore_gate.txt
+            v9_asset_prep_gate.txt
+            v9_harness_install.log
+            v9_prepare_base.log
+            payload/MANIFEST.txt
+            payload/fullreg_c8b8.c
+            payload/run_windows_gate.ps1
+            payload/HostCompat-stackprobe-fixed.dll
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Self-calibrate persistent-state harness with original C63
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:v9_calibrate.exe payload\fullreg_c8b8.c *> v9_calibration_compile.txt
+          if($LASTEXITCODE -ne 0){Get-Content v9_calibration_compile.txt;throw 'V9_CALIBRATION_COMPILE_FAIL'}
+          $c63=(Resolve-Path 'payload\C63.dll').Path
+          $rt=(Resolve-Path 'payload\runtime\outer-medical-bed').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\v9_calibrate.exe calibrate $c63 $rt $test *> v9_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content v9_calibration.log
+          if($rc -ne 0){throw "V9_CALIBRATION_FAIL rc=$rc"}
+          if(-not (Select-String -Path v9_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V9_CALIBRATION_MARKER_MISSING'}
+          'V9_HARNESS_SELF_CALIBRATION_PASS' | Set-Content v9_calibration_gate.txt
+
+      - name: Run exact native Windows complete regression with V9 harness
+        shell: powershell
+        timeout-minutes: 120
+        run: |
+          $ErrorActionPreference='Stop'
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload\run_windows_gate.ps1
+          if($LASTEXITCODE -ne 0){throw "WINDOWS_GATE_FAIL $LASTEXITCODE"}
+          if(!(Test-Path C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock)){throw 'PASS_LOCK_MISSING'}
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:CAND_SHA){throw "POST_GATE_CANDIDATE_SHA_FAIL $h"}
+          "V9_POST_GATE_EXACT_SHA_PASS SHA256=$h" | Set-Content v9_post_gate_sha.txt
+          Get-Content C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+
+      - name: Upload V9 exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v9-native-fullreg-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/HostCompat-stackprobe-fixed.dll
+            payload/MANIFEST.txt
+            v9_decrypted_restore_gate.txt
+            v9_asset_prep_gate.txt
+            v9_harness_install.log
+            v9_calibration_compile.txt
+            v9_calibration.log
+            v9_calibration_gate.txt
+            exact_asset_hashes.txt
+            exact_asset_binding.txt
+            ghf_sha_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_pe_gate.txt
+            static_gate_python.log
+            fullreg_compile.txt
+            loader_inner.log
+            loader_outer.log
+            hostfix_loader_inner.log
+            hostfix_loader_outer.log
+            candidate_nonzero.log
+            c63_nonzero.log
+            hostcompat_fixed_nonzero.log
+            native_loader_baseline_gate.txt
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            post_test_sha.txt
+            complete_regression_gate.txt
+            C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+            run_windows_gate_pass.txt
+            v9_post_gate_sha.txt
+          if-no-files-found: ignore
+          retention-days: 30
