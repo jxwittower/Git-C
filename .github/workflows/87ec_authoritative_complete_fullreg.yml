@@ -1,0 +1,236 @@
+name: 87ec-authoritative-complete-fullreg
+on:
+  push:
+    branches: [87ec-authoritative-complete-fullreg-20260809]
+    paths:
+      - '.github/workflows/87ec_authoritative_complete_fullreg.yml'
+permissions:
+  actions: read
+  contents: write
+jobs:
+  release-gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      HANDOFF_BRANCH: 87ec-authoritative-complete-fullreg-20260809
+      CAND_SHA: 87ec3f9f2748d3143136c97e652b0334d63b973338b4c802aaea08e853ad226e
+      PARENT_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 90bd3ef14c9948677f259641e15227a7d26481baf399ae61ef67d09b031ecf71
+      CHECKPOINT_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      CORE_RUN_ID: '31298060637'
+      CHECKPOINT_RUN_ID: '31310246212'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download decrypted complete fullreg checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-31310246212
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31310246212
+
+      - name: Download exact 87ec core-native PASS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: c8b8-threadfix-v8-31298060637
+          path: core87
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31298060637
+
+      - name: Bind decrypted fullreg payload to exact tested 87ec DLL
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $xz=(Resolve-Path 'checkpoint\c8b8_fullreg_payload_v2.tar.xz').Path
+          $xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($xh -ne $env:CHECKPOINT_XZ_SHA){throw "CHECKPOINT_XZ_SHA_FAIL $xh"}
+          New-Item -ItemType Directory -Force xzstage,expanded,payload | Out-Null
+          7z x -y $xz "-o$pwd\xzstage" | Out-Null
+          $tar=Get-ChildItem xzstage -Filter '*.tar' | Select-Object -First 1
+          if(!$tar){throw 'CHECKPOINT_TAR_MISSING'}
+          7z x -y $tar.FullName "-o$pwd\expanded" | Out-Null
+          $src=(Resolve-Path 'expanded\c8b8_fullreg_payload_v2').Path
+          Copy-Item "$src\*" payload -Recurse -Force
+
+          $parent=(Get-FileHash 'payload\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($parent -ne $env:PARENT_SHA){throw "CHECKPOINT_PARENT_SHA_FAIL $parent"}
+          $candidates=@(Get-ChildItem core87 -Recurse -Filter 'SigProcDll-64HF.dll' | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:CAND_SHA })
+          if($candidates.Count -ne 1){throw "EXACT_87EC_DLL_COUNT_FAIL count=$($candidates.Count)"}
+          Copy-Item $candidates[0].FullName 'payload\SigProcDll-64HF.dll' -Force
+          $bound=(Get-FileHash 'payload\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($bound -ne $env:CAND_SHA){throw "BOUND_87EC_SHA_FAIL $bound"}
+
+          $locks=@(Get-ChildItem core87 -Recurse -Filter 'C8B8_THREADFIX_V8_CORE_PASS.lock')
+          if($locks.Count -ne 1){throw "CORE_PASS_LOCK_COUNT_FAIL count=$($locks.Count)"}
+          $core=Get-Content $locks[0].FullName -Raw
+          foreach($m in @('THREADFIX_V8_CORE_NATIVE_PASS',"SHA256=$env:CAND_SHA",'TWO_THREAD=2x2000','LONG_STABILITY=20000','REALTIME_1HZ=60','RUN_ID=31298060637')){if(-not $core.Contains($m)){throw "CORE_PASS_MARKER_FAIL $m"}}
+          Copy-Item $locks[0].FullName '87ec_core_native_pass.lock' -Force
+          foreach($p in @('threadstress_v8.log','stability_v8.log','realtime_v8.log','loader_inner-bed.log','loader_outer-medical-bed.log')){
+            $f=Get-ChildItem core87 -Recurse -Filter $p | Select-Object -First 1
+            if(!$f){throw "CORE_EVIDENCE_MISSING $p"}
+            Copy-Item $f.FullName ".\core_$p" -Force
+          }
+          if(-not(Select-String core_threadstress_v8.log -SimpleMatch 'TWO_THREAD_STRESS_PASS threads=2 loops_each=2000' -Quiet)){throw 'CORE_THREAD_MARKER_FAIL'}
+          if(-not(Select-String core_stability_v8.log -SimpleMatch 'LONG_STABILITY_PASS loops=20000' -Quiet)){throw 'CORE_STABILITY_MARKER_FAIL'}
+          if(-not(Select-String core_realtime_v8.log -SimpleMatch 'REALTIME_1HZ_PASS frames=60' -Quiet)){throw 'CORE_REALTIME_MARKER_FAIL'}
+          if(-not(Select-String core_loader_inner-bed.log -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){throw 'CORE_INNER_LOADER_MARKER_FAIL'}
+          if(-not(Select-String core_loader_outer-medical-bed.log -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){throw 'CORE_OUTER_LOADER_MARKER_FAIL'}
+
+          $bytes=[IO.File]::ReadAllBytes((Resolve-Path 'payload\SigProcDll-64HF.dll'))
+          $ascii=[Text.Encoding]::ASCII.GetString($bytes)
+          if(-not $ascii.Contains('.stkfix')){throw 'STKFIX_SECTION_MISSING'}
+          if(-not $ascii.Contains('.thrfix')){throw 'THRFIX_SECTION_MISSING'}
+          $ghf=@(Get-ChildItem payload\testdata -Recurse -Filter '*.ghf')
+          $gb=($ghf|Measure-Object Length -Sum).Sum
+          if($ghf.Count -ne 13 -or $gb -ne 82484656){throw "ORIGINAL_GHF_COVERAGE_FAIL count=$($ghf.Count) bytes=$gb"}
+          @("CHECKPOINT_XZ_SHA=$xh","PARENT_SHA=$parent","BOUND_CANDIDATE_SHA=$bound","CORE_NATIVE_RUN=$env:CORE_RUN_ID","GHF_COUNT=$($ghf.Count)","GHF_BYTES=$gb",'STKFIX=PASS','THRFIX=PASS') | Set-Content 87ec_exact_binding.txt
+          'EXACT_87EC_DECRYPTED_FULLREG_BIND_PASS' | Set-Content 87ec_bind_pass.txt
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Execute authoritative complete native Windows regression
+        shell: powershell
+        timeout-minutes: 95
+        run: |
+          $ErrorActionPreference='Stop'
+          & .\payload\run_windows_gate.ps1
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          if(!(Test-Path 'run_windows_gate_pass.txt')){throw 'RUN_WINDOWS_GATE_PASS_MISSING'}
+          if(!(Test-Path 'complete_regression_gate.txt')){throw 'COMPLETE_REGRESSION_GATE_MISSING'}
+          if(-not(Select-String complete_regression_gate.txt -SimpleMatch 'COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS' -Quiet)){throw 'COMPLETE_REGRESSION_MARKER_FAIL'}
+          $post=(Get-FileHash 'payload\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $env:CAND_SHA){throw "POST_FULLREG_SHA_FAIL $post"}
+
+      - name: Create SHA-bound 87ec final release lock and package audit
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $post=(Get-FileHash 'payload\SigProcDll-64HF.dll' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $env:CAND_SHA){throw "FINAL_PREPACKAGE_SHA_FAIL $post"}
+          $required=@(
+            @{f='01_sentinel.log';m='SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS'},
+            @{f='02_long.log';m='LONG_STABILITY_PASS loops=20000'},
+            @{f='03_threads.log';m='TWO_THREAD_STRESS_PASS threads=2 loops_each=2000'},
+            @{f='04_full.log';m='FULL_GHF_NATIVE_PASS frames=10808 samples=6853006'},
+            @{f='04_full.log';m='PERFORMANCE_PASS'},
+            @{f='05_determinism.log';m='DETERMINISTIC_REPLAY_PASS'},
+            @{f='06_realtime.log';m='REALTIME_1HZ_PASS frames=60'}
+          )
+          foreach($x in $required){if(-not(Select-String $x.f -SimpleMatch $x.m -Quiet)){throw "FINAL_FULLREG_MARKER_FAIL $($x.m)"}}
+          foreach($x in @(
+            @{f='core_threadstress_v8.log';m='TWO_THREAD_STRESS_PASS threads=2 loops_each=2000'},
+            @{f='core_stability_v8.log';m='LONG_STABILITY_PASS loops=20000'},
+            @{f='core_realtime_v8.log';m='REALTIME_1HZ_PASS frames=60'}
+          )){if(-not(Select-String $x.f -SimpleMatch $x.m -Quiet)){throw "FINAL_CORE_MARKER_FAIL $($x.m)"}}
+
+          @(
+            '87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS',
+            "SHA256=$post",
+            'PARENT_SHA=c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9',
+            'CORE_NATIVE_RUN=31298060637',
+            "COMPLETE_FULLREG_RUN=$env:GITHUB_RUN_ID",
+            'PE32_X86=PASS',
+            'EXPORTS=PASS',
+            'IMPORT_SUBSET=PASS',
+            'STACK_PROBE=PASS',
+            'THREAD_SERIALIZATION=PASS',
+            'LOADER_INNER_OUTER=PASS',
+            'REAL_NONZERO_GHF=PASS',
+            'GHF_COUNT=13',
+            'GHF_BYTES=82484656',
+            'FULL_GHF_FRAMES=10808',
+            'FULL_GHF_SAMPLES=6853006',
+            'SEQ_TARGETS=PASS',
+            'DETERMINISTIC_REPLAY=PASS',
+            'LONG_STABILITY_20000=PASS',
+            'SAME_PROCESS_TWO_THREAD_2X2000=PASS',
+            'REALTIME_1HZ_60=PASS',
+            'PERFORMANCE=PASS'
+          ) | Set-Content 87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS.lock
+          @(
+            'GuanHu SigProc authoritative final release',
+            'Filename=SigProcDll-64HF.dll',
+            "SHA256=$post",
+            'Architecture=PE32 x86',
+            'Exports=_SigProc@24,_SigProc_Fini@0,_SigProc_Init@8,_SigProc_Stat@0',
+            'CoreNativeEvidenceRun=31298060637',
+            "CompleteRegressionRun=$env:GITHUB_RUN_ID",
+            'OriginalGHFCount=13',
+            'OriginalGHFBytes=82484656',
+            'FullFrames=10808',
+            'FullSamples=6853006'
+          ) | Set-Content FINAL_RELEASE_MANIFEST.txt
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item 'payload\SigProcDll-64HF.dll' 'release\SigProcDll-64HF.dll' -Force
+          Copy-Item '87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS.lock' release\ -Force
+          Copy-Item 'FINAL_RELEASE_MANIFEST.txt' release\ -Force
+          $post | Set-Content 'release\SigProcDll-64HF.dll.sha256'
+          Compress-Archive -Path 'release\*' -DestinationPath 'GuanHu_SigProc_Final_Release_20260809.zip' -Force
+          if((Get-Item 'GuanHu_SigProc_Final_Release_20260809.zip').Length -le 0){throw 'FINAL_ZIP_EMPTY'}
+          if(Test-Path zip_audit){Remove-Item zip_audit -Recurse -Force}
+          Expand-Archive 'GuanHu_SigProc_Final_Release_20260809.zip' zip_audit -Force
+          $zdll=Get-Item 'zip_audit\SigProcDll-64HF.dll'
+          if($zdll.Length -le 0){throw 'ZIP_DLL_EMPTY'}
+          $zsha=(Get-FileHash $zdll.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($zsha -ne $env:CAND_SHA){throw "ZIP_EXTRACTED_DLL_SHA_FAIL $zsha"}
+          $zipsha=(Get-FileHash 'GuanHu_SigProc_Final_Release_20260809.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("FINAL_ZIP_AUDIT_PASS","ZIP_SHA256=$zipsha","EXTRACTED_DLL_SHA256=$zsha","EXTRACTED_DLL_BYTES=$($zdll.Length)") | Set-Content FINAL_ZIP_AUDIT_PASS.txt
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item '87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS.lock','FINAL_RELEASE_MANIFEST.txt','FINAL_ZIP_AUDIT_PASS.txt' evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary
+          git commit -m 'Lock exact 87ec authoritative native complete regression PASS'
+          if($LASTEXITCODE -ne 0){throw 'FINAL_LOCK_COMMIT_FAIL'}
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'FINAL_LOCK_PUSH_FAIL'}
+
+      - name: Upload exact final DLL package and complete evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 87ec-authoritative-final-${{ github.run_id }}
+          path: |
+            release/SigProcDll-64HF.dll
+            GuanHu_SigProc_Final_Release_20260809.zip
+            87EC_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS.lock
+            FINAL_RELEASE_MANIFEST.txt
+            FINAL_ZIP_AUDIT_PASS.txt
+            87ec_exact_binding.txt
+            87ec_core_native_pass.lock
+            exact_asset_hashes.txt
+            exact_asset_binding.txt
+            ghf_sha_gate.txt
+            static_pe_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            loader_inner.log
+            loader_outer.log
+            hostcompat_nonzero.log
+            c63_nonzero.log
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            post_test_sha.txt
+            complete_regression_gate.txt
+            core_threadstress_v8.log
+            core_stability_v8.log
+            core_realtime_v8.log
+          if-no-files-found: error
+          retention-days: 30
