@@ -1,0 +1,13 @@
+name: exact7-preflight-diag-v6
+on:
+  push:
+    branches: [exact7-fullreg-20260809]
+    paths: ['.github/workflows/exact7_preflight_diag_v6.yml']
+permissions:
+  contents: read
+jobs:
+  registry:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo registered
