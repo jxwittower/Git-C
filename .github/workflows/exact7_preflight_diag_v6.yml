@@ -1,0 +1,123 @@
+name: exact7-preflight-diag-v6
+on:
+  push:
+    branches: [exact7-fullreg-20260809]
+    paths: ['.github/workflows/exact7_preflight_diag_v6.yml']
+permissions:
+  contents: write
+jobs:
+  diag:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      ENC_SHA: bb8a51f1c349de672d55e3ae3299bda1fc2d2dcdd8e16280c9c99a07c6df112a
+      XZ_SHA: 0e29addb45f5535151311cbcd8c944804be2963c337fe958caea740c1129a7cd
+      EXACT_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      HANDOFF_BRANCH: exact7-fullreg-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Publish diagnostic handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('NO_MAIL_DOMAIN')
+          a=string.ascii_lowercase+string.digits;addr='ghdiag'+''.join(secrets.choice(a) for _ in range(14))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-EXACT7-DIAGV6-'+os.environ['GITHUB_RUN_ID']+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .exact7_diag_v6_handoff|Out-Null;Copy-Item public.pem,mailbox.txt,subject_prefix.txt .exact7_diag_v6_handoff\
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .exact7_diag_v6_handoff;git commit -m 'Publish exact7 diagnostic V6 handoff';git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Receive payload
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          @'
+          import json,os,time,urllib.parse,urllib.request
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';prefix=Path('subject_prefix.txt').read_text().strip();out=Path('transport');out.mkdir(exist_ok=True);want={f'{prefix}-P{i}':i for i in range(1,5)};got=set();key=False;seen=set()
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          end=time.time()+1500
+          while time.time()<end and (len(got)<4 or not key):
+              q=gj(base+'/messages');msgs=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject') not in want or m['id'] in seen:continue
+                  seen.add(m['id']);idx=want[m['subject']];d=gj(base+'/messages/'+m['id'])
+                  for at in d.get('attachments',[]):
+                      n=at.get('filename','');u=at.get('downloadUrl')
+                      if not u:continue
+                      data=gb(urllib.parse.urljoin(base,u))
+                      if n==f'exact7_part{idx}.bin':(out/n).write_bytes(data);got.add(idx)
+                      elif n=='exact7_wrapped_key.bin':(out/n).write_bytes(data);key=True
+              if len(got)<4 or not key:time.sleep(3)
+          if len(got)!=4 or not key:raise SystemExit(f'TRANSPORT_FAIL {sorted(got)} {key}')
+          print('DIAG_TRANSPORT_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py
+      - name: Decrypt exact payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$o=[IO.File]::Create("$env:RUNNER_TEMP\p.enc");try{1..4|%{$b=[IO.File]::ReadAllBytes("transport\exact7_part$_.bin");$o.Write($b,0,$b.Length)}}finally{$o.Dispose()}
+          $h=(Get-FileHash $env:RUNNER_TEMP\p.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\exact7_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in $env:RUNNER_TEMP\p.enc -out $env:RUNNER_TEMP\p.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          $x=(Get-FileHash $env:RUNNER_TEMP\p.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"};New-Item -ItemType Directory -Force xzstage,payload_root|Out-Null;7z x -y $env:RUNNER_TEMP\p.tar.xz "-o$pwd\xzstage"|Out-Null;$t=Get-ChildItem xzstage -Filter '*.tar'|Select-Object -First 1;7z x -y $t.FullName "-o$pwd\payload_root"|Out-Null
+          $dll=(Get-FileHash payload_root\payload\dlls\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($dll -ne $env:EXACT_SHA){throw "DLL_SHA_FAIL $dll"}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x86'
+      - name: Run occupancy and vitals diagnostic
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import collections,json,sys
+          from pathlib import Path
+          root=Path('payload_root/payload').resolve();sys.path.insert(0,str(root));import run_fullreg as r
+          def diag(label,dll):
+              obj=r.run_worker('diag_'+label,{'mode':'full','dll':str(dll),'bed':'inner-bed','frames':r.INNER[:2],'collect':True})
+              sup=r.segrows(obj,1);stable=sup[120:]
+              states=collections.Counter(x[2] for x in stable);rr=[x[3] for x in stable if x[3] not in (0,r.INVALID)];hr=[x[4] for x in stable if x[4] not in (0,r.INVALID)]
+              occupied=sum(1 for x in stable if x[2]!=0);both=sum(1 for x in stable if x[2]!=0 and x[3] not in (0,r.INVALID) and x[4] not in (0,r.INVALID))
+              first_occ=next((x[1] for x in sup if x[2]!=0),None);first_both=next((x[1] for x in sup if x[2]!=0 and x[3] not in (0,r.INVALID) and x[4] not in (0,r.INVALID)),None)
+              d={'label':label,'calls':obj['calls'],'stable':len(stable),'occupied':occupied,'rr_valid':len(rr),'hr_valid':len(hr),'both_valid':both,'states':dict(states),'first_occ_row':first_occ,'first_both_row':first_both,'rr_minmax':[min(rr),max(rr)] if rr else None,'hr_minmax':[min(hr),max(hr)] if hr else None,'digest':obj['digest'],'max_ms':obj['max_ms'],'p99_ms':obj['p99_ms']}
+              print('DIAG',json.dumps(d,sort_keys=True));return d
+          results=[diag('exact7',r.CAND),diag('c63',r.C63),diag('hostsafe',r.HOST)]
+          Path('diag_summary.json').write_text(json.dumps(results,indent=2))
+          '@ | Set-Content -Encoding ascii diag.py
+          Push-Location payload_root\payload
+          python ..\..\diag.py 2>&1 | Tee-Object ..\..\diag_summary.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){exit $rc}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exact7-preflight-diag-v6-${{ github.run_id }}
+          path: |
+            diag_summary.txt
+            diag_summary.json
+            payload_root/payload/diag_*.json
+          if-no-files-found: ignore
+          retention-days: 14
