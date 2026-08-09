@@ -1,0 +1,14 @@
+name: c8b8-drive-exact-native-fullreg-v2
+on:
+  push:
+    branches: [c8b8-drive-fullreg-20260809]
+    paths:
+      - '.github/workflows/c8b8_drive_exact_native_fullreg_v2.yml'
+permissions:
+  contents: write
+jobs:
+  noop:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo registered
