@@ -1,0 +1,87 @@
+name: c8b8-v4.8-c63-exhaustive-diagnostic
+on:
+  push:
+    branches: [c8b8-v4-drive-resumable-20260809]
+    paths:
+      - '.github/workflows/c8b8_v48_c63_exhaustive_diagnostic.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnostic:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      SOURCE_RUN: '31314728589'
+      SOURCE_ARTIFACT: c8b8-v4-plaintext-xz-31314728589
+      XZ_SHA: 5a1c750b48a7d436f8ca7a011dd4d925d68891e8241a11aa42bf4bbd30afd3c0
+      XZ_BYTES: '20593840'
+      CAND_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      PAYLOAD_ROOT: c8b8_fullreg_payload_v4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore verified full-data checkpoint and exact C63 candidate
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP resume;New-Item -ItemType Directory -Force $d|Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D $d
+          if($LASTEXITCODE -ne 0){throw 'CHECKPOINT_DOWNLOAD_FAIL'}
+          $p=Get-ChildItem $d -Recurse -Filter payload.tar.xz|Select-Object -First 1;if(!$p){throw 'NO_XZ'}
+          $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:XZ_SHA -or $p.Length -ne [int64]$env:XZ_BYTES){throw 'XZ_BIND_FAIL'}
+          $s=Join-Path $env:RUNNER_TEMP stage;New-Item -ItemType Directory -Force $s|Out-Null;7z x -y $p.FullName "-o$s"|Out-Null;$t=Get-ChildItem $s -Filter *.tar|Select-Object -First 1;7z x -y $t.FullName '-o.'|Out-Null
+          Copy-Item -Force "$env:PAYLOAD_ROOT\C63.dll" "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll"
+          $ch=(Get-FileHash "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($ch -ne $env:CAND_SHA){throw 'CAND_BIND_FAIL'}
+          "V48_RESTORE_BIND_PASS XZ=$h CAND=$ch"|Tee-Object v48_restore.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Convert production fullreg harness to exhaustive diagnostic mode
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          p=Path('c8b8_fullreg_payload_v4/fullreg.c')
+          s=p.read_text()
+          old='static int fail(const char *s){ fprintf(stderr,"FAIL: %s\\n",s); return 0; }'
+          new=old+'\nstatic unsigned g_diag_failures=0;\nstatic void diag_fail(const char *s){ fprintf(stderr,"DIAG_FAIL: %s\\n",s); g_diag_failures++; }'
+          if old not in s: raise SystemExit('FAIL_HELPER_ANCHOR_MISSING')
+          s=s.replace(old,new,1)
+          a=s.index('    if(evaluate){')
+          b=s.index('    return 1;\n}',a)
+          ev='''    if(evaluate){\n        SourceStats *s;\n        s=&out->src[0]; if(s->nonzero!=0||s->valid_hr!=0||s->valid_rr!=0)diag_fail("INITIAL_EMPTY_CORRECTNESS_FAIL");\n        if(strcmp(bed,"inner-bed")==0){\n            for(fi=1;fi<=4;fi++){s=&out->src[fi]; if(s->frames<100||s->nonzero*100u<s->frames*80u||s->valid_hr*100u<s->frames*35u||s->valid_rr*100u<s->frames*35u)diag_fail("INNER_OCCUPIED_STABILITY_FAIL");}\n            s=&out->src[5]; if(s->first_zero<0||s->first_zero>10||s->last30_zero<27||s->last30_invalid_hr<27||s->last30_invalid_rr<27)diag_fail("INNER_FINAL_EMPTY_10_FRAME_FAIL");\n        }else{\n            for(fi=1;fi<=3;fi++){s=&out->src[fi]; if(s->frames<100||s->nonzero*100u<s->frames*75u||s->valid_hr*100u<s->frames*35u||s->valid_rr*100u<s->frames*35u)diag_fail("OUTER_OCCUPIED_STABILITY_FAIL");}\n            s=&out->src[4]; if(s->transitional==0||s->last30_invalid_hr<20||s->last30_invalid_rr<20)diag_fail("LEAVE_WARNING_VITAL_SUPPRESSION_FAIL");\n            s=&out->src[5]; if(s->first_nonzero<0||s->first_nonzero>10||s->first_valid_hr<0||s->first_valid_hr>120||s->first_valid_rr<0||s->first_valid_rr>120)diag_fail("RETURN_RECOVERY_FAIL");\n            s=&out->src[6]; if(s->first_zero<0||s->first_zero>10||s->last30_zero<27||s->last30_invalid_hr<27||s->last30_invalid_rr<27)diag_fail("OUTER_FINAL_EMPTY_10_FRAME_FAIL");\n        }\n    }\n'''
+          s=s[:a]+ev+s[b:]
+          m=s.index('int main(int argc,char **argv){')
+          main='''int main(int argc,char **argv){\n    const char *cand,*host,*c63,*data,*runtime;\n    static const char *infiles[]={"01_initial_empty.ghf","02_supine.ghf","03_left.ghf","04_right.ghf","05_free.ghf","06_final_empty.ghf"};\n    static const char *outfiles[]={"01_initial_empty.ghf","02_supine.ghf","03_left.ghf","04_right.ghf","05_leave.ghf","06_return_free.ghf","07_final_empty.ghf"};\n    SequenceResult in={0},out={0};uint64_t bytes=0;size_t frames=0;unsigned before;\n    if(argc!=6){fprintf(stderr,"usage: fullreg_diag.exe candidate.dll HostCompat.dll C63.dll testdata runtime\\n");return 2;}\n    cand=argv[1];host=argv[2];c63=argv[3];data=argv[4];runtime=argv[5];\n    printf("EXHAUSTIVE_DIAGNOSTIC_BEGIN\\n");\n    if(!nonzero_contract(host,data,runtime,"HOSTCOMPAT"))diag_fail("HOSTCOMPAT_NONZERO_CONTRACT_FAIL");\n    if(!nonzero_contract(c63,data,runtime,"C63"))diag_fail("C63_NONZERO_CONTRACT_FAIL");\n    if(!nonzero_contract(cand,data,runtime,"CANDIDATE"))diag_fail("CANDIDATE_NONZERO_CONTRACT_FAIL");\n    before=g_diag_failures;if(!collect_sequence(cand,data,runtime,"inner-bed",infiles,6,&in,1))diag_fail("INNER_SEQUENCE_EXECUTION_FAIL");printf("DIAG_CATEGORY inner_added_failures=%u\\n",g_diag_failures-before);\n    before=g_diag_failures;if(!collect_sequence(cand,data,runtime,"outer-medical-bed",outfiles,7,&out,1))diag_fail("OUTER_SEQUENCE_EXECUTION_FAIL");printf("DIAG_CATEGORY outer_added_failures=%u\\n",g_diag_failures-before);\n    frames=in.n+out.n;bytes=in.bytes+out.bytes;\n    if(frames!=EXPECTED_TOTAL_GHF_FRAMES){fprintf(stderr,"DIAG_FAIL: FULL_GHF_FRAME_COUNT_FAIL got=%u\\n",(unsigned)frames);g_diag_failures++;}\n    if(bytes!=EXPECTED_TOTAL_GHF_BYTES){fprintf(stderr,"DIAG_FAIL: FULL_GHF_BYTE_COUNT_FAIL got=%llu\\n",(unsigned long long)bytes);g_diag_failures++;}\n    if(frames==EXPECTED_TOTAL_GHF_FRAMES&&bytes==EXPECTED_TOTAL_GHF_BYTES)printf("FULL_13_GHF_CORPUS_PASS files=13 frames=%u bytes=%llu\\n",(unsigned)frames,(unsigned long long)bytes);\n    if(!deterministic_gate(cand,data,runtime))g_diag_failures++;\n    if(!long_stability(cand,data,runtime))g_diag_failures++;\n    if(!thread_stress(cand,data,runtime))g_diag_failures++;\n    if(!realtime_1hz(cand,data,runtime))g_diag_failures++;\n    printf("EXHAUSTIVE_DIAGNOSTIC_COMPLETE failures=%u frames=%u bytes=%llu\\n",g_diag_failures,(unsigned)frames,(unsigned long long)bytes);\n    free(in.v);free(out.v);return 0;\n}\n'''
+          s=s[:m]+main
+          Path('fullreg_exhaustive_diag.c').write_text(s)
+          '@|Set-Content -Encoding ascii make_diag.py
+          python make_diag.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          cmd.exe /d /c "cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg_exhaustive_diag.exe fullreg_exhaustive_diag.c > v48_compile.txt 2>&1";$rc=$LASTEXITCODE
+          Get-Content v48_compile.txt;if($rc -ne 0){throw "V48_COMPILE_FAIL $rc"}
+      - name: Run all full-regression categories without early business-gate exit
+        shell: powershell
+        timeout-minutes: 100
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path $env:PAYLOAD_ROOT).Path
+          cmd.exe /d /c "fullreg_exhaustive_diag.exe $r\SigProcDll-64HF.dll $r\HostCompat.dll $r\C63.dll $r\testdata $r\runtime > v48_exhaustive.log 2>&1";$rc=$LASTEXITCODE
+          Get-Content v48_exhaustive.log;"V48_PROCESS_EXIT=$rc"|Tee-Object v48_exit.txt
+          if($rc -ne 0){throw "V48_PROCESS_CRASH_OR_INFRA_FAIL $rc"}
+          if(-not(Select-String -Quiet -SimpleMatch 'EXHAUSTIVE_DIAGNOSTIC_COMPLETE' v48_exhaustive.log)){throw 'V48_COMPLETE_MARKER_MISSING'}
+      - name: Upload exhaustive evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v48-c63-exhaustive-${{ github.run_id }}
+          path: |
+            v48_restore.txt
+            fullreg_exhaustive_diag.c
+            v48_compile.txt
+            v48_exhaustive.log
+            v48_exit.txt
+          if-no-files-found: ignore
+          retention-days: 30
