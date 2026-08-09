@@ -17,7 +17,7 @@ jobs:
       C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
       SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
       HARNESS_SHA: 90bd3ef14c9948677f259641e15227a7d26481baf399ae61ef67d09b031ecf71
-      FIXED_RUNNER_SHA: b9648d44abb7c7717c23117b33d26f5442df27aae8364f1604dce95c30817607
+      FIXED_RUNNER_SHA: 9d5de71cd64166c8b861e4d3f4c541d1f9bda41ff96d26a42318dfa9c1da88f1
       ENC_SHA: e0bbcd4883362daf8cfc5c067a8a8f72e03760f6ab9d425bb3f426b97ad5fd59
       XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
       SOURCE_RUN: '31308233779'
@@ -103,7 +103,7 @@ jobs:
           python $env:RUNNER_TEMP\recvkey.py | Tee-Object key_handoff.log
           if((Get-Item wrapped_key.bin).Length -ne 384){throw 'WRAPPED_KEY_SIZE_FAIL'}
 
-      - name: Decrypt extract and overlay fixed runner
+      - name: Decrypt extract and patch fixed runner
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
@@ -120,8 +120,29 @@ jobs:
           if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
           Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
           Copy-Item .c8b8_resume_support\run_windows_gate_fixed_v2.ps1 payload\run_windows_gate.ps1 -Force
+          @'
+          from pathlib import Path
+          p=Path('payload/run_windows_gate.ps1')
+          s=p.read_text()
+          s=s.replace("function Run-Native([string]$Log,[string[]]$Args){\n    & $exe @Args *> $Log", "function Run-Native {\n    param([string]$Log,[Parameter(ValueFromRemainingArguments=$true)][string[]]$NativeArgs)\n    & $exe @NativeArgs *> $Log")
+          repl={
+          "Run-Native 'hostcompat_nonzero.log' @('baseline',$hostDll,$rtHost,$innerFrame)":"Run-Native 'hostcompat_nonzero.log' 'baseline' $hostDll $rtHost $innerFrame",
+          "Run-Native 'c63_nonzero.log' @('baseline',$c63,$rtC63,$innerFrame)":"Run-Native 'c63_nonzero.log' 'baseline' $c63 $rtC63 $innerFrame",
+          "Run-Native '01_sentinel.log' @('sentinel',$cand,$rtSent,$test)":"Run-Native '01_sentinel.log' 'sentinel' $cand $rtSent $test",
+          "Run-Native '02_long.log' @('long',$cand,$rtLong,$innerFrame)":"Run-Native '02_long.log' 'long' $cand $rtLong $innerFrame",
+          "Run-Native '03_threads.log' @('threads',$dllA,$dllB,$rtThr,$innerFrame)":"Run-Native '03_threads.log' 'threads' $dllA $dllB $rtThr $innerFrame",
+          "Run-Native '04_full.log' @('full',$cand,$rtFI,$rtFO,$test)":"Run-Native '04_full.log' 'full' $cand $rtFI $rtFO $test",
+          "Run-Native '05_determinism.log' @('determinism',$cand,$r1i,$r1o,$r2i,$r2o,$test)":"Run-Native '05_determinism.log' 'determinism' $cand $r1i $r1o $r2i $r2o $test",
+          "Run-Native '06_realtime.log' @('realtime',$cand,$rtReal,$innerFrame)":"Run-Native '06_realtime.log' 'realtime' $cand $rtReal $innerFrame"}
+          for a,b in repl.items():
+              if a not in s: raise SystemExit('PATCH_PATTERN_MISSING '+a)
+              s=s.replace(a,b)
+          p.write_text(s)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\patch_runner.py
+          python $env:RUNNER_TEMP\patch_runner.py
+          if($LASTEXITCODE -ne 0){throw 'RUNNER_PATCH_FAIL'}
           $rh=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant(); if($rh -ne $env:FIXED_RUNNER_SHA){throw "FIXED_RUNNER_SHA_FAIL $rh"}
-          "FIXED_RUNNER_OVERLAY_PASS SHA256=$rh XZ_SHA=$xh" | Set-Content fixed_runner_overlay_gate.txt
+          "FIXED_RUNNER_PATCH_PASS SHA256=$rh XZ_SHA=$xh" | Set-Content fixed_runner_overlay_gate.txt
 
       - name: Configure MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
