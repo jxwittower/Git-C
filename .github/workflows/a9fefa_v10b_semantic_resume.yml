@@ -1,0 +1,201 @@
+name: a9fefa-v10b-semantic-resume-from-checkpoints
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/a9fefa_v10b_semantic_resume.yml'
+permissions:
+  actions: read
+  contents: read
+jobs:
+  semantic:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      FULL_RUN: '31310246212'
+      FULL_ARTIFACT: c8b8-decrypted-fullreg-xz-31310246212
+      FULL_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      PREP_RUN: '31312585691'
+      PREP_ARTIFACT: a9fefa-v10-prepared-31312585691
+      A9_SHA: a9fefa04b804c61d522d6e1ede59f078151400c1e5eec29d483e4a297049af34
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 2fac53a77568525781f4945321ca3b21b8c9bb20561d6c1f7db118a6ae8e127d
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore full data and prepared A9 checkpoints
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force full,prep,xz_stage,tar_stage | Out-Null
+          gh run download $env:FULL_RUN -n $env:FULL_ARTIFACT -D full
+          gh run download $env:PREP_RUN -n $env:PREP_ARTIFACT -D prep
+          $xz='full\c8b8_fullreg_payload_v2.tar.xz'
+          $xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($xh -ne $env:FULL_XZ_SHA){throw "V10B_FULL_XZ_SHA_FAIL $xh"}
+          & 7z x -y $xz '-oxz_stage' | Out-File v10b_7z_xz.log
+          if($LASTEXITCODE -ne 0){throw 'V10B_7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem xz_stage -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'V10B_TAR_MISSING'}
+          & 7z x -y $tar '-otar_stage' | Out-File v10b_7z_tar.log
+          if($LASTEXITCODE -ne 0){throw 'V10B_7Z_TAR_FAIL'}
+          Move-Item tar_stage\c8b8_fullreg_payload_v2 payload
+          if(!(Test-Path prep\payload\SigProcDll-64HF.dll)){throw 'V10B_PREP_CANDIDATE_MISSING'}
+          if(!(Test-Path prep\payload\fullreg_c8b8.c)){throw 'V10B_PREP_HARNESS_MISSING'}
+          Copy-Item prep\payload\SigProcDll-64HF.dll payload\SigProcDll-64HF.dll -Force
+          Copy-Item prep\payload\fullreg_c8b8.c payload\fullreg_c8b8.c -Force
+          $a9=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hs=(Get-FileHash payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          $c63=(Get-FileHash payload\C63.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sm=(Get-FileHash payload\SigProcLoaderContractSmoke.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($a9 -ne $env:A9_SHA){throw "V10B_A9_SHA_FAIL $a9"}
+          if($hs -ne $env:HARNESS_SHA){throw "V10B_HARNESS_SHA_FAIL $hs"}
+          if($c63 -ne $env:C63_SHA){throw "V10B_C63_SHA_FAIL $c63"}
+          if($sm -ne $env:SMOKE_SHA){throw "V10B_SMOKE_SHA_FAIL $sm"}
+          @("V10B_CHECKPOINT_RESTORE_PASS","FULL_XZ_SHA=$xh","A9_SHA=$a9","HARNESS_SHA=$hs") | Set-Content v10b_restore_gate.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static binary ABI export import and stack gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /exports payload\SigProcDll-64HF.dll | Out-File -Encoding ascii v10b_exports.txt
+          dumpbin /dependents payload\SigProcDll-64HF.dll | Out-File -Encoding ascii v10b_dependents.txt
+          @'
+          from pathlib import Path
+          import re,struct
+          b=Path('payload/SigProcDll-64HF.dll').read_bytes()
+          u16=lambda o:struct.unpack_from('<H',b,o)[0]
+          u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          if b[:2]!=b'MZ': raise SystemExit('V10B_MZ_FAIL')
+          pe=u32(0x3c)
+          if b[pe:pe+4]!=b'PE\0\0': raise SystemExit('V10B_PE_SIG_FAIL')
+          machine=u16(pe+4); magic=u16(pe+24)
+          if machine!=0x14c or magic!=0x10b: raise SystemExit(f'V10B_PE32_X86_FAIL machine={machine:x} magic={magic:x}')
+          e=Path('v10b_exports.txt').read_text(errors='strict')
+          for x in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if x not in e: raise SystemExit('V10B_EXPORT_MISSING_'+x)
+          d=Path('v10b_dependents.txt').read_text(errors='strict')
+          deps=sorted({x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',d,re.I|re.M)})
+          if 'ucrtbase.dll' in deps: raise SystemExit('V10B_DIRECT_UCRTBASE_FAIL')
+          n=u16(pe+6); osz=u16(pe+20); s0=pe+24+osz; bad=[]
+          for i in range(n):
+              o=s0+40*i; rs=u32(o+16); rp=u32(o+20); ch=u32(o+36)
+              if ch & 0x20000000:
+                  for p in range(rp,max(rp,rp+rs-6)):
+                      if b[p:p+2]==b'\x81\xec':
+                          imm=u32(p+2)
+                          if 0x1000<=imm<0x100000: bad.append((p,imm))
+          if bad: raise SystemExit('V10B_UNSAFE_DIRECT_STACK '+repr(bad))
+          Path('v10b_static_gate.txt').write_text(f'V10B_STATIC_PASS\nMACHINE=0x{machine:x}\nMAGIC=0x{magic:x}\nDEPENDENTS='+','.join(deps)+'\nLARGE_DIRECT_STACK=0\n')
+          print(Path('v10b_static_gate.txt').read_text())
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\v10b_static.py
+          python $env:RUNNER_TEMP\v10b_static.py
+
+      - name: Compile V9 persistent-state harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:a9_v10b.exe payload\fullreg_c8b8.c *> v10b_compile.txt
+          if($LASTEXITCODE -ne 0){Get-Content v10b_compile.txt;throw 'V10B_COMPILE_FAIL'}
+          'V10B_COMPILE_PASS' | Set-Content v10b_compile_gate.txt
+
+      - name: C63 self-calibration
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_c63 -Recurse -Force
+          $dll=(Resolve-Path 'payload\C63.dll').Path
+          $rt=(Resolve-Path 'rt_c63').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10b.exe calibrate $dll $rt $test *> v10b_c63_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content v10b_c63_calibration.log
+          if($rc -ne 0){throw "V10B_C63_CALIBRATION_FAIL rc=$rc"}
+          if(-not (Select-String v10b_c63_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V10B_C63_MARKER_FAIL'}
+          'V10B_C63_CALIBRATION_PASS' | Set-Content v10b_c63_gate.txt
+
+      - name: A9 occupied-state and vitals calibration
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_a9_cal -Recurse -Force
+          $dll=(Resolve-Path 'payload\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_a9_cal').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10b.exe calibrate $dll $rt $test *> v10b_a9_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content v10b_a9_calibration.log
+          if($rc -ne 0){throw "V10B_A9_CALIBRATION_FAIL rc=$rc"}
+          if(-not (Select-String v10b_a9_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V10B_A9_CALIBRATION_MARKER_FAIL'}
+          'V10B_A9_OCCUPIED_VITALS_PASS' | Set-Content v10b_a9_calibration_gate.txt
+
+      - name: A9 inner outer loader contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($pair in @(@('inner-bed','rt_loader_inner','v10b_loader_inner.log'),@('outer-medical-bed','rt_loader_outer','v10b_loader_outer.log'))){
+            Copy-Item ("payload\runtime\"+$pair[0]) $pair[1] -Recurse -Force
+            Copy-Item payload\SigProcDll-64HF.dll ($pair[1]+'\SigProcDll-64HF.dll') -Force
+            Copy-Item payload\SigProcLoaderContractSmoke.exe ($pair[1]+'\SigProcLoaderContractSmoke.exe') -Force
+            Push-Location $pair[1]
+            .\SigProcLoaderContractSmoke.exe *> ("..\"+$pair[2])
+            $rc=$LASTEXITCODE
+            Pop-Location
+            Get-Content $pair[2]
+            if($rc -ne 0){throw "V10B_LOADER_FAIL $($pair[0]) rc=$rc"}
+            if(-not (Select-String $pair[2] -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw "V10B_LOADER_MARKER_FAIL $($pair[0])"}
+          }
+          'V10B_A9_INNER_OUTER_LOADER_PASS' | Set-Content v10b_loader_gate.txt
+
+      - name: A9 leave warning suppression recovery sentinel
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_a9_sentinel -Recurse -Force
+          $dll=(Resolve-Path 'payload\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_a9_sentinel').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10b.exe sentinel $dll $rt $test *> v10b_a9_sentinel.log
+          $rc=$LASTEXITCODE
+          Get-Content v10b_a9_sentinel.log
+          if($rc -ne 0){throw "V10B_A9_SENTINEL_FAIL rc=$rc"}
+          if(-not (Select-String v10b_a9_sentinel.log -Pattern 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -SimpleMatch -Quiet)){throw 'V10B_A9_SENTINEL_MARKER_FAIL'}
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:A9_SHA){throw "V10B_POST_SHA_FAIL $h"}
+          @("A9FEFA_V10B_SEMANTIC_PASS","SHA256=$h","HARNESS_SHA=$env:HARNESS_SHA") | Set-Content A9FEFA_V10B_SEMANTIC_PASS.lock
+
+      - name: Upload V10b evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a9fefa-v10b-semantic-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            v10b_restore_gate.txt
+            v10b_exports.txt
+            v10b_dependents.txt
+            v10b_static_gate.txt
+            v10b_compile.txt
+            v10b_compile_gate.txt
+            v10b_c63_calibration.log
+            v10b_c63_gate.txt
+            v10b_a9_calibration.log
+            v10b_a9_calibration_gate.txt
+            v10b_loader_inner.log
+            v10b_loader_outer.log
+            v10b_loader_gate.txt
+            v10b_a9_sentinel.log
+            A9FEFA_V10B_SEMANTIC_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
