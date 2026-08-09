@@ -1,0 +1,186 @@
+name: c8b8-final-release-gate-v4
+on:
+  push:
+    branches: [c8b8-final-release-gate-20260809]
+    paths:
+      - '.github/workflows/c8b8_final_release_gate_v4.yml'
+permissions:
+  contents: write
+jobs:
+  final-release-v4:
+    runs-on: windows-2022
+    timeout-minutes: 110
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      ENC_SHA: 3cbe4e8339d3f934a1766a66e48a6ca794c32a262f768f43e6b9548d5276b5d9
+      XZ_SHA: eace407afd906df9409b8e5e8c116d0f6a6e47ec398c19034b2981f1fbf8d93b
+      GHF_COUNT: '13'
+      GHF_BYTES: '82484656'
+      HANDOFF_BRANCH: c8b8-final-release-gate-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish Guerrilla inbox and V4 RSA key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import http.cookiejar,json,os,urllib.parse,urllib.request
+          from pathlib import Path
+          jar=http.cookiejar.MozillaCookieJar(str(Path(os.environ['RUNNER_TEMP'])/'gm_cookies.txt'))
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+          base='https://api.guerrillamail.com/ajax.php'
+          q={'f':'get_email_address','lang':'en','ip':'127.0.0.1','agent':'GuanHuFinalGateV4'}
+          with op.open(base+'?'+urllib.parse.urlencode(q),timeout=30) as r:d=json.load(r)
+          addr=d.get('email_addr')
+          if not addr:raise SystemExit('GUERRILLA_ADDR_FAIL '+repr(d))
+          jar.save(ignore_discard=True,ignore_expires=True)
+          Path('mailbox_v4.txt').write_text(addr+'\n');Path('subject_v4.txt').write_text('GuanHu-C8B8-GM-'+os.environ['GITHUB_RUN_ID']+'\n');Path(os.environ['RUNNER_TEMP'],'gm_meta.json').write_text(json.dumps({'addr':addr,'sid_token':d.get('sid_token','')}))
+          print('GUERRILLA_MAILBOX_READY',addr,'cookies',len(list(jar)))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\gm_make.py
+          python $env:RUNNER_TEMP\gm_make.py 2>&1|Tee-Object gm_make.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private_v4.pem;if($LASTEXITCODE -ne 0){throw 'RSA_GEN_FAIL'}
+          openssl pkey -in $env:RUNNER_TEMP\private_v4.pem -pubout -out public_v4.pem;if($LASTEXITCODE -ne 0){throw 'RSA_PUB_FAIL'}
+          New-Item -ItemType Directory -Force .c8b8_final_v4_handoff|Out-Null;Copy-Item mailbox_v4.txt,subject_v4.txt,public_v4.pem .c8b8_final_v4_handoff\ -Force
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_final_v4_handoff;git commit -m "Publish c8b8 final V4 Guerrilla handoff";if($LASTEXITCODE -ne 0){throw 'HANDOFF_COMMIT_FAIL'};git push origin "HEAD:$env:HANDOFF_BRANCH";if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+
+      - name: Receive Guerrilla body ciphertext
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import base64,html,http.cookiejar,json,os,re,time,urllib.parse,urllib.request
+          from pathlib import Path
+          jar=http.cookiejar.MozillaCookieJar(str(Path(os.environ['RUNNER_TEMP'])/'gm_cookies.txt'));jar.load(ignore_discard=True,ignore_expires=True);op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar));base='https://api.guerrillamail.com/ajax.php';prefix=Path('subject_v4.txt').read_text().strip();want={f'{prefix}-P{i}':i for i in range(1,5)};out=Path('gm_transport');out.mkdir(exist_ok=True);got=set();key=False;meta=json.loads(Path(os.environ['RUNNER_TEMP'],'gm_meta.json').read_text());sid=meta.get('sid_token','')
+          def call(f,**kw):
+              q={'f':f,'ip':'127.0.0.1','agent':'GuanHuFinalGateV4'};q.update(kw)
+              if sid:q['sid_token']=sid
+              with op.open(base+'?'+urllib.parse.urlencode(q,doseq=True),timeout=90) as r:return json.load(r)
+          def strings(x):
+              if isinstance(x,str):yield x
+              elif isinstance(x,dict):
+                  for v in x.values():yield from strings(v)
+              elif isinstance(x,list):
+                  for v in x:yield from strings(v)
+          end=time.time()+1000
+          while time.time()<end and (len(got)<4 or not key):
+              box=call('get_email_list',offset=0)
+              for m in box.get('list',[]):
+                  subj=html.unescape(str(m.get('mail_subject','')))
+                  if subj not in want:continue
+                  d=call('fetch_email',email_id=m.get('mail_id'));text='\n'.join(html.unescape(s) for s in strings(d));text=re.sub(r'<[^>]+>','',text)
+                  i=want[subj];md=re.search(r'(?m)^DATA=([A-Za-z0-9+/=]+)\s*$',text)
+                  if md:
+                      try:z=base64.b64decode(md.group(1),validate=True)
+                      except Exception:z=b''
+                      if z:(out/f'c8b8_payload_part{i}.bin').write_bytes(z);got.add(i)
+                  mk=re.search(r'(?m)^KEY=([A-Za-z0-9+/=]+)\s*$',text)
+                  if mk:
+                      try:k=base64.b64decode(mk.group(1),validate=True)
+                      except Exception:k=b''
+                      if len(k)==384:(out/'c8b8_wrapped_key.bin').write_bytes(k);key=True
+              if len(got)<4 or not key:time.sleep(3)
+          if len(got)!=4 or not key:raise SystemExit(f'GM_TRANSPORT_FAIL parts={sorted(got)} key={key}')
+          print('GM_TRANSPORT_PASS',sorted(got),key)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\gm_recv.py
+          python $env:RUNNER_TEMP\gm_recv.py 2>&1|Tee-Object gm_transport.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: V4 decrypt extract and exact asset binding
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$enc=Join-Path $env:RUNNER_TEMP payload_v4.enc;$o=[IO.File]::Create($enc);try{1..4|%{$s=[IO.File]::OpenRead("gm_transport\c8b8_payload_part$_.bin");try{$s.CopyTo($o)}finally{$s.Dispose()}}}finally{$o.Dispose()};$eh=(Get-FileHash $enc -Algorithm SHA256).Hash.ToLowerInvariant();if($eh -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $eh"};$pass=Join-Path $env:RUNNER_TEMP pass_v4.txt;$xz=Join-Path $env:RUNNER_TEMP payload_v4.tar.xz;openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private_v4.pem -in gm_transport\c8b8_wrapped_key.bin -out $pass -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256;if($LASTEXITCODE -ne 0){throw 'UNWRAP_FAIL'};openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $enc -out $xz -pass "file:$pass";if($LASTEXITCODE -ne 0){throw 'DECRYPT_FAIL'};$xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $xh"}
+          @'
+          import hashlib,os,re,shutil,tarfile
+          from pathlib import Path
+          root=Path('payload');shutil.rmtree(root,ignore_errors=True);root.mkdir();xz=Path(os.environ['RUNNER_TEMP'])/'payload_v4.tar.xz'
+          with tarfile.open(xz,'r:xz') as t:t.extractall(root)
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1048576),b''):h.update(b)
+              return h.hexdigest()
+          for n,e in {'SigProcDll-64HF.dll':os.environ['CAND_SHA'],'HostCompat.dll':os.environ['HOST_SHA'],'C63.dll':os.environ['C63_SHA'],'SigProcLoaderContractSmoke.exe':os.environ['SMOKE_SHA']}.items():
+              if sha(root/n)!=e:raise SystemExit('BINARY_SHA_FAIL '+n)
+          ok=0
+          for line in (root/'MANIFEST.sha256').read_text().splitlines():
+              m=re.match(r'^([0-9a-f]{64})  (.+)$',line)
+              if not m:continue
+              rel=m.group(2)[2:] if m.group(2).startswith('./') else m.group(2)
+              if sha(root/rel)!=m.group(1):raise SystemExit('MANIFEST_FAIL '+rel)
+              ok+=1
+          g=list((root/'testdata').rglob('*.ghf'));b=sum(p.stat().st_size for p in g)
+          if len(g)!=int(os.environ['GHF_COUNT']) or b!=int(os.environ['GHF_BYTES']):raise SystemExit(f'GHF_FAIL {len(g)} {b}')
+          Path('asset_v4.txt').write_text(f'MANIFEST={ok}\nGHF={len(g)}\nBYTES={b}\nSHA={os.environ["CAND_SHA"]}\n');print('V4_ASSET_PASS',ok,len(g),b)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\asset_v4.py
+          python $env:RUNNER_TEMP\asset_v4.py 2>&1|Tee-Object asset_v4.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE};"ENC=$eh`nXZ=$xh"|Set-Content crypto_v4.txt
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: V4 static ABI loader and x86 compile
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';dumpbin /headers payload\SigProcDll-64HF.dll|Out-File hdr_v4.txt;dumpbin /exports payload\SigProcDll-64HF.dll|Out-File exp_v4.txt;dumpbin /dependents payload\SigProcDll-64HF.dll|Out-File dep_v4.txt;dumpbin /dependents payload\HostCompat.dll|Out-File hostdep_v4.txt
+          @'
+          import re,struct
+          from pathlib import Path
+          h=Path('hdr_v4.txt').read_text(errors='ignore');e=Path('exp_v4.txt').read_text(errors='ignore')
+          if not re.search(r'(?i)14C machine|machine \(x86\)',h) or '.stkfix' not in h:raise SystemExit('PE_GATE')
+          for x in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if x not in e:raise SystemExit('EXPORT '+x)
+          def deps(p):return {x.lower() for x in re.findall(r'(?im)^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path(p).read_text(errors='ignore'))}
+          c=deps('dep_v4.txt');hb=deps('hostdep_v4.txt')
+          if 'ucrtbase.dll' in c or c-hb:raise SystemExit('IMPORT_GATE '+repr(c-hb))
+          b=Path('payload/SigProcDll-64HF.dll').read_bytes();pe=struct.unpack_from('<I',b,0x3c)[0];n=struct.unpack_from('<H',b,pe+6)[0];osz=struct.unpack_from('<H',b,pe+20)[0];s0=pe+24+osz
+          for i in range(n):
+              o=s0+40*i;rs=struct.unpack_from('<I',b,o+16)[0];rp=struct.unpack_from('<I',b,o+20)[0];ch=struct.unpack_from('<I',b,o+36)[0]
+              if ch&0x20000000:
+                  for p in range(rp,rp+rs-6):
+                      if b[p:p+2]==b'\x81\xec' and 0x1000<=struct.unpack_from('<I',b,p+2)[0]<0x100000:raise SystemExit('UNSAFE_STACK')
+          print('V4_STATIC_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\static_v4.py
+          python $env:RUNNER_TEMP\static_v4.py;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          foreach($bed in @('inner-bed','outer-medical-bed')){$tag=if($bed -eq 'inner-bed'){'inner'}else{'outer'};$d="smoke_gm_$tag";New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item payload\SigProcDll-64HF.dll,payload\SigProcLoaderContractSmoke.exe $d -Force;Copy-Item "payload\runtime\$bed\*" $d -Force;Push-Location $d;& .\SigProcLoaderContractSmoke.exe 2>&1|Tee-Object "..\loader_v4_$tag.log";$rc=$LASTEXITCODE;Pop-Location;if($rc -ne 0 -or (Get-Content "loader_v4_$tag.log" -Raw)-notmatch 'ALL_LOADER_CONTRACT_TESTS_PASS'){throw "LOADER_$tag`_FAIL"}}
+          cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS payload\fullreg.c /Fe:payload\fullreg.exe 2>&1|Tee-Object compile_v4.log;if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'};dumpbin /headers payload\fullreg.exe|Out-File harness_hdr_v4.txt;if((Get-Content harness_hdr_v4.txt -Raw)-notmatch '(?i)14C machine|machine \(x86\)'){throw 'HARNESS_NOT_X86'}
+
+      - name: V4 execute complete native Windows regression
+        shell: powershell
+        timeout-minutes: 80
+        run: |
+          $ErrorActionPreference='Stop';$c=(Resolve-Path payload\SigProcDll-64HF.dll).Path;$h=(Resolve-Path payload\HostCompat.dll).Path;$b=(Resolve-Path payload\C63.dll).Path;$t=(Resolve-Path payload\testdata).Path;$r=(Resolve-Path payload\runtime).Path;& .\payload\fullreg.exe $c $h $b $t $r 2>&1|Tee-Object fullreg_v4.log;$rc=$LASTEXITCODE;"EXIT=$rc"|Set-Content fullreg_v4_exit.txt;if($rc -ne 0){throw "FULLREG_EXIT_$rc"};$s=Get-Content fullreg_v4.log -Raw;foreach($m in @('BASELINE_CONTRACTS_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','FULL_DATA_PERFORMANCE_PASS','DETERMINISTIC_REPLAY_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){if($s -notmatch [regex]::Escape($m)){throw "MARKER $m"}};$q=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($q -ne $env:CAND_SHA){throw 'SHA_DRIFT'};"V4_FINAL_PASS`nSHA=$q"|Set-Content C8B8_FINAL_V4_PASS.lock
+
+      - name: V4 final package audit and persist
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';New-Item -ItemType Directory -Force release_v4|Out-Null;Copy-Item payload\SigProcDll-64HF.dll release_v4\SigProcDll-64HF.dll -Force;"$env:CAND_SHA  SigProcDll-64HF.dll"|Set-Content release_v4\RELEASE_SHA256SUMS.txt;Copy-Item fullreg_v4.log release_v4\full_regression.log;"WINDOWS_NATIVE_FULLREG_PASS`nSHA=$env:CAND_SHA"|Set-Content release_v4\PASS.txt;$zip='GuanHu_SigProc_Final_Release_20260809.zip';Remove-Item $zip -Force -ErrorAction SilentlyContinue;Compress-Archive release_v4\* $zip -CompressionLevel Optimal;Remove-Item audit_v4 -Recurse -Force -ErrorAction SilentlyContinue;Expand-Archive $zip audit_v4 -Force;$p='audit_v4\SigProcDll-64HF.dll';$a=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant();$o=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if((Get-Item $p).Length -ne 441344 -or $a -ne $env:CAND_SHA -or $a -ne $o){throw 'PACKAGE_AUDIT_FAIL'};"PACKAGE_AUDIT_PASS`nTESTED_SHA=$o`nEXTRACTED_SHA=$a`nDLL_BYTES=441344`nZIP_BYTES=$((Get-Item $zip).Length)"|Set-Content package_v4_audit.txt;New-Item -ItemType Directory -Force .c8b8_final_v4_release|Out-Null;Copy-Item C8B8_FINAL_V4_PASS.lock,package_v4_audit.txt .c8b8_final_v4_release\ -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_final_v4_release;git commit -m "Record c8b8 final V4 release PASS";if($LASTEXITCODE -ne 0){throw 'PASS_COMMIT_FAIL'};git push origin "HEAD:$env:HANDOFF_BRANCH";if($LASTEXITCODE -ne 0){throw 'PASS_PUSH_FAIL'}
+
+      - name: V4 upload tested release
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guanhu-c8b8-final-v4-${{ github.run_id }}
+          path: |
+            GuanHu_SigProc_Final_Release_20260809.zip
+            release_v4/SigProcDll-64HF.dll
+            C8B8_FINAL_V4_PASS.lock
+            package_v4_audit.txt
+            asset_v4.txt
+            crypto_v4.txt
+            gm_make.log
+            gm_transport.log
+            asset_v4.log
+            loader_v4_inner.log
+            loader_v4_outer.log
+            compile_v4.log
+            fullreg_v4.log
+            fullreg_v4_exit.txt
+          if-no-files-found: ignore
+          retention-days: 14
