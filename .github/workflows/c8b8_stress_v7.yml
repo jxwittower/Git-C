@@ -1,0 +1,88 @@
+name: c8b8-stress-v7
+on:
+  push:
+    branches: [c8b8-stress-v7-20260809]
+    paths: ['.github/workflows/c8b8_stress_v7.yml']
+permissions: {actions: read, contents: write}
+jobs:
+  stress:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      BRANCH: c8b8-stress-v7-20260809
+      ROOT: c8b8_fullreg_v2_payload
+      ENC_SHA: 0a3f05c61deb236d0e9c6e9d7879fb0d0d84551a765e75dfad25967d6e6c70c8
+      XZ_SHA: 9e24503212064455f50e1f37d8ce15da52d0c2894b1570639ab5644199e6bfcd
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+      - uses: actions/download-artifact@v4
+        with:
+          name: c8b8-staged-encrypted-fullreg-31296517289
+          path: stage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31296517289
+      - name: Publish run-specific RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$h=(Get-FileHash stage\c8b8_fullreg_transport.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw 'STAGE_SHA_FAIL'}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem;openssl pkey -in private.pem -pubout -out public.pem
+          $d=".c8b8_stress_v7_handoff\run_$env:GITHUB_RUN_ID";New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item public.pem (Join-Path $d public.pem);@("RUN_ID=$env:GITHUB_RUN_ID","CAND_SHA=$env:CAND_SHA")|Set-Content (Join-Path $d binding.txt)
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add $d;git commit -m "Publish stress v7 RSA handoff $env:GITHUB_RUN_ID";git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+      - name: Receive wrapped key
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Continue';$ok=$false;$rp=".c8b8_stress_v7_handoff/run_$env:GITHUB_RUN_ID/wrapped_key.b64";$spec="origin/$env:BRANCH`:$rp"
+          for($i=0;$i -lt 180;$i++){git fetch origin $env:BRANCH --quiet 2>$null;$txt=& git show $spec 2>$null;if($LASTEXITCODE -eq 0 -and $txt){try{$raw=[Convert]::FromBase64String((($txt -join "`n").Trim()))}catch{$raw=$null};if($raw -and $raw.Length -eq 384){[IO.File]::WriteAllBytes('wrapped_key.bin',$raw);$ok=$true;break}};Start-Sleep 5}
+          $ErrorActionPreference='Stop';if(-not $ok){throw 'KEY_TIMEOUT'}
+      - name: Decrypt candidate and runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';openssl pkeyutl -decrypt -inkey private.pem -in wrapped_key.bin -out aes.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256;openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in stage\c8b8_fullreg_transport.enc -out payload.tar.xz -pass file:aes.txt;if($LASTEXITCODE -ne 0){throw 'DECRYPT_FAIL'}
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw 'XZ_SHA_FAIL'};New-Item -ItemType Directory -Force xzstage,unpacked|Out-Null;7z x -y payload.tar.xz "-o$pwd\xzstage"|Out-Null;$t=Get-ChildItem xzstage -Filter '*.tar'|Select-Object -First 1;7z x -y $t.FullName "-o$pwd\unpacked"|Out-Null;Remove-Item aes.txt -Force
+          $c="unpacked\$env:ROOT\SigProcDll-64HF.dll";$h=(Get-FileHash $c -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:CAND_SHA){throw "CAND_SHA_FAIL $h"};'EXACT_CANDIDATE_BIND_PASS'|Out-File cp01_bind.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Compile native stress host
+        shell: powershell
+        run: |
+          $r="unpacked\$env:ROOT";cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:native_fullreg_host.exe (Join-Path $r native_fullreg_host.c) 2>&1|Tee-Object compile.log;if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'}
+      - name: Run long stability thread stress and 1Hz in parallel
+        shell: powershell
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path "unpacked\$env:ROOT").Path;$h=(Resolve-Path native_fullreg_host.exe).Path;$dll=Join-Path $r 'SigProcDll-64HF.dll';$ghf=Join-Path $r 'testdata\inner-bed\02_supine.ghf'
+          foreach($n in @('rt_stress','rt_thread','rt_realtime')){Copy-Item (Join-Path $r 'runtime\inner-bed') $n -Recurse -Force}
+          $p1=Start-Process -FilePath $h -ArgumentList @('stress',$dll,(Resolve-Path rt_stress).Path,$ghf,'20000') -NoNewWindow -PassThru -RedirectStandardOutput stress.out -RedirectStandardError stress.err
+          $p2=Start-Process -FilePath $h -ArgumentList @('threadstress',$dll,(Resolve-Path rt_thread).Path,$ghf,'2000') -NoNewWindow -PassThru -RedirectStandardOutput thread.out -RedirectStandardError thread.err
+          $p3=Start-Process -FilePath $h -ArgumentList @('realtime',$dll,(Resolve-Path rt_realtime).Path,$ghf,'60') -NoNewWindow -PassThru -RedirectStandardOutput realtime.out -RedirectStandardError realtime.err
+          $p1.WaitForExit();$p2.WaitForExit();$p3.WaitForExit();Get-Content stress.out,stress.err,thread.out,thread.err,realtime.out,realtime.err|Tee-Object stress_gate.log
+          if($p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0 -or $p3.ExitCode -ne 0){throw "STRESS_PROCESS_FAIL $($p1.ExitCode),$($p2.ExitCode),$($p3.ExitCode)"}
+          foreach($m in @('LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60')){if(-not(Select-String -Path stress_gate.log -Pattern $m -SimpleMatch -Quiet)){throw "MARKER_FAIL $m"}}
+          $post=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:CAND_SHA){throw 'POST_SHA_FAIL'};"POST_SHA=$post`nC8B8_STRESS_V7_PASS"|Out-File cp02_stress.txt
+      - name: Commit stress PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;@('C8B8_STRESS_V7_PASS',"SHA256=$env:CAND_SHA",'LONG_STABILITY=20000','THREAD_STRESS=2x2000','REALTIME_1HZ=60',"RUN_ID=$env:GITHUB_RUN_ID")|Set-Content evidence_summary\C8B8_STRESS_V7_PASS.lock;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/C8B8_STRESS_V7_PASS.lock;git commit -m 'Lock exact c8b8 stress v7 PASS';git fetch origin $env:BRANCH;git rebase "origin/$env:BRANCH";git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'LOCK_PUSH_FAIL'}
+      - name: Upload stress evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-stress-v7-${{ github.run_id }}
+          path: |
+            cp*.txt
+            compile.log
+            stress_gate.log
+            stress.out
+            stress.err
+            thread.out
+            thread.err
+            realtime.out
+            realtime.err
+            evidence_summary/C8B8_STRESS_V7_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
