@@ -1,0 +1,186 @@
+name: semantic-probe-preserve-v1
+on:
+  push:
+    branches: [semantic-probe-preserve-v1-20260809]
+    paths:
+      - '.github/workflows/semantic_probe_preserve_v1.yml'
+permissions:
+  contents: write
+jobs:
+  semantic-smoke:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      BRANCH: semantic-probe-preserve-v1-20260809
+      ENC_SHA: ee559bcb094da6576dde59d160fb6f44df39654dd2a86cd97b4c460bdc559c6b
+      XZ_SHA: c76496833ba3208e7a5f4898e9cc2cb331c23ec4ecf233613a035f44a9711e99
+      CAND_SHA: 683b5c925f703d920105b30042fade2e10e29b604930cac7cc0f4f2d2cffa99b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish one-time mailbox and RSA public key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'
+          d=req('GET',base+'/domains'); m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('NO_MAIL_DOMAIN')
+          alpha=string.ascii_lowercase+string.digits
+          addr='gh683b'+''.join(secrets.choice(alpha) for _ in range(14))+'@'+m[0]['domain']
+          pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          req('POST',base+'/accounts',{'address':addr,'password':pw})
+          tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}))
+          Path('mailbox.txt').write_text(addr+'\n')
+          Path('subject.txt').write_text('GuanHu-683B-Semantic-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('SEMANTIC_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .semantic_683b_handoff | Out-Null
+          Copy-Item mailbox.txt,subject.txt,public.pem .semantic_683b_handoff\
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","XZ_SHA=$env:XZ_SHA","CAND_SHA=$env:CAND_SHA") | Set-Content .semantic_683b_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .semantic_683b_handoff
+          git commit -m 'Publish 683b semantic one-time handoff'
+          git push origin "HEAD:$env:BRANCH"
+
+      - name: Receive encrypted semantic payload
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token']
+          base='https://api.mail.tm'; subject=Path('subject.txt').read_text().strip(); out=Path('transport');out.mkdir(exist_ok=True)
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          deadline=time.time()+780; got_payload=False; got_key=False; seen=set()
+          while time.time()<deadline and not (got_payload and got_key):
+              q=gj(base+'/messages'); msgs=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject','')!=subject or m['id'] in seen:continue
+                  seen.add(m['id']); d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      data=gb(urllib.parse.urljoin(base,u))
+                      if n=='semantic_payload.enc':(out/n).write_bytes(data);got_payload=True
+                      elif n=='semantic_wrapped_key.bin':(out/n).write_bytes(data);got_key=True
+              if not (got_payload and got_key):time.sleep(3)
+          if not (got_payload and got_key):raise SystemExit(f'TRANSPORT_FAIL payload={got_payload} key={got_key}')
+          print('SEMANTIC_MAIL_TRANSPORT_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object mail_transport.txt
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Decrypt, extract, and bind exact payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash transport\semantic_payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          if((Get-Item transport\semantic_wrapped_key.bin).Length -ne 384){throw 'WRAPPED_KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\semantic_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_DECRYPT_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in transport\semantic_payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"}
+          New-Item -ItemType Directory -Force xzstage,unpacked | Out-Null
+          7z x -y payload.tar.xz "-o$pwd\xzstage" | Out-File sevenzip_xz.txt
+          if($LASTEXITCODE -ne 0){throw 'XZ_EXTRACT_FAIL'}
+          $t=Get-ChildItem xzstage -Filter '*.tar' | Select-Object -First 1
+          if(!$t){throw 'TAR_MISSING'}
+          7z x -y $t.FullName "-o$pwd\unpacked" | Out-File sevenzip_tar.txt
+          if($LASTEXITCODE -ne 0){throw 'TAR_EXTRACT_FAIL'}
+          $root=Resolve-Path unpacked\semantic_smoke_payload
+          $c=(Get-FileHash "$root\candidate.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $b=(Get-FileHash "$root\c63.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($c -ne $env:CAND_SHA){throw "CAND_SHA_FAIL $c"}
+          if($b -ne $env:C63_SHA){throw "C63_SHA_FAIL $b"}
+          "ENC_SHA=$h`nXZ_SHA=$x`nCAND_SHA=$c`nC63_SHA=$b`nSEMANTIC_PAYLOAD_BIND_PASS" | Set-Content semantic_payload_binding.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile and run real-GHF semantic A/B
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Resolve-Path unpacked\semantic_smoke_payload).Path
+          Copy-Item "$root\runtime_base" "$root\cand_rt" -Recurse
+          Copy-Item "$root\runtime_base" "$root\c63_rt" -Recurse
+          Push-Location $root
+          cl /nologo /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:semantic_smoke.exe semantic_smoke.c 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\compile.log"
+          if($LASTEXITCODE -ne 0){Pop-Location;throw 'COMPILE_FAIL'}
+          $cand=(Resolve-Path candidate.dll).Path
+          $c63=(Resolve-Path c63.dll).Path
+          $crt=(Resolve-Path cand_rt).Path
+          $brt=(Resolve-Path c63_rt).Path
+          $empty=(Resolve-Path testdata\01_initial_empty.ghf).Path
+          $sup=(Resolve-Path testdata\02_supine.ghf).Path
+          .\semantic_smoke.exe $cand $c63 $crt $brt $empty $sup 2>&1 | Tee-Object "$env:GITHUB_WORKSPACE\semantic_smoke.log"
+          $rc=$LASTEXITCODE
+          Pop-Location
+          "EXIT_CODE=$rc" | Set-Content semantic_exit.txt
+          if($rc -ne 0){throw "SEMANTIC_SMOKE_FAIL rc=$rc"}
+          if(-not (Select-String semantic_smoke.log -SimpleMatch 'SEMANTIC_REAL_GHF_SMOKE_PASS' -Quiet)){throw 'PASS_MARKER_MISSING'}
+          $post=(Get-FileHash unpacked\semantic_smoke_payload\candidate.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $env:CAND_SHA){throw 'POST_TEST_SHA_CHANGED'}
+          "SEMANTIC_REAL_GHF_SMOKE_PASS SHA256=$post" | Set-Content SEMANTIC_683B_PASS.lock
+
+      - name: Commit semantic PASS checkpoint
+        if: success()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item SEMANTIC_683B_PASS.lock evidence_summary\SEMANTIC_683B_PASS.lock
+          Copy-Item semantic_smoke.log evidence_summary\semantic_smoke.log
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary
+          git commit -m 'Lock 683b real-GHF semantic smoke PASS'
+          git push origin "HEAD:$env:BRANCH"
+
+      - name: Upload semantic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-683b-probe-preserve-${{ github.run_id }}
+          path: |
+            semantic_payload_binding.txt
+            compile.log
+            semantic_smoke.log
+            semantic_exit.txt
+            SEMANTIC_683B_PASS.lock
+            mail_transport.txt
+            sevenzip_xz.txt
+            sevenzip_tar.txt
+          if-no-files-found: ignore
+          retention-days: 30
