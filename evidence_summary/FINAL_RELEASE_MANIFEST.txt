@@ -1,0 +1,11 @@
+GuanHu SigProc C63 semantic empty-fix release
+PublicDLL=SigProcDll-64HF.dll
+PublicSHA256=e2d9c410644f5a366cd56e0f4d6912fcab63cc978c910451557bf6abdf1ee778
+PrivateCore=SigProcDll-64HF.core.dll
+CoreSHA256=56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+Architecture=PE32 x86
+Exports=_SigProc@24,_SigProc_Fini@0,_SigProc_Init@8,_SigProc_Stat@0
+WindowsCompleteRun=31324361668
+OriginalGHF=13 files / 82484656 bytes / 10808 frames / 6853006 samples
+PerformanceAvgMs=61.465118
+EmptyDecision=3 consecutive frames with sum of 4 channel ranges <300
