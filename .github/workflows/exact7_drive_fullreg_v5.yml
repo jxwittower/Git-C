@@ -1,0 +1,13 @@
+name: exact7-drive-native-fullreg-v5
+on:
+  push:
+    branches: [exact7-fullreg-20260809]
+    paths: ['.github/workflows/exact7_drive_fullreg_v5.yml']
+permissions:
+  contents: read
+jobs:
+  registry:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo registered
