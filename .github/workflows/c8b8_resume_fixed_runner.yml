@@ -17,7 +17,7 @@ jobs:
       C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
       SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
       HARNESS_SHA: 90bd3ef14c9948677f259641e15227a7d26481baf399ae61ef67d09b031ecf71
-      FIXED_RUNNER_SHA: 2855cb8ee231d36001fec1e445a4ec2fd9cc39a847b2829eeb1d9132e441db85
+      FIXED_RUNNER_SHA: b9648d44abb7c7717c23117b33d26f5442df27aae8364f1604dce95c30817607
       ENC_SHA: e0bbcd4883362daf8cfc5c067a8a8f72e03760f6ab9d425bb3f426b97ad5fd59
       XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
       SOURCE_RUN: '31308233779'
@@ -119,7 +119,7 @@ jobs:
           & 7z x -y $tar '-oextract_tar' | Out-File 7z_tar.log
           if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
           Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
-          Copy-Item .c8b8_resume_support\run_windows_gate_fixed.ps1 payload\run_windows_gate.ps1 -Force
+          Copy-Item .c8b8_resume_support\run_windows_gate_fixed_v2.ps1 payload\run_windows_gate.ps1 -Force
           $rh=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant(); if($rh -ne $env:FIXED_RUNNER_SHA){throw "FIXED_RUNNER_SHA_FAIL $rh"}
           "FIXED_RUNNER_OVERLAY_PASS SHA256=$rh XZ_SHA=$xh" | Set-Content fixed_runner_overlay_gate.txt
 
