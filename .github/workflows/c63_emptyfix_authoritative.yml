@@ -1,0 +1,153 @@
+name: c63-emptyfix-authoritative
+on:
+  push:
+    branches: [c63-emptyfix-wrapper-20260809]
+    paths:
+      - '.github/workflows/c63_emptyfix_authoritative.yml'
+permissions:
+  actions: read
+  contents: write
+env:
+  C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+  CHECKPOINT_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+  HANDOFF_BRANCH: c63-emptyfix-wrapper-20260809
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-31310246212
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31310246212
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build one exact public wrapper candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $xz=(Resolve-Path 'checkpoint\c8b8_fullreg_payload_v2.tar.xz').Path
+          $xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh-ne$env:CHECKPOINT_XZ_SHA){throw "CHECKPOINT_SHA $xh"}
+          New-Item -ItemType Directory -Force xs,u,candidate|Out-Null
+          7z x -y $xz "-o$pwd\xs"|Out-Null;$t=Get-ChildItem xs -Filter '*.tar'|Select-Object -First 1;if(!$t){throw'TAR_MISSING'};7z x -y $t.FullName "-o$pwd\u"|Out-Null
+          $core=(Resolve-Path 'u\c8b8_fullreg_payload_v2\C63.dll').Path
+          $ch=(Get-FileHash $core -Algorithm SHA256).Hash.ToLowerInvariant();if($ch-ne$env:C63_SHA){throw "C63_SHA $ch"}
+          Copy-Item $core candidate\SigProcDll-64HF.core.dll -Force
+          cl /nologo /LD /O2 /GS- /MT /W4 /DWIN32_LEAN_AND_MEAN tools\SigProc_C63_EmptyFix_Wrapper.c /Fe:candidate\SigProcDll-64HF.dll *> wrapper_build.log
+          if($LASTEXITCODE-ne0){Get-Content wrapper_build.log;throw 'WRAPPER_BUILD_FAIL'}
+          if(!(Test-Path candidate\SigProcDll-64HF.dll)){throw'WRAPPER_DLL_MISSING'}
+          dumpbin /headers candidate\SigProcDll-64HF.dll|Out-File wrapper_headers.txt;dumpbin /exports candidate\SigProcDll-64HF.dll|Out-File wrapper_exports.txt;dumpbin /dependents candidate\SigProcDll-64HF.dll|Out-File wrapper_dependents.txt
+          if(-not(Select-String -Path wrapper_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet)){throw'WRAPPER_NOT_X86'}
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String -Path wrapper_exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "WRAPPER_EXPORT_MISSING $e"}}
+          $wh=(Get-FileHash candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();$sz=(Get-Item candidate\SigProcDll-64HF.dll).Length
+          $wh|Set-Content candidate\wrapper_sha.txt
+          @("WRAPPER_SHA=$wh","WRAPPER_BYTES=$sz","CORE_SHA=$ch",'EMPTY_METRIC=sum(range(lane0..3))','EMPTY_THRESHOLD=<300','EMPTY_CONFIRM_FRAMES=3','PUBLIC_EXPORT_SERIALIZATION=Interlocked spin lock')|Set-Content candidate\BUILD_BINDING.txt
+          Get-Content candidate\BUILD_BINDING.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c63-emptyfix-candidate-${{ github.run_id }}
+          path: |
+            candidate/**
+            wrapper_build.log
+            wrapper_headers.txt
+            wrapper_exports.txt
+            wrapper_dependents.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  mode:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [static_loader, baseline, sentinel, long, threads, full, determinism, realtime]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-31310246212
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31310246212
+      - uses: actions/download-artifact@v4
+        with:
+          name: c63-emptyfix-candidate-${{ github.run_id }}
+          path: build_artifact
+      - name: Stage exact candidate and bind SHA
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force candidate|Out-Null
+          Copy-Item build_artifact\candidate\* candidate\ -Force
+          $h=(Get-Content candidate\wrapper_sha.txt -Raw).Trim();"WRAPPER_SHA=$h"|Add-Content $env:GITHUB_ENV
+          "MATRIX_CANDIDATE_SHA=$h"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Run authoritative mode ${{ matrix.mode }}
+        shell: powershell
+        run: |
+          & .\tools\c63_wrapper_gate_mode.ps1 -Mode '${{ matrix.mode }}'
+          if($LASTEXITCODE-ne0){exit $LASTEXITCODE}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c63-emptyfix-${{ matrix.mode }}-${{ github.run_id }}
+          path: |
+            mode_pass.txt
+            *.log
+            *.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  final:
+    needs: [build, mode]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: c63-emptyfix-candidate-${{ github.run_id }}
+          path: build_artifact
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: c63-emptyfix-*-${{ github.run_id }}
+          path: modes
+          merge-multiple: false
+      - name: Aggregate same-SHA suite and create final ZIP
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $cand=(Resolve-Path 'build_artifact\candidate\SigProcDll-64HF.dll').Path;$core=(Resolve-Path 'build_artifact\candidate\SigProcDll-64HF.core.dll').Path
+          $sha=(Get-Content build_artifact\candidate\wrapper_sha.txt -Raw).Trim();$actual=(Get-FileHash $cand -Algorithm SHA256).Hash.ToLowerInvariant();if($actual-ne$sha){throw "BUILD_SHA_BIND $actual $sha"}
+          $coreSha=(Get-FileHash $core -Algorithm SHA256).Hash.ToLowerInvariant();if($coreSha-ne$env:C63_SHA){throw "CORE_SHA_BIND $coreSha"}
+          $modes=@('static_loader','baseline','sentinel','long','threads','full','determinism','realtime')
+          foreach($m in $modes){$d=Get-ChildItem modes -Directory|Where-Object{$_.Name -like "c63-emptyfix-$m-*"}|Select-Object -First 1;if(!$d){throw "MODE_DIR_MISSING $m"};$p=Join-Path $d.FullName 'mode_pass.txt';if(!(Test-Path $p)){throw "MODE_PASS_MISSING $m"};if(-not(Select-String -Path $p -Pattern "CAND_SHA=$sha" -SimpleMatch -Quiet)){throw "MODE_SHA_FAIL $m"}}
+          $full=Get-ChildItem modes -Recurse -Filter mode_pass.txt|Where-Object{(Get-Content $_.FullName -Raw).Contains('WRAPPER_FULL_PASS')}|Select-Object -First 1;$avgLine=Get-Content $full.FullName|Where-Object{$_ -like 'AVG_MS=*'}|Select-Object -First 1;$avg=[double]$avgLine.Split('=')[1];if($avg-gt100){throw "FINAL_PERF $avg"}
+          @('C63_EMPTYFIX_EXACT_NATIVE_AND_COMPLETE_FULLREG_PASS',"SHA256=$sha",'PUBLIC_FILE=SigProcDll-64HF.dll',"CORE_FILE=SigProcDll-64HF.core.dll","CORE_SHA256=$coreSha","WINDOWS_RUN=$env:GITHUB_RUN_ID",'PE32_X86=PASS','EXPORTS=PASS','INNER_OUTER_LOADER=PASS','REAL_NONZERO_BASELINE=PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY=PASS','LONG_STABILITY_20000=PASS','TWO_THREAD_2X2000=PASS','FULL_13_GHF=PASS','GHF_COUNT=13','GHF_BYTES=82484656','FULL_FRAMES=10808','FULL_SAMPLES=6853006','DETERMINISTIC_REPLAY=PASS','REALTIME_1HZ_60=PASS',"PERFORMANCE_AVG_MS=$avg",'PERFORMANCE_LE_100MS=PASS','EMPTY_METRIC=sum(max-min over four int16 lanes)','EMPTY_THRESHOLD=<300','EMPTY_CONFIRM_FRAMES=3','CORPUS_OCCUPIED_MIN_RANGE_SUM=352','CORPUS_EMPTY_STABLE_MAX_RANGE_SUM=278')|Set-Content FINAL_PASS.lock
+          @('GuanHu SigProc C63 semantic empty-fix release','PublicDLL=SigProcDll-64HF.dll',"PublicSHA256=$sha",'PrivateCore=SigProcDll-64HF.core.dll',"CoreSHA256=$coreSha",'Architecture=PE32 x86','Exports=_SigProc@24,_SigProc_Fini@0,_SigProc_Init@8,_SigProc_Stat@0',"WindowsCompleteRun=$env:GITHUB_RUN_ID",'OriginalGHF=13 files / 82484656 bytes / 10808 frames / 6853006 samples',"PerformanceAvgMs=$avg",'EmptyDecision=3 consecutive frames with sum of 4 channel ranges <300')|Set-Content FINAL_RELEASE_MANIFEST.txt
+          New-Item -ItemType Directory -Force release|Out-Null;Copy-Item $cand release\SigProcDll-64HF.dll -Force;Copy-Item $core release\SigProcDll-64HF.core.dll -Force;Copy-Item FINAL_PASS.lock,FINAL_RELEASE_MANIFEST.txt release\ -Force;"$sha  SigProcDll-64HF.dll"|Set-Content release\SigProcDll-64HF.dll.sha256;"$coreSha  SigProcDll-64HF.core.dll"|Set-Content release\SigProcDll-64HF.core.dll.sha256
+          Compress-Archive -Path release\* -DestinationPath GuanHu_SigProc_Final_Release_20260809.zip -Force;if((Get-Item GuanHu_SigProc_Final_Release_20260809.zip).Length-le0){throw'ZIP_EMPTY'}
+          Expand-Archive GuanHu_SigProc_Final_Release_20260809.zip zip_audit -Force;$pd=Get-Item zip_audit\SigProcDll-64HF.dll;$pc=Get-Item zip_audit\SigProcDll-64HF.core.dll;if($pd.Length-le0-or$pc.Length-le0){throw'ZIP_DLL_EMPTY'};$ps=(Get-FileHash $pd.FullName -Algorithm SHA256).Hash.ToLowerInvariant();$cs=(Get-FileHash $pc.FullName -Algorithm SHA256).Hash.ToLowerInvariant();if($ps-ne$sha-or$cs-ne$coreSha){throw "ZIP_SHA_FAIL public=$ps core=$cs"};$zs=(Get-FileHash GuanHu_SigProc_Final_Release_20260809.zip -Algorithm SHA256).Hash.ToLowerInvariant();@('FINAL_ZIP_AUDIT_PASS',"ZIP_SHA256=$zs","EXTRACTED_PUBLIC_SHA256=$ps","EXTRACTED_PUBLIC_BYTES=$($pd.Length)","EXTRACTED_CORE_SHA256=$cs","EXTRACTED_CORE_BYTES=$($pc.Length)")|Set-Content FINAL_ZIP_AUDIT_PASS.txt
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;Copy-Item FINAL_PASS.lock,FINAL_RELEASE_MANIFEST.txt,FINAL_ZIP_AUDIT_PASS.txt evidence_summary\ -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary;git commit -m 'Lock C63 empty-fix exact native complete regression PASS';if($LASTEXITCODE-ne0){throw'LOCK_COMMIT_FAIL'};git push origin "HEAD:$env:HANDOFF_BRANCH";if($LASTEXITCODE-ne0){throw'LOCK_PUSH_FAIL'}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GuanHu-SigProc-C63-EmptyFix-FINAL-${{ github.run_id }}
+          path: |
+            release/**
+            GuanHu_SigProc_Final_Release_20260809.zip
+            FINAL_PASS.lock
+            FINAL_RELEASE_MANIFEST.txt
+            FINAL_ZIP_AUDIT_PASS.txt
+            modes/**
+          if-no-files-found: error
+          retention-days: 30
