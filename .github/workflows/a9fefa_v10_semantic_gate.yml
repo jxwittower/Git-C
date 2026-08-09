@@ -1,0 +1,233 @@
+name: a9fefa-v10-register-preserving-semantic-gate
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/a9fefa_v10_semantic_gate.yml'
+      - '.c8b8_resume_support/run_a9_converter_packed.py'
+permissions:
+  actions: read
+  contents: read
+jobs:
+  semantic:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      SOURCE_RUN: '31310246212'
+      SOURCE_ARTIFACT: c8b8-decrypted-fullreg-xz-31310246212
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      C8_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      A9_SHA: a9fefa04b804c61d522d6e1ede59f078151400c1e5eec29d483e4a297049af34
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 2fac53a77568525781f4945321ca3b21b8c9bb20561d6c1f7db118a6ae8e127d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore decrypted fullreg checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          $xz='recovered\c8b8_fullreg_payload_v2.tar.xz'
+          if(!(Test-Path $xz)){throw 'V10_XZ_MISSING'}
+          $h=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:XZ_SHA){throw "V10_XZ_SHA_FAIL $h"}
+          Copy-Item $xz payload.tar.xz -Force
+          "V10_DECRYPTED_CHECKPOINT_PASS SHA256=$h" | Set-Content v10_restore_gate.txt
+
+      - name: Extract install V9 harness and build exact A9 candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force extract_xz,extract_tar | Out-Null
+          & 7z x -y payload.tar.xz '-oextract_xz' | Out-File v10_7z_xz.log
+          if($LASTEXITCODE -ne 0){throw 'V10_7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem extract_xz -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'V10_TAR_MISSING'}
+          & 7z x -y $tar '-oextract_tar' | Out-File v10_7z_tar.log
+          if($LASTEXITCODE -ne 0){throw 'V10_7Z_TAR_FAIL'}
+          Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
+          $c8=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($c8 -ne $env:C8_SHA){throw "V10_SOURCE_C8_SHA_FAIL $c8"}
+          Copy-Item payload\SigProcDll-64HF.dll payload\SigProcDll-c8b8-source.dll -Force
+          python .c8b8_resume_support\install_v9_harness.py | Tee-Object v10_harness_install.log
+          if($LASTEXITCODE -ne 0){throw 'V10_HARNESS_INSTALL_FAIL'}
+          $hs=(Get-FileHash payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hs -ne $env:HARNESS_SHA){throw "V10_HARNESS_SHA_FAIL $hs"}
+          python .c8b8_resume_support\run_a9_converter_packed.py payload\SigProcDll-64HF.dll | Tee-Object v10_candidate_build.log
+          if($LASTEXITCODE -ne 0){throw 'V10_A9_CONVERT_FAIL'}
+          $a9=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($a9 -ne $env:A9_SHA){throw "V10_A9_SHA_FAIL $a9"}
+          $c63=(Get-FileHash payload\C63.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($c63 -ne $env:C63_SHA){throw "V10_C63_SHA_FAIL $c63"}
+          $sm=(Get-FileHash payload\SigProcLoaderContractSmoke.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sm -ne $env:SMOKE_SHA){throw "V10_SMOKE_SHA_FAIL $sm"}
+          "V10_A9_PREPARED_PASS A9_SHA=$a9 HARNESS_SHA=$hs" | Set-Content v10_prepared_gate.txt
+
+      - name: Persist exact A9 prepared candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: a9fefa-v10-prepared-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/SigProcDll-c8b8-source.dll
+            payload/fullreg_c8b8.c
+            payload/MANIFEST.txt
+            v10_restore_gate.txt
+            v10_harness_install.log
+            v10_candidate_build.log
+            v10_prepared_gate.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Static PE ABI import and stack gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers payload\SigProcDll-64HF.dll | Out-File v10_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll | Out-File v10_exports.txt
+          dumpbin /dependents payload\SigProcDll-64HF.dll | Out-File v10_a9_dependents.txt
+          dumpbin /dependents payload\SigProcDll-c8b8-source.dll | Out-File v10_c8_dependents.txt
+          @'
+          from pathlib import Path
+          import re,struct
+          h=Path('v10_headers.txt').read_text(errors='ignore')
+          e=Path('v10_exports.txt').read_text(errors='ignore')
+          if '14C machine (x86)' not in h: raise SystemExit('V10_NOT_X86')
+          for x in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if x not in e: raise SystemExit('V10_EXPORT_MISSING_'+x)
+          pat=re.compile(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',re.I|re.M)
+          a={x.lower() for x in pat.findall(Path('v10_a9_dependents.txt').read_text(errors='ignore'))}
+          c={x.lower() for x in pat.findall(Path('v10_c8_dependents.txt').read_text(errors='ignore'))}
+          if a!=c: raise SystemExit('V10_IMPORT_SET_CHANGED '+repr((sorted(a),sorted(c))))
+          b=Path('payload/SigProcDll-64HF.dll').read_bytes()
+          u16=lambda o:struct.unpack_from('<H',b,o)[0]; u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c); n=u16(pe+6); osz=u16(pe+20); s0=pe+24+osz; bad=[]
+          for i in range(n):
+              o=s0+40*i; rs=u32(o+16); rp=u32(o+20); ch=u32(o+36)
+              if ch & 0x20000000:
+                  for p in range(rp,max(rp,rp+rs-6)):
+                      if b[p:p+2]==b'\x81\xec':
+                          imm=u32(p+2)
+                          if 0x1000<=imm<0x100000: bad.append((p,imm))
+          if bad: raise SystemExit('V10_UNSAFE_DIRECT_STACK '+repr(bad))
+          Path('v10_static_gate.txt').write_text('V10_STATIC_PE_ABI_IMPORT_STACK_PASS\nIMPORTS='+','.join(sorted(a))+'\nLARGE_DIRECT_STACK=0\n')
+          print(Path('v10_static_gate.txt').read_text())
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\v10_static.py
+          python $env:RUNNER_TEMP\v10_static.py
+
+      - name: Compile persistent-state semantic harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:a9_v10.exe payload\fullreg_c8b8.c *> v10_compile.txt
+          if($LASTEXITCODE -ne 0){Get-Content v10_compile.txt;throw 'V10_COMPILE_FAIL'}
+          'V10_HARNESS_COMPILE_PASS' | Set-Content v10_compile_gate.txt
+
+      - name: C63 ground-truth self-calibration
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_c63 -Recurse -Force
+          $dll=(Resolve-Path 'payload\C63.dll').Path
+          $rt=(Resolve-Path 'rt_c63').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10.exe calibrate $dll $rt $test *> v10_c63_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content v10_c63_calibration.log
+          if($rc -ne 0){throw "V10_C63_CALIBRATION_FAIL rc=$rc"}
+          if(-not (Select-String v10_c63_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V10_C63_CALIBRATION_MARKER_FAIL'}
+          'V10_C63_GROUND_TRUTH_PASS' | Set-Content v10_c63_gate.txt
+
+      - name: A9 occupied-state and vitals semantic calibration
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_a9_cal -Recurse -Force
+          $dll=(Resolve-Path 'payload\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_a9_cal').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10.exe calibrate $dll $rt $test *> v10_a9_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content v10_a9_calibration.log
+          if($rc -ne 0){throw "V10_A9_CALIBRATION_FAIL rc=$rc"}
+          if(-not (Select-String v10_a9_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'V10_A9_CALIBRATION_MARKER_FAIL'}
+          'V10_A9_OCCUPIED_VITALS_PASS' | Set-Content v10_a9_calibration_gate.txt
+
+      - name: A9 inner and outer canonical loader contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($pair in @(@('inner-bed','rt_loader_inner','v10_loader_inner.log'),@('outer-medical-bed','rt_loader_outer','v10_loader_outer.log'))){
+            Copy-Item ("payload\runtime\"+$pair[0]) $pair[1] -Recurse -Force
+            Copy-Item payload\SigProcDll-64HF.dll ($pair[1]+'\SigProcDll-64HF.dll') -Force
+            Copy-Item payload\SigProcLoaderContractSmoke.exe ($pair[1]+'\SigProcLoaderContractSmoke.exe') -Force
+            Push-Location $pair[1]
+            .\SigProcLoaderContractSmoke.exe *> ("..\"+$pair[2])
+            $rc=$LASTEXITCODE
+            Pop-Location
+            Get-Content $pair[2]
+            if($rc -ne 0){throw "V10_LOADER_FAIL $($pair[0]) rc=$rc"}
+            if(-not (Select-String $pair[2] -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw "V10_LOADER_MARKER_FAIL $($pair[0])"}
+          }
+          'V10_A9_INNER_OUTER_LOADER_PASS' | Set-Content v10_loader_gate.txt
+
+      - name: A9 leave warning suppression recovery sentinel
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item payload\runtime\outer-medical-bed rt_a9_sentinel -Recurse -Force
+          $dll=(Resolve-Path 'payload\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_a9_sentinel').Path
+          $test=(Resolve-Path 'payload\testdata').Path
+          .\a9_v10.exe sentinel $dll $rt $test *> v10_a9_sentinel.log
+          $rc=$LASTEXITCODE
+          Get-Content v10_a9_sentinel.log
+          if($rc -ne 0){throw "V10_A9_SENTINEL_FAIL rc=$rc"}
+          if(-not (Select-String v10_a9_sentinel.log -Pattern 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -SimpleMatch -Quiet)){throw 'V10_A9_SENTINEL_MARKER_FAIL'}
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:A9_SHA){throw "V10_POST_SEMANTIC_SHA_FAIL $h"}
+          @("V10_A9_SEMANTIC_GATE_PASS","SHA256=$h","HARNESS_SHA=$env:HARNESS_SHA") | Set-Content A9FEFA_V10_SEMANTIC_PASS.lock
+
+      - name: Upload V10 semantic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a9fefa-v10-semantic-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            v10_restore_gate.txt
+            v10_prepared_gate.txt
+            v10_candidate_build.log
+            v10_headers.txt
+            v10_exports.txt
+            v10_a9_dependents.txt
+            v10_c8_dependents.txt
+            v10_static_gate.txt
+            v10_compile.txt
+            v10_compile_gate.txt
+            v10_c63_calibration.log
+            v10_c63_gate.txt
+            v10_a9_calibration.log
+            v10_a9_calibration_gate.txt
+            v10_loader_inner.log
+            v10_loader_outer.log
+            v10_loader_gate.txt
+            v10_a9_sentinel.log
+            A9FEFA_V10_SEMANTIC_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
