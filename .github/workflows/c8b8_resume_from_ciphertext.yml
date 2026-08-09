@@ -1,0 +1,173 @@
+name: c8b8-resume-from-ciphertext
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/c8b8_resume_from_ciphertext.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  resume:
+    runs-on: windows-2022
+    timeout-minutes: 125
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 90bd3ef14c9948677f259641e15227a7d26481baf399ae61ef67d09b031ecf71
+      RUNNER_SHA: fa0fadfda7cc72135f39a583e977f4a0ba14df07aa88ab73a4be5678f06cb874
+      ENC_SHA: e0bbcd4883362daf8cfc5c067a8a8f72e03760f6ab9d425bb3f426b97ad5fd59
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      SOURCE_RUN: '31308233779'
+      SOURCE_ARTIFACT: c8b8-v2-ciphertext-checkpoint-31308233779
+      HANDOFF_BRANCH: c8b8-fullreg-v2-resume-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore persisted ciphertext checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          if(!(Test-Path recovered\payload.enc)){throw 'RESTORED_PAYLOAD_MISSING'}
+          $h=(Get-FileHash recovered\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "RESTORED_ENC_SHA_FAIL $h"}
+          Copy-Item recovered\payload.enc payload.enc -Force
+          "CIPHERTEXT_RESTORE_PASS SHA256=$h SOURCE_RUN=$env:SOURCE_RUN" | Set-Content ciphertext_restore_gate.txt
+
+      - name: Publish RSA key for tiny key-only handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          alphabet=string.ascii_lowercase+string.digits;addr='ghres'+''.join(secrets.choice(alphabet) for _ in range(14))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32))
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-C8B8-RESUME-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('KEY_ONLY_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mail.py
+          python $env:RUNNER_TEMP\mail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_resume_handoff | Out-Null
+          Copy-Item mailbox.txt,subject_prefix.txt,public.pem .c8b8_resume_handoff\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c8b8_resume_handoff
+          git commit -m "Publish c8b8 resume key handoff"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+
+      - name: Receive wrapped AES key only
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          token=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';subj=Path('subject_prefix.txt').read_text().strip()+'-KEY';out=Path('wrapped_key.bin')
+          def gj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          end=time.time()+1100
+          while time.time()<end and not out.exists():
+              z=gj(base+'/messages');msgs=z if isinstance(z,list) else z.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject')!=subj:continue
+                  d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      if a.get('filename')!='c8b8_v2_wrapped_key.bin':continue
+                      u=urllib.parse.urljoin(base,a.get('downloadUrl',''));r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+token)
+                      with urllib.request.urlopen(r,timeout=60) as x:out.write_bytes(x.read())
+              if not out.exists():time.sleep(3)
+          if not out.exists():raise SystemExit('KEY_ONLY_HANDOFF_TIMEOUT')
+          print('KEY_ONLY_HANDOFF_PASS bytes='+str(out.stat().st_size))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recvkey.py
+          python $env:RUNNER_TEMP\recvkey.py | Tee-Object key_handoff.log
+          if((Get-Item wrapped_key.bin).Length -ne 384){throw 'WRAPPED_KEY_SIZE_FAIL'}
+
+      - name: Decrypt and extract with 7-Zip
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in wrapped_key.bin -out $env:RUNNER_TEMP\aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_DECRYPT_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $xh=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $xh"}
+          7z x -y payload.tar.xz -o. | Out-File 7z_xz.log
+          if($LASTEXITCODE -ne 0){throw '7Z_XZ_FAIL'}
+          if(!(Test-Path payload.tar)){throw 'PAYLOAD_TAR_MISSING'}
+          7z x -y payload.tar -o. | Out-File 7z_tar.log
+          if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
+          if(!(Test-Path c8b8_fullreg_payload_v2)){throw 'EXTRACTED_DIR_MISSING'}
+          Move-Item c8b8_fullreg_payload_v2 payload
+          $rh=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant();if($rh -ne $env:RUNNER_SHA){throw "RUNNER_SHA_FAIL $rh"}
+          "RESUME_EXTRACT_PASS XZ_SHA=$xh RUNNER_SHA=$rh" | Set-Content resume_extract_gate.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Run exact native Windows complete regression
+        shell: powershell
+        timeout-minutes: 105
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload\run_windows_gate.ps1
+          if($LASTEXITCODE -ne 0){throw "WINDOWS_GATE_FAIL $LASTEXITCODE"}
+          if(!(Test-Path C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock)){throw 'PASS_LOCK_MISSING'}
+
+      - name: Upload exact resume evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-resume-native-fullreg-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/MANIFEST.txt
+            ciphertext_restore_gate.txt
+            key_handoff.log
+            resume_extract_gate.txt
+            exact_asset_hashes.txt
+            exact_asset_binding.txt
+            ghf_sha_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_pe_gate.txt
+            static_gate_python.log
+            fullreg_compile.txt
+            loader_inner.log
+            loader_outer.log
+            hostcompat_nonzero.log
+            c63_nonzero.log
+            native_loader_baseline_gate.txt
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            post_test_sha.txt
+            complete_regression_gate.txt
+            C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+            run_windows_gate_pass.txt
+          if-no-files-found: ignore
+          retention-days: 30
