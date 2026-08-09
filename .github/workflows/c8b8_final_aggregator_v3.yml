@@ -1,0 +1,116 @@
+name: c8b8-final-exact-release-aggregator-v3
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.final_trigger/c8b8_v3.txt'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_RUN: '31302120039'
+  STAGE_C_RUN: '31302799001'
+  STAGE_E_RUN: '31302313459'
+  CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+  BRANCH: c8b8-fullreg-v2-final-20260809
+jobs:
+  final:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore exact tested payload and all completed stage evidence
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload,evidence\A,evidence\B,evidence\D1,evidence\D2,evidence\D3,evidence\D4,evidence\F,evidence\C,evidence\E | Out-Null
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-windows-ready-payload-$env:SOURCE_RUN" --dir payload
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageA-$env:SOURCE_RUN" --dir evidence\A
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageB-$env:SOURCE_RUN" --dir evidence\B
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageD-cand_inner-$env:SOURCE_RUN" --dir evidence\D1
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageD-cand_outer-$env:SOURCE_RUN" --dir evidence\D2
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageD-c63_inner-$env:SOURCE_RUN" --dir evidence\D3
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageD-c63_outer-$env:SOURCE_RUN" --dir evidence\D4
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-evidence-stageF-$env:SOURCE_RUN" --dir evidence\F
+          gh run download $env:STAGE_C_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3b-stageC-$env:STAGE_C_RUN" --dir evidence\C
+          gh run download $env:STAGE_E_RUN --repo $env:GITHUB_REPOSITORY --name "c8b8-v3-resume-stageE-$env:STAGE_E_RUN" --dir evidence\E
+          if($LASTEXITCODE -ne 0){throw 'EVIDENCE_RESTORE_FAIL'}
+      - name: Verify all stage PASS evidence and exact SHA binding
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:CAND_SHA){throw "DLL_SHA_FAIL $h"}
+          $checks=@(
+            @{p='evidence\A\payload_binding.txt';m='WINDOWS_READY_PAYLOAD_BINDING_PASS'},
+            @{p='evidence\B\static_gate.txt';m='STATIC_GATE_PASS'},
+            @{p='evidence\B\loader_gate.txt';m='INNER_OUTER_LOADER_CONTRACT_PASS'},
+            @{p='evidence\D1\realtime_cand_inner_gate.txt';m='REALTIME_1HZ_PASS'},
+            @{p='evidence\D2\realtime_cand_outer_gate.txt';m='REALTIME_1HZ_PASS'},
+            @{p='evidence\D3\realtime_c63_inner_gate.txt';m='REALTIME_1HZ_PASS'},
+            @{p='evidence\D4\realtime_c63_outer_gate.txt';m='REALTIME_1HZ_PASS'},
+            @{p='evidence\F\performance.txt';m='PERFORMANCE_GATE_PASS'},
+            @{p='evidence\C\STAGE_C_V3B_PASS.lock';m='STAGE_C_V3B_VIRTUAL_1HZ_PASS'},
+            @{p='evidence\C\STAGE_C_V3B_PASS.lock';m=$env:CAND_SHA},
+            @{p='evidence\E\STAGE_E_V3_RESUME_PASS.lock';m='STAGE_E_V3_RESUME_PASS'},
+            @{p='evidence\E\STAGE_E_V3_RESUME_PASS.lock';m=$env:CAND_SHA},
+            @{p='evidence\E\determinism_gate.txt';m='DETERMINISTIC_REPLAY_PASS'},
+            @{p='evidence\E\stress_gate.txt';m='THREAD_STRESS_2x2000_PASS'},
+            @{p='evidence\E\long_stability_gate.txt';m='LONG_STABILITY_2x20000_PASS'}
+          )
+          foreach($c in $checks){
+            if(!(Test-Path $c.p)){throw "MISSING_EVIDENCE $($c.p)"}
+            if(-not(Select-String -Path $c.p -Pattern $c.m -SimpleMatch -Quiet)){throw "MARKER_FAIL $($c.p) :: $($c.m)"}
+          }
+          @(
+            'C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS',
+            "SHA256=$h",
+            "SOURCE_RUN=$env:SOURCE_RUN",
+            "STAGE_C_RUN=$env:STAGE_C_RUN",
+            "STAGE_E_RUN=$env:STAGE_E_RUN",
+            'STAGE_A_WINDOWS_READY_PAYLOAD=PASS',
+            'STAGE_B_PE_ABI_STACK_DUAL_LOADER=PASS',
+            'STAGE_C_FULL_13_GHF_VIRTUAL_EXACT_1HZ_SEMANTICS=PASS',
+            'STAGE_D_CANDIDATE_INNER_1HZ=PASS',
+            'STAGE_D_CANDIDATE_OUTER_1HZ=PASS',
+            'STAGE_D_C63_INNER_1HZ=PASS',
+            'STAGE_D_C63_OUTER_1HZ=PASS',
+            'STAGE_E_DETERMINISTIC_REPLAY=PASS',
+            'STAGE_E_THREAD_STRESS_2x2000=PASS',
+            'STAGE_E_LONG_STABILITY_2x20000=PASS',
+            'STAGE_F_PERFORMANCE_VS_C63=PASS',
+            'GHF_COUNT=13',
+            'GHF_BYTES=82484656',
+            'POST_TEST_SHA_MATCH=PASS'
+          ) | Set-Content C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS.lock
+          Get-Content C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS.lock
+      - name: Commit final release lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          git fetch origin $env:BRANCH
+          git checkout -B $env:BRANCH "origin/$env:BRANCH"
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS.lock evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS.lock
+          git commit -m "Lock exact c8b8 final native Windows full regression PASS"
+          git push origin "HEAD:$env:BRANCH"
+      - name: Upload exact tested final DLL and full evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-FINAL-exact-tested-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/MANIFEST.txt
+            C8B8_EXACT_NATIVE_WINDOWS_FULLREG_FINAL_PASS.lock
+            evidence
+          if-no-files-found: error
+          retention-days: 30
