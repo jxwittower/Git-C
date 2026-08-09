@@ -1,0 +1,100 @@
+name: c8b8-transport-stage-v4
+on:
+  push:
+    branches: [c8b8-transport-stage-v4-20260809]
+    paths:
+      - '.github/workflows/c8b8_transport_stage_v4.yml'
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      ENC_SHA: 0a3f05c61deb236d0e9c6e9d7879fb0d0d84551a765e75dfad25967d6e6c70c8
+      BRANCH: c8b8-transport-stage-v4-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Publish staging mailbox
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def rq(method,url,obj=None,token=None):
+              d=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=d,method=method);r.add_header('Accept','application/json')
+              if d is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';q=rq('GET',base+'/domains');q=q if isinstance(q,list) else q.get('hydra:member',[])
+          if not q:raise SystemExit('NO_DOMAIN')
+          a='ghstage'+''.join(secrets.choice(string.ascii_lowercase+string.digits) for _ in range(14))+'@'+q[0]['domain'];p=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          rq('POST',base+'/accounts',{'address':a,'password':p});t=rq('POST',base+'/token',{'address':a,'password':p})['token']
+          Path('mail.json').write_text(json.dumps({'token':t}));Path('mailbox.txt').write_text(a+'\n');Path('subject.txt').write_text('GuanHu-C8B8-STAGE-'+os.environ['GITHUB_RUN_ID']+'\n');print(a)
+          '@ | Set-Content -Encoding ascii make_mail.py
+          python make_mail.py | Tee-Object handoff.log
+          New-Item -ItemType Directory -Force .c8b8_stage_handoff|Out-Null; Copy-Item mailbox.txt,subject.txt .c8b8_stage_handoff\ -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","PARTS=6")|Set-Content .c8b8_stage_handoff\binding.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_stage_handoff;git commit -m 'Publish c8b8 stage mailbox';git push origin "HEAD:$env:BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+      - name: Receive six encrypted parts
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,time,urllib.request,urllib.parse
+          from pathlib import Path
+          t=json.loads(Path('mail.json').read_text())['token'];base='https://api.mail.tm';pre=Path('subject.txt').read_text().strip();out=Path('parts');out.mkdir(exist_ok=True);want={f'{pre}-P{i}':i for i in range(1,7)};got=set();seen=set()
+          def j(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+t)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def b(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+t)
+              with urllib.request.urlopen(r,timeout=120) as x:return x.read()
+          end=time.time()+1800
+          while time.time()<end and len(got)<6:
+              q=j(base+'/messages');q=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in q:
+                  s=m.get('subject','');mid=m.get('id')
+                  if s not in want or mid in seen:continue
+                  seen.add(mid);i=want[s];d=j(base+'/messages/'+mid)
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl');pn=f'c8b8_payload_part{i:02d}.bin'
+                      if n==pn and u:(out/pn).write_bytes(b(urllib.parse.urljoin(base,u)));got.add(i)
+              Path('stage_progress.txt').write_text('RECEIVED='+','.join(map(str,sorted(got)))+'\n')
+              if len(got)<6:time.sleep(5)
+          if len(got)!=6:raise SystemExit('STAGE_INCOMPLETE '+repr(sorted(got)))
+          print('STAGE_MAIL_RECEIVE_PASS parts=6')
+          '@ | Set-Content -Encoding ascii recv.py
+          python recv.py | Tee-Object receive.log
+          if($LASTEXITCODE -ne 0){throw 'RECEIVE_FAIL'}
+      - name: Reassemble and SHA-lock staged ciphertext
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat parts/c8b8_payload_part01.bin parts/c8b8_payload_part02.bin parts/c8b8_payload_part03.bin parts/c8b8_payload_part04.bin parts/c8b8_payload_part05.bin parts/c8b8_payload_part06.bin > c8b8_fullreg_transport.enc
+          echo "$ENC_SHA  c8b8_fullreg_transport.enc" | sha256sum -c - | tee staged_sha.txt
+          echo C8B8_ENCRYPTED_PAYLOAD_STAGE_PASS > stage_pass.txt
+      - name: Upload durable encrypted fullreg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-staged-encrypted-fullreg-${{ github.run_id }}
+          path: |
+            c8b8_fullreg_transport.enc
+            staged_sha.txt
+            stage_pass.txt
+            receive.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Commit stage PASS lock
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;@('C8B8_ENCRYPTED_PAYLOAD_STAGE_PASS',"ENC_SHA=$env:ENC_SHA","RUN_ID=$env:GITHUB_RUN_ID")|Set-Content evidence_summary\C8B8_STAGE_V4_PASS.lock
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/C8B8_STAGE_V4_PASS.lock;git commit -m 'Lock c8b8 encrypted payload staging PASS';git fetch origin $env:BRANCH;git rebase "origin/$env:BRANCH";git push origin "HEAD:$env:BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'STAGE_LOCK_PUSH_FAIL'}
