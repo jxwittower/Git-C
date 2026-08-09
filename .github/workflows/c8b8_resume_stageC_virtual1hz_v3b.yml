@@ -1,0 +1,155 @@
+name: c8b8-resume-stageC-virtual1hz-v3b
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_resume_stageC_virtual1hz_v3b.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  PAYLOAD_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  HARNESS_RUN: '31302697175'
+  HARNESS_ARTIFACT: c8b8-v3-resume-stageC-virtual1hz-31302697175
+  CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+  HARNESS_SHA: f04b8707ccb1785d729fadb93d389696dc4e052a8211ee787c0a3a55ac6c6a56
+  HANDOFF_BRANCH: c8b8-fullreg-v2-final-20260809
+jobs:
+  stageC:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore immutable payload and materialized virtual-1Hz harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload,harness | Out-Null
+          gh run download $env:PAYLOAD_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          if($LASTEXITCODE -ne 0){throw 'PAYLOAD_RESTORE_FAIL'}
+          gh run download $env:HARNESS_RUN --repo $env:GITHUB_REPOSITORY --name $env:HARNESS_ARTIFACT --dir harness
+          if($LASTEXITCODE -ne 0){throw 'HARNESS_RESTORE_FAIL'}
+          $dh=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hh=(Get-FileHash harness\HostReplayWinVirtualFixed.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($dh -ne $env:CAND_SHA){throw "DLL_SHA_FAIL $dh"}
+          if($hh -ne $env:HARNESS_SHA){throw "HARNESS_SHA_FAIL $hh"}
+          @("DLL_SHA=$dh","HARNESS_SHA=$hh","PAYLOAD_RUN=$env:PAYLOAD_RUN","HARNESS_RUN=$env:HARNESS_RUN",'RESTORE_BINDING_PASS') | Set-Content restore_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Compile exact virtual-1Hz harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS harness\HostReplayWinVirtualFixed.c /Fe:HostReplayWinVirtualFixed.exe *> virtual_build.txt
+          if($LASTEXITCODE -ne 0){Get-Content virtual_build.txt;throw 'BUILD_FAIL'}
+          Get-Content virtual_build.txt
+      - name: Execute complete 13-GHF lifecycle at virtual exact 1Hz
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe="$env:GITHUB_WORKSPACE\HostReplayWinVirtualFixed.exe"
+          function New-Runtime([string]$runtime,[string]$name){
+            $d=Join-Path $env:RUNNER_TEMP $name
+            if(Test-Path $d){Remove-Item -Recurse -Force $d}
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item "$runtime\*" $d -Force
+            Copy-Item payload\SigProcDll-64HF.dll "$d\SigProcDll-64HF.dll" -Force
+            return $d
+          }
+          function Invoke-Replay([string]$dir,[object[]]$argv,[string]$name){
+            $out="$env:GITHUB_WORKSPACE\$name.stdout";$err="$env:GITHUB_WORKSPACE\$name.stderr";$log="$env:GITHUB_WORKSPACE\$name.log"
+            $p=Start-Process -FilePath $exe -ArgumentList $argv -WorkingDirectory $dir -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            Get-Content $out,$err | Set-Content $log
+            Get-Content $log
+            if($p.ExitCode -ne 0){throw "$name RC=$($p.ExitCode)"}
+            if(-not(Select-String -Path $log -Pattern 'VIRTUAL_CLOCK_1HZ_IAT_PATCH_PASS' -SimpleMatch -Quiet)){throw "$name CLOCK_PATCH_MISSING"}
+          }
+          $inner=Get-ChildItem payload\testdata\inner-bed\*.ghf | Sort-Object Name | ForEach-Object {$_.FullName}
+          $outer=Get-ChildItem payload\testdata\outer-medical-bed\*.ghf | Sort-Object Name | ForEach-Object {$_.FullName}
+          if($inner.Count -ne 6 -or $outer.Count -ne 7){throw 'CORPUS_SPLIT_FAIL'}
+          $di=New-Runtime payload\runtime_inner virtual_inner
+          $ia=@('--dll','.\SigProcDll-64HF.dll','--mode','replay');foreach($f in $inner){$ia+=@('--ghf',$f)};$ia+=@('--out',"$env:GITHUB_WORKSPACE\virtual_inner.csv",'--virtual-1hz')
+          Invoke-Replay $di $ia virtual_inner
+          $do=New-Runtime payload\runtime_outer virtual_outer
+          $oa=@('--dll','.\SigProcDll-64HF.dll','--mode','replay');foreach($f in $outer){$oa+=@('--ghf',$f)};$oa+=@('--out',"$env:GITHUB_WORKSPACE\virtual_outer.csv",'--virtual-1hz','--sequence-sentinel')
+          Invoke-Replay $do $oa virtual_outer
+      - name: Validate lifecycle semantics and exact post-test DLL SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import csv,collections
+          def read(p):
+              with open(p,newline='') as f:return list(csv.DictReader(f))
+          def valid(s):
+              v=int(s);return 0<v<1000 and v!=65535
+          I=read('virtual_inner.csv');O=read('virtual_outer.csv')
+          if len(I)!=6294:raise SystemExit('INNER_ROWS='+str(len(I)))
+          if len(O)!=4514:raise SystemExit('OUTER_ROWS='+str(len(O)))
+          ic=collections.Counter(int(r['state']) for r in I);oc=collections.Counter(int(r['state']) for r in O)
+          if ic[1]<3000 or ic[0]<500:raise SystemExit('INNER_LIFECYCLE='+repr(ic))
+          if oc[1]<2000 or oc[0]<500:raise SystemExit('OUTER_LIFECYCLE='+repr(oc))
+          if sum(valid(r['hr']) for r in I)<1000 or sum(valid(r['rr']) for r in I)<1000:raise SystemExit('INNER_VITALS_FAIL')
+          if sum(valid(r['hr']) for r in O)<1000 or sum(valid(r['rr']) for r in O)<1000:raise SystemExit('OUTER_VITALS_FAIL')
+          bad8=[r for r in O if int(r['state'])==8 and (valid(r['hr']) or valid(r['rr']))]
+          if bad8:raise SystemExit('STATE8_VALID_VITAL_LEAK='+str(len(bad8)))
+          by={i:[r for r in O if int(r['source'])==i] for i in range(7)}
+          if any(int(r['state'])!=0 for r in by[0]):raise SystemExit('INITIAL_EMPTY_FAIL')
+          if not any(int(r['state'])==1 for r in by[1]):raise SystemExit('SUPINE_OCCUPANCY_FAIL')
+          if not any(valid(r['hr']) for r in by[1]) or not any(valid(r['rr']) for r in by[1]):raise SystemExit('SUPINE_VITALS_FAIL')
+          if not any(int(r['state'])==0 for r in by[4]):raise SystemExit('LEAVE_EMPTY_FAIL')
+          if not any(int(r['state'])==1 for r in by[5]):raise SystemExit('RETURN_REENTRY_FAIL')
+          if not any(valid(r['hr']) for r in by[5]) or not any(valid(r['rr']) for r in by[5]):raise SystemExit('RETURN_VITALS_FAIL')
+          if int(by[6][-1]['state'])!=0:raise SystemExit('FINAL_EMPTY_FAIL')
+          with open('semantic_summary.txt','w') as f:
+              f.write('INNER_STATE_COUNTS='+repr(dict(ic))+'\nOUTER_STATE_COUNTS='+repr(dict(oc))+'\n')
+              f.write('INNER_VALID_HR=%d INNER_VALID_RR=%d\n'%(sum(valid(r['hr']) for r in I),sum(valid(r['rr']) for r in I)))
+              f.write('OUTER_VALID_HR=%d OUTER_VALID_RR=%d\n'%(sum(valid(r['hr']) for r in O),sum(valid(r['rr']) for r in O)))
+              f.write('STATE8_VALID_VITAL_LEAK=0\nLEAVE_EMPTY=PASS\nRETURN_REENTRY=PASS\nRETURN_VITALS=PASS\nFINAL_EMPTY=PASS\n')
+          print('FULL_13_GHF_VIRTUAL_1HZ_SEMANTIC_VALIDATION_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\validate.py
+          python $env:RUNNER_TEMP\validate.py | Tee-Object semantic_validation.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          if(-not(Select-String -Path virtual_outer.log -Pattern 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -SimpleMatch -Quiet)){throw 'SEQ_SENTINEL_MISSING'}
+          $post=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($post -ne $env:CAND_SHA){throw "POST_SHA_FAIL $post"}
+          @('STAGE_C_V3B_VIRTUAL_1HZ_PASS',"SHA256=$post",'INNER_FRAMES=6294','OUTER_FRAMES=4514','SEMANTIC_VALIDATION=PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY=PASS','POST_TEST_SHA_MATCH=PASS') | Set-Content STAGE_C_V3B_PASS.lock
+      - name: Persist Stage C PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          git fetch origin $env:HANDOFF_BRANCH
+          git checkout -B $env:HANDOFF_BRANCH "origin/$env:HANDOFF_BRANCH"
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item STAGE_C_V3B_PASS.lock evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/STAGE_C_V3B_PASS.lock
+          git commit -m "Record c8b8 Stage C virtual-1Hz v3b PASS"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Upload Stage C v3b evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v3b-stageC-${{ github.run_id }}
+          path: |
+            restore_binding.txt
+            virtual_build.txt
+            virtual_inner.log
+            virtual_outer.log
+            virtual_inner.csv
+            virtual_outer.csv
+            semantic_summary.txt
+            semantic_validation.log
+            STAGE_C_V3B_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
