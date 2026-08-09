@@ -39,9 +39,9 @@ jobs:
         shell: powershell
         timeout-minutes: 15
         run: |
-          $ErrorActionPreference='Stop';$ok=$false
-          for($i=0;$i -lt 180;$i++){git fetch origin $env:BRANCH --quiet;git show "origin/$env:BRANCH`:.c8b8_v5_handoff/wrapped_key.b64" 2>$null|Out-File -Encoding ascii wrapped_key.b64;if($LASTEXITCODE -eq 0 -and (Get-Item wrapped_key.b64 -ErrorAction SilentlyContinue).Length -gt 100){$ok=$true;break};Start-Sleep 5}
-          if(-not $ok){throw 'KEY_HANDOFF_TIMEOUT'};$s=(Get-Content wrapped_key.b64 -Raw).Trim();[IO.File]::WriteAllBytes('wrapped_key.bin',[Convert]::FromBase64String($s));if((Get-Item wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'};'WRAPPED_KEY_PASS'|Out-File cp02_key.txt
+          $ErrorActionPreference='Continue';$ok=$false
+          for($i=0;$i -lt 180;$i++){git fetch origin $env:BRANCH --quiet 2>$null;git show "origin/$env:BRANCH`:.c8b8_v5_handoff/wrapped_key.b64" 2>$null|Out-File -Encoding ascii wrapped_key.b64;if($LASTEXITCODE -eq 0 -and (Get-Item wrapped_key.b64 -ErrorAction SilentlyContinue).Length -gt 100){$ok=$true;break};Start-Sleep 5}
+          $ErrorActionPreference='Stop';if(-not $ok){throw 'KEY_HANDOFF_TIMEOUT'};$s=(Get-Content wrapped_key.b64 -Raw).Trim();[IO.File]::WriteAllBytes('wrapped_key.bin',[Convert]::FromBase64String($s));if((Get-Item wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'};'WRAPPED_KEY_PASS'|Out-File cp02_key.txt
       - name: Decrypt and exact-bind complete payload
         shell: powershell
         run: |
