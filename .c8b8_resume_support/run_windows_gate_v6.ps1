@@ -102,11 +102,11 @@ function Run-Native {
     if($rc -ne 0){throw "NATIVE_FAIL rc=$rc log=$Log"}
 }
 
-# Candidate canonical loader contract in both runtime layouts.
+# Canonical loader contract in both runtime layouts.
 $rtLI=Copy-Runtime 'payload\runtime\inner-bed' 'rt_loader_inner'
 $rtLO=Copy-Runtime 'payload\runtime\outer-medical-bed' 'rt_loader_outer'
 foreach($rt in @($rtLI,$rtLO)){Copy-Item $cand "$rt\SigProcDll-64HF.dll" -Force;Copy-Item $smoke "$rt\SigProcLoaderContractSmoke.exe" -Force}
-Push-Location $rtLI; .\SigProcLoaderContractSmoke.exe *> "$root\loader_inner.log"; $rc=$LASTEXITCODE; Pop-Location; Get-Content loader_inner.log; if($rc -ne 0){throw "INNER_LOADER_FAIL $rc"}
+Push-Location $rtLI; .\SigProcLoaderContractSmoke.exe *> "$root\loader_inner.log"; $rc=$LASTEXITCODE; Pop-Location; Get-Content loader_inner.log; if($rc -ne 0){throw "INNER_LOADER_FAIL rc"}
 Push-Location $rtLO; .\SigProcLoaderContractSmoke.exe *> "$root\loader_outer.log"; $rc=$LASTEXITCODE; Pop-Location; Get-Content loader_outer.log; if($rc -ne 0){throw "OUTER_LOADER_FAIL $rc"}
 if(-not (Select-String -Path loader_inner.log -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw 'INNER_LOADER_MARKER_FAIL'}
 if(-not (Select-String -Path loader_outer.log -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw 'OUTER_LOADER_MARKER_FAIL'}
@@ -170,6 +170,7 @@ if($post -ne $env:CAND_SHA){throw "POST_SHA_FAIL $post"}
 "C8B8_EXACT_NATIVE_COMPLETE_REGRESSION_PASS SHA256=$post" | Set-Content C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
 'COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS' | Set-Content complete_regression_gate.txt
 
+# Commit the exact pass lock to the handoff branch; path filter prevents re-trigger.
 New-Item -ItemType Directory -Force evidence_summary | Out-Null
 Copy-Item C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock,post_test_sha.txt,complete_regression_gate.txt evidence_summary\ -Force
 git config user.name windows-dll-test-bot
