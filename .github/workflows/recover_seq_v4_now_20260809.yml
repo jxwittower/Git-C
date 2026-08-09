@@ -1,0 +1,57 @@
+name: recover-seq-v4-now-20260809
+on:
+  push:
+    branches: [seq-v4-native-gate-20260808b]
+    paths: ['.github/workflows/recover_seq_v4_now_20260809.yml']
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Reconstruct all seq V4 payload variants
+        shell: python
+        run: |
+          from pathlib import Path
+          import base64,hashlib
+          o=Path('out');o.mkdir()
+          groups={
+            'candidate':[Path('.seq_candidate_v4_payload/chunk_00'),Path('.seq_candidate_v4_payload/chunk_01')],
+            'native':[Path('.seq_v4_native_payload/chunk_00.b64'),Path('.seq_v4_native_payload/chunk_01.b64')],
+          }
+          log=[]
+          for name,ps in groups.items():
+              cs=[p.read_bytes() for p in ps]
+              raw=b''.join(cs); (o/f'{name}.rawcat.bin').write_bytes(raw)
+              log.append(f'{name}.rawcat bytes={len(raw)} sha={hashlib.sha256(raw).hexdigest()} head={raw[:16]!r}')
+              ds=[]
+              for i,b in enumerate(cs):
+                  try: ds.append(base64.b64decode(b''.join(b.split()),validate=True))
+                  except Exception as e: log.append(f'{name}.chunk{i}.decode_error={e!r}'); ds=[]; break
+              if ds:
+                  d=b''.join(ds);(o/f'{name}.decode_each.bin').write_bytes(d);log.append(f'{name}.decode_each bytes={len(d)} sha={hashlib.sha256(d).hexdigest()} head={d[:16]!r}')
+              try:
+                  d=base64.b64decode(b''.join(raw.split()),validate=True);(o/f'{name}.decode_concat.bin').write_bytes(d);log.append(f'{name}.decode_concat bytes={len(d)} sha={hashlib.sha256(d).hexdigest()} head={d[:16]!r}')
+              except Exception as e: log.append(f'{name}.concat.decode_error={e!r}')
+          (o/'format_detection.txt').write_text('\n'.join(log)+'\n');print('\n'.join(log))
+      - name: Identify and inspect archives
+        shell: bash
+        run: |
+          set -u
+          for f in out/*.bin; do
+            echo "=== $f ===" | tee -a out/ident.txt
+            wc -c "$f" | tee -a out/ident.txt
+            sha256sum "$f" | tee -a out/ident.txt
+            file "$f" | tee -a out/ident.txt
+            xxd -l 64 "$f" | tee -a out/ident.txt
+            7z l "$f" > "${f}.7zlist.txt" 2>&1 || true
+          done
+      - name: Upload recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-v4-recovered-now-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
