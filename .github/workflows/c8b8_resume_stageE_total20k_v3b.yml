@@ -1,0 +1,82 @@
+name: c8b8-resume-stageE-total20k-v3b
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_resume_stageE_total20k_v3b.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+  BRANCH: c8b8-fullreg-v2-final-20260809
+jobs:
+  stageE:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Restore immutable payload
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload | Out-Null
+          gh run download $env:SOURCE_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          if($LASTEXITCODE -ne 0){throw 'PAYLOAD_RESTORE_FAIL'}
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h-ne $env:CAND_SHA){throw "SHA_BIND_FAIL $h"}
+          "CAND_SHA=$h`nRESTORE_PASS"|Set-Content restore_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Compile exact x86 harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS payload\HostReplayWin.c /Fe:payload\HostReplayWin.exe *> stageE_build.txt
+          if($LASTEXITCODE-ne 0){Get-Content stageE_build.txt;throw 'BUILD_FAIL'}
+      - name: Determinism, 2x2000 stress, 20000-total long stability
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe="$env:GITHUB_WORKSPACE\payload\HostReplayWin.exe";$ghf=(Resolve-Path 'payload\testdata\inner-bed\02_supine.ghf').Path
+          function New-TestDir([string]$name){$d=Join-Path $env:RUNNER_TEMP $name;if(Test-Path $d){Remove-Item -Recurse -Force $d};New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item payload\runtime_inner\* $d -Force;Copy-Item payload\SigProcDll-64HF.dll "$d\SigProcDll-64HF.dll" -Force;return $d}
+          function Invoke-Test([string]$dir,[object[]]$argv,[string]$name){$out="$env:GITHUB_WORKSPACE\$name.stdout";$err="$env:GITHUB_WORKSPACE\$name.stderr";$log="$env:GITHUB_WORKSPACE\$name.log";$p=Start-Process -FilePath $exe -ArgumentList $argv -WorkingDirectory $dir -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err;Get-Content $out,$err|Set-Content $log;Get-Content $log;if($p.ExitCode-ne 0){throw "$name RC=$($p.ExitCode)"}}
+          foreach($n in 1,2){$d=New-TestDir "det$n";Invoke-Test $d @('--dll','.\SigProcDll-64HF.dll','--mode','replay','--ghf',$ghf,'--max-frames','120','--out',"$env:GITHUB_WORKSPACE\det$n.csv") "det$n"}
+          $h1=(Get-FileHash det1.csv -Algorithm SHA256).Hash.ToLowerInvariant();$h2=(Get-FileHash det2.csv -Algorithm SHA256).Hash.ToLowerInvariant();if($h1-ne $h2){throw 'DETERMINISM_FAIL'};"DETERMINISTIC_REPLAY_PASS SHA256=$h1"|Set-Content determinism_gate.txt
+          $d=New-TestDir stress2k;Invoke-Test $d @('--dll','.\SigProcDll-64HF.dll','--mode','stress','--ghf',$ghf,'--loops','2000','--threads','2') stress_2x2000;if(-not(Select-String -Path stress_2x2000.log -Pattern 'STRESS_PASS threads=2 loops_each=2000' -SimpleMatch -Quiet)){throw 'STRESS2K_MARKER_FAIL'};'THREAD_STRESS_2x2000_PASS TOTAL_CALLS=4000'|Set-Content stress_gate.txt
+          $d=New-TestDir long20k;Invoke-Test $d @('--dll','.\SigProcDll-64HF.dll','--mode','stress','--ghf',$ghf,'--loops','10000','--threads','2') long_2x10000;if(-not(Select-String -Path long_2x10000.log -Pattern 'STRESS_PASS threads=2 loops_each=10000 total_calls=20000' -SimpleMatch -Quiet)){throw 'LONG20K_MARKER_FAIL'};'LONG_STABILITY_20000_TOTAL_PASS THREADS=2 LOOPS_EACH=10000'|Set-Content long_stability_gate.txt
+          $post=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post-ne $env:CAND_SHA){throw "POST_SHA_FAIL $post"}
+          @('STAGE_E_V3B_TOTAL20K_PASS',"SHA256=$post",'DETERMINISM=PASS','THREAD_STRESS_2x2000=PASS','LONG_STABILITY_TOTAL_CALLS=20000','LONG_STABILITY_THREADS=2','LONG_STABILITY_LOOPS_EACH=10000','POST_TEST_SHA_MATCH=PASS')|Set-Content STAGE_E_V3B_TOTAL20K_PASS.lock
+      - name: Persist PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';git fetch origin $env:BRANCH;git checkout -B $env:BRANCH "origin/$env:BRANCH";New-Item -ItemType Directory -Force evidence_summary|Out-Null;Copy-Item STAGE_E_V3B_TOTAL20K_PASS.lock evidence_summary\ -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/STAGE_E_V3B_TOTAL20K_PASS.lock;git commit -m "Record exact c8b8 historical 20k total long stability PASS";git push origin "HEAD:$env:BRANCH"
+      - name: Upload Stage E v3b evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v3b-stageE-total20k-${{ github.run_id }}
+          path: |
+            restore_binding.txt
+            stageE_build.txt
+            det1.log
+            det2.log
+            det1.csv
+            det2.csv
+            determinism_gate.txt
+            stress_2x2000.log
+            long_2x10000.log
+            stress_gate.txt
+            long_stability_gate.txt
+            STAGE_E_V3B_TOTAL20K_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
