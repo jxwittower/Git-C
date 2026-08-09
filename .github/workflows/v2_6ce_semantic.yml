@@ -1,0 +1,106 @@
+name: v2-6ce-semantic
+on:
+  push:
+    branches: [v2-6ce-semantic-20260809]
+    paths: ['.github/workflows/v2_6ce_semantic.yml']
+permissions:
+  contents: write
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      BRANCH: v2-6ce-semantic-20260809
+      ENC_SHA: 5bb16bfdcf3d7e15c32876307742eb9a776a004fc9730c78142cd40438435950
+      XZ_SHA: 6a7e02a9071823d57a1fd81d34458de8a6acc2b595191c42f7d558c11c8cea89
+      CAND_SHA: 6ce8138341e7949ac1436acce2c66a8ba501d7b965f314e96b37f6930a4e2a95
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+      - name: Publish one-time mailbox and RSA key
+        shell: powershell
+        run: |
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def q(method,u,obj=None,tok=None):
+              d=None if obj is None else json.dumps(obj).encode(); r=urllib.request.Request(u,data=d,method=method); r.add_header('Accept','application/json')
+              if d is not None:r.add_header('Content-Type','application/json')
+              if tok:r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=q('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          a=string.ascii_lowercase+string.digits;addr='ghv26ce'+''.join(secrets.choice(a) for _ in range(14))+'@'+m[0]['domain'];pw=secrets.token_urlsafe(36)
+          q('POST',base+'/accounts',{'address':addr,'password':pw});tok=q('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject.txt').write_text('GuanHu-V2-6CE-'+os.environ['GITHUB_RUN_ID']+'\n');print('MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mk.py
+          python $env:RUNNER_TEMP\mk.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .v2_6ce_handoff | Out-Null; Copy-Item mailbox.txt,subject.txt,public.pem .v2_6ce_handoff\
+          git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com; git add .v2_6ce_handoff; git commit -m 'Publish V2 6ce semantic handoff'; git push origin "HEAD:$env:BRANCH"
+      - name: Receive payload
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';sub=Path('subject.txt').read_text().strip();out=Path('transport');out.mkdir(exist_ok=True)
+          def j(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def b(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          p=k=False;deadline=time.time()+780;seen=set()
+          while time.time()<deadline and not(p and k):
+              z=j(base+'/messages');msgs=z if isinstance(z,list) else z.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject')!=sub or m['id'] in seen:continue
+                  seen.add(m['id']);d=j(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      x=b(urllib.parse.urljoin(base,u))
+                      if n=='payload.enc':(out/n).write_bytes(x);p=True
+                      elif n=='key.bin':(out/n).write_bytes(x);k=True
+              if not(p and k):time.sleep(3)
+          if not(p and k):raise SystemExit('TRANSPORT_FAIL')
+          print('TRANSPORT_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object mail_transport.txt
+      - name: Decrypt and bind
+        shell: powershell
+        run: |
+          $e=(Get-FileHash transport\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant(); if($e -ne $env:ENC_SHA){throw 'ENC_SHA_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in transport\payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant(); if($x -ne $env:XZ_SHA){throw 'XZ_SHA_FAIL'}
+          New-Item -ItemType Directory -Force xs,u | Out-Null;7z x -y payload.tar.xz "-o$pwd\xs" | Out-Null;$t=Get-ChildItem xs -Filter '*.tar'|Select-Object -First 1;7z x -y $t.FullName "-o$pwd\u"|Out-Null
+          $r=(Resolve-Path u\v2_semantic_payload).Path;$c=(Get-FileHash "$r\candidate.dll" -Algorithm SHA256).Hash.ToLowerInvariant();$b=(Get-FileHash "$r\c63.dll" -Algorithm SHA256).Hash.ToLowerInvariant();if($c -ne $env:CAND_SHA -or $b -ne $env:C63_SHA){throw 'BIND_FAIL'}
+          "CAND_SHA=$c`nC63_SHA=$b`nV2_BIND_PASS"|Set-Content bind.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Real GHF semantic A/B
+        shell: powershell
+        run: |
+          $r=(Resolve-Path u\v2_semantic_payload).Path;Copy-Item "$r\runtime_base" "$r\cand_rt" -Recurse;Copy-Item "$r\runtime_base" "$r\c63_rt" -Recurse;Push-Location $r
+          cl /nologo /O2 /MT /D_CRT_SECURE_NO_WARNINGS /Fe:semantic.exe semantic_smoke.c 2>&1|Tee-Object "$env:GITHUB_WORKSPACE\compile.log";if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'}
+          .\semantic.exe (Resolve-Path candidate.dll).Path (Resolve-Path c63.dll).Path (Resolve-Path cand_rt).Path (Resolve-Path c63_rt).Path (Resolve-Path testdata\01_initial_empty.ghf).Path (Resolve-Path testdata\02_supine.ghf).Path 2>&1|Tee-Object "$env:GITHUB_WORKSPACE\semantic.log";$rc=$LASTEXITCODE;Pop-Location
+          "EXIT=$rc"|Set-Content exit.txt;if($rc -ne 0){throw "SEMANTIC_FAIL_$rc"}
+          $post=(Get-FileHash u\v2_semantic_payload\candidate.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:CAND_SHA){throw 'POST_SHA_FAIL'};"V2_6CE_SEMANTIC_PASS SHA256=$post"|Set-Content V2_6CE_SEMANTIC_PASS.lock
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-6ce-semantic-${{ github.run_id }}
+          path: |
+            bind.txt
+            compile.log
+            semantic.log
+            exit.txt
+            V2_6CE_SEMANTIC_PASS.lock
+            mail_transport.txt
+          if-no-files-found: ignore
+          retention-days: 30
