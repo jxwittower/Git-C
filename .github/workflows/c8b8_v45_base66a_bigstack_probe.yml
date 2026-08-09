@@ -1,0 +1,110 @@
+name: c8b8-v4.5-base66a-bigstack-probe
+on:
+  push:
+    branches: [c8b8-v4-drive-resumable-20260809]
+    paths:
+      - '.github/workflows/c8b8_v45_base66a_bigstack_probe.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      SOURCE_RUN: '31314728589'
+      SOURCE_ARTIFACT: c8b8-v4-plaintext-xz-31314728589
+      XZ_SHA: 5a1c750b48a7d436f8ca7a011dd4d925d68891e8241a11aa42bf4bbd30afd3c0
+      XZ_BYTES: '20593840'
+      BASE_SHA: 66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c
+      PAYLOAD_ROOT: c8b8_fullreg_payload_v4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore verified checkpoint and reconstruct exact 66a
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP resume; New-Item -ItemType Directory -Force $d | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D $d
+          if($LASTEXITCODE -ne 0){ throw 'CHECKPOINT_DOWNLOAD_FAIL' }
+          $p=Get-ChildItem $d -Recurse -Filter payload.tar.xz | Select-Object -First 1
+          if(!$p){ throw 'NO_XZ' }
+          $h=(Get-FileHash $p.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $env:XZ_SHA -or $p.Length -ne [int64]$env:XZ_BYTES){ throw 'XZ_BIND_FAIL' }
+          $s=Join-Path $env:RUNNER_TEMP stage; New-Item -ItemType Directory -Force $s|Out-Null; 7z x -y $p.FullName "-o$s"|Out-Null; $t=Get-ChildItem $s -Filter *.tar|Select-Object -First 1; 7z x -y $t.FullName '-o.'|Out-Null
+          Copy-Item "$env:PAYLOAD_ROOT\SigProcDll-64HF.dll" base66a.dll
+          @'
+          from pathlib import Path
+          import hashlib
+          p=Path('base66a.dll'); b=bytearray(p.read_bytes())
+          edits={126:'04',201:'00',528:'00000000000000',536:'00',542:'00',545:'00',549:'0000',564:'00',567:'00',1545:'81ec9022',1550:'00',7684:'81ec4c21',7689:'00',18161:'81ec6881',18166:'00',28073:'81ec000f0100',120937:'81ec406f',120942:'00',134649:'81ec90d6',134654:'00',221761:'81ecc09d',221766:'00',282041:'81ec7010',282046:'00',283481:'81ec805a0200',302137:'81ec4040',302142:'00',305257:'81ec4820',305262:'00',314422:'81ece037',314427:'00'}
+          for o,h in edits.items(): b[o:o+len(bytes.fromhex(h))]=bytes.fromhex(h)
+          b=b[:440832]; p.write_bytes(b)
+          got=hashlib.sha256(b).hexdigest(); print('BASE66A_SHA='+got)
+          if got!='66a44c88e9c9bf011825077fcc67c6ddc78a439700add94574056eb67d54678c': raise SystemExit('BASE_RECONSTRUCT_FAIL')
+          '@ | Set-Content -Encoding ascii reconstruct_base.py
+          python reconstruct_base.py | Tee-Object base_reconstruct.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build exact real-frame probe with 32MB reserve and commit
+        shell: powershell
+        run: |
+          @'
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #define SB 0x105c
+          #define RB 0x786
+          typedef struct Sample4{int16_t lane[4];}Sample4;
+          typedef uint32_t (__stdcall *PProc)(const uint32_t*,const Sample4*,int,void*,void*,void*);
+          typedef int (__stdcall *PInit)(char*,void*); typedef unsigned char (__stdcall *PStat)(void); typedef void (__stdcall *PFini)(void);
+          typedef struct {uint32_t n;uint16_t tl;char ts[128];uint32_t*ids;Sample4*s;} Frame;
+          static unsigned char lic[34]={6,0,0,0,171,16,21,14,16,26,84,22,23,21,22,157,31,29,15,229,88,92,94,96,96,100,102,111,56,26,95,75,182,33};
+          static uint16_t rd16(const unsigned char*p,size_t o){return (uint16_t)(p[o]|((uint16_t)p[o+1]<<8));}
+          static int fr(FILE*f,Frame*x){uint32_t n;uint16_t tl;memset(x,0,sizeof(*x));if(fread(&n,4,1,f)!=1)return feof(f)?0:-1;if(fread(&tl,2,1,f)!=1||!n||!tl||tl>=128)return -1;x->n=n;x->tl=tl;if(fread(x->ts,1,tl,f)!=tl)return -1;x->ts[tl]=0;x->ids=(uint32_t*)malloc(n*4);x->s=(Sample4*)malloc(n*sizeof(Sample4));if(!x->ids||!x->s)return -1;if(fread(x->ids,4,n,f)!=n||fread(x->s,sizeof(Sample4),n,f)!=n)return -1;return 1;}
+          static void ff(Frame*x){free(x->ids);free(x->s);memset(x,0,sizeof(*x));}
+          static int cp(const char*src,const char*dst){FILE*a=fopen(src,"rb"),*b;if(!a)return 0;b=fopen(dst,"wb");if(!b){fclose(a);return 0;}char q[65536];size_t n;while((n=fread(q,1,sizeof(q),a))>0)if(fwrite(q,1,n,b)!=n){fclose(a);fclose(b);return 0;}fclose(a);fclose(b);return 1;}
+          static int runtime(const char*root){const char*n[]={"filter_brth","filter_hrt3","file_sig","file_bed_model_v1","file_bias"};char p[1024];for(int i=0;i<5;i++){snprintf(p,sizeof(p),"%s\\inner-bed\\%s",root,n[i]);if(!cp(p,n[i]))return 0;}return 1;}
+          static int runone(const char*dll,const char*label,const char*data,const char*rt){
+            if(!runtime(rt)){printf("%s RUNTIME_FAIL\n",label);return 0;}HMODULE h=LoadLibraryA(dll);if(!h){printf("%s LOAD_FAIL gle=%lu\n",label,GetLastError());return 0;}
+            PInit init=(PInit)GetProcAddress(h,"_SigProc_Init@8");PProc proc=(PProc)GetProcAddress(h,"_SigProc@24");PStat stat=(PStat)GetProcAddress(h,"_SigProc_Stat@0");PFini fini=(PFini)GetProcAddress(h,"_SigProc_Fini@0");if(!init||!proc||!stat||!fini){printf("%s EXPORT_FAIL\n",label);return 0;}
+            char prod[256]={0};unsigned char st[SB],re[RB];memset(st,0,sizeof(st));memset(re,0,sizeof(re));if(!init(prod,lic)||stat()!=1){printf("%s INIT_FAIL\n",label);return 0;}printf("PROBE_BEGIN label=%s product=%s\n",label,prod);
+            char p[1024];snprintf(p,sizeof(p),"%s\\inner-bed\\01_initial_empty.ghf",data);FILE*f=fopen(p,"rb");Frame x;int r;unsigned k=0;if(!f)return 0;
+            while((r=fr(f,&x))==1){memset(st,0,sizeof(st));memset(re,0,sizeof(re));if(!proc(x.ids,x.s,(int)x.n,0,st,re)){printf("%s PROC_EMPTY_FAIL k=%u\n",label,k);return 0;}ff(&x);k++;}fclose(f);if(r<0)return 0;
+            printf("AFTER_EMPTY label=%s frames=%u main=%u hr=%u rr=%u hs=%u rs=%u\n",label,k,(unsigned)st[0x404],(unsigned)rd16(st,2),(unsigned)rd16(st,0),(unsigned)st[0xeb8],(unsigned)st[0xeaa]);
+            snprintf(p,sizeof(p),"%s\\inner-bed\\02_supine.ghf",data);f=fopen(p,"rb");if(!f)return 0;unsigned nz=0,vh=0,vr=0,firstnz=9999,firsthr=9999,firstrr=9999;k=0;
+            while(k<80&&(r=fr(f,&x))==1){memset(st,0,sizeof(st));memset(re,0,sizeof(re));if(!proc(x.ids,x.s,(int)x.n,0,st,re)){printf("%s PROC_SUPINE_FAIL k=%u\n",label,k);return 0;}unsigned m=st[0x404],hr=rd16(st,2),rr=rd16(st,0);if(m){nz++;if(firstnz==9999)firstnz=k;}if(hr!=65535){vh++;if(firsthr==9999)firsthr=k;}if(rr!=65535){vr++;if(firstrr==9999)firstrr=k;}if(k<5||k==10||k==20||k==40||k==79)printf("FRAME label=%s k=%u main=%u hr=%u rr=%u hs=%u rs=%u\n",label,k,m,hr,rr,(unsigned)st[0xeb8],(unsigned)st[0xeaa]);ff(&x);k++;}fclose(f);
+            printf("PROBE_RESULT label=%s supine_frames=%u nonzero=%u firstNZ=%u validHR=%u firstHR=%u validRR=%u firstRR=%u finalMain=%u finalHR=%u finalRR=%u\n",label,k,nz,firstnz,vh,firsthr,vr,firstrr,(unsigned)st[0x404],(unsigned)rd16(st,2),(unsigned)rd16(st,0));fini();FreeLibrary(h);return 1;}
+          int main(int ac,char**av){if(ac!=4){fprintf(stderr,"usage probe payloadroot data runtime\n");return 2;}char c63[1024];snprintf(c63,sizeof(c63),"%s\\C63.dll",av[1]);int ok=1;ok&=runone(c63,"C63",av[2],av[3]);ok&=runone("base66a.dll","BASE66A_BIGSTACK",av[2],av[3]);return ok?0:1;}
+          '@ | Set-Content -Encoding ascii base66a_probe.c
+          cmd.exe /d /c "cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:base66a_probe.exe base66a_probe.c /link /STACK:33554432,33554432 > base66a_probe_compile.txt 2>&1"
+          $rc=$LASTEXITCODE; Get-Content base66a_probe_compile.txt; if($rc -ne 0){ throw "COMPILE_FAIL $rc" }
+          dumpbin /headers base66a_probe.exe | Select-String -Pattern 'size of stack reserve|size of stack commit' | Set-Content -Encoding ascii stack_header.txt
+          Get-Content stack_header.txt
+      - name: Run C63 versus unmodified 66a on fully committed stack
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'; $r=(Resolve-Path $env:PAYLOAD_ROOT).Path
+          cmd.exe /d /c "base66a_probe.exe $r $r\testdata $r\runtime > base66a_bigstack_probe.log 2>&1"; $rc=$LASTEXITCODE
+          Get-Content base66a_bigstack_probe.log; "PROBE_EXIT=$rc" | Tee-Object base66a_probe_exit.txt
+          if($rc -ne 0){ throw "PROBE_FAIL $rc" }
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v45-base66a-bigstack-${{ github.run_id }}
+          path: |
+            base_reconstruct.txt
+            stack_header.txt
+            base66a_probe.c
+            base66a_probe_compile.txt
+            base66a_bigstack_probe.log
+            base66a_probe_exit.txt
+          if-no-files-found: ignore
+          retention-days: 30
