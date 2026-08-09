@@ -1,0 +1,13 @@
+name: c8b8-drive-native-fullreg-v3
+on:
+  push:
+    branches: [c8b8-drive-fullreg-20260809]
+    paths: ['.github/workflows/c8b8_drive_fullreg_v3.yml']
+permissions:
+  contents: read
+jobs:
+  registry:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo registered
