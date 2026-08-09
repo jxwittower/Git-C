@@ -1,0 +1,190 @@
+name: c8b8-final-release-gate-v3
+on:
+  push:
+    branches: [c8b8-final-release-gate-20260809]
+    paths:
+      - '.github/workflows/c8b8_final_release_gate_v3.yml'
+permissions:
+  contents: write
+jobs:
+  final-release-v3:
+    runs-on: windows-2022
+    timeout-minutes: 110
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      ENC_SHA: 3cbe4e8339d3f934a1766a66e48a6ca794c32a262f768f43e6b9548d5276b5d9
+      XZ_SHA: eace407afd906df9409b8e5e8c116d0f6a6e47ec398c19034b2981f1fbf8d93b
+      GHF_COUNT: '13'
+      GHF_BYTES: '82484656'
+      HANDOFF_BRANCH: c8b8-final-release-gate-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish V3 body-mailbox and RSA key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def rq(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();h={'Accept':'application/json'}
+              if data is not None:h['Content-Type']='application/json'
+              if token:h['Authorization']='Bearer '+token
+              with urllib.request.urlopen(urllib.request.Request(url,data=data,method=method,headers=h),timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=rq('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('MAIL_DOMAIN_FAIL')
+          a=string.ascii_lowercase+string.digits;addr='ghc8body'+''.join(secrets.choice(a) for _ in range(15))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          rq('POST',base+'/accounts',{'address':addr,'password':pw});tok=rq('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail_v3.json').write_text(json.dumps({'address':addr,'token':tok}));Path('mailbox_v3.txt').write_text(addr+'\n');Path('subject_v3.txt').write_text('GuanHu-C8B8-BODY-'+os.environ['GITHUB_RUN_ID']+'\n');print('V3_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mail_v3.py
+          python $env:RUNNER_TEMP\mail_v3.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private_v3.pem;if($LASTEXITCODE -ne 0){throw 'RSA_GEN_FAIL'}
+          openssl pkey -in $env:RUNNER_TEMP\private_v3.pem -pubout -out public_v3.pem;if($LASTEXITCODE -ne 0){throw 'RSA_PUB_FAIL'}
+          New-Item -ItemType Directory -Force .c8b8_final_v3_handoff|Out-Null;Copy-Item mailbox_v3.txt,subject_v3.txt,public_v3.pem .c8b8_final_v3_handoff\ -Force
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_final_v3_handoff;git commit -m "Publish c8b8 final V3 body handoff";if($LASTEXITCODE -ne 0){throw 'HANDOFF_COMMIT_FAIL'};git push origin "HEAD:$env:HANDOFF_BRANCH";if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+
+      - name: Receive four ciphertext bodies and wrapped key body
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import base64,json,os,re,time,urllib.request
+          from pathlib import Path
+          c=json.loads(Path(os.environ['RUNNER_TEMP'],'mail_v3.json').read_text());tok=c['token'];base='https://api.mail.tm';prefix=Path('subject_v3.txt').read_text().strip();want={f'{prefix}-P{i}':i for i in range(1,5)};out=Path('body_transport');out.mkdir(exist_ok=True);got=set();key=False
+          def j(u):
+              r=urllib.request.Request(u,headers={'Accept':'application/json','Authorization':'Bearer '+tok});
+              with urllib.request.urlopen(r,timeout=60) as x:return json.load(x)
+          end=time.time()+1500
+          while time.time()<end and (len(got)<4 or not key):
+              q=j(base+'/messages');items=q if isinstance(q,list) else q.get('hydra:member',[])
+              for x in items:
+                  s=x.get('subject','')
+                  if s not in want:continue
+                  i=want[s];d=j(base+'/messages/'+x['id']);txt=d.get('text','')
+                  if isinstance(txt,list):txt='\n'.join(txt)
+                  if not isinstance(txt,str):continue
+                  md=re.search(r'(?m)^DATA=([A-Za-z0-9+/=]+)\s*$',txt)
+                  if md:
+                      try:z=base64.b64decode(md.group(1),validate=True)
+                      except Exception:continue
+                      if len(z)>0:(out/f'c8b8_payload_part{i}.bin').write_bytes(z);got.add(i)
+                  mk=re.search(r'(?m)^KEY=([A-Za-z0-9+/=]+)\s*$',txt)
+                  if mk:
+                      try:k=base64.b64decode(mk.group(1),validate=True)
+                      except Exception:continue
+                      if len(k)==384:(out/'c8b8_wrapped_key.bin').write_bytes(k);key=True
+              if len(got)<4 or not key:time.sleep(4)
+          if len(got)!=4 or not key:raise SystemExit(f'BODY_TRANSPORT_FAIL parts={sorted(got)} key={key}')
+          print('V3_BODY_TRANSPORT_PASS',sorted(got),key)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv_v3.py
+          python $env:RUNNER_TEMP\recv_v3.py 2>&1|Tee-Object transport_v3.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: V3 crypto exact binding
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$enc=Join-Path $env:RUNNER_TEMP payload_v3.enc;$o=[IO.File]::Create($enc);try{1..4|%{$s=[IO.File]::OpenRead("body_transport\c8b8_payload_part$_.bin");try{$s.CopyTo($o)}finally{$s.Dispose()}}}finally{$o.Dispose()};$h=(Get-FileHash $enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"};$pass=Join-Path $env:RUNNER_TEMP pass_v3.txt;$xz=Join-Path $env:RUNNER_TEMP payload_v3.tar.xz;openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private_v3.pem -in body_transport\c8b8_wrapped_key.bin -out $pass -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256;if($LASTEXITCODE -ne 0){throw 'UNWRAP_FAIL'};openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $enc -out $xz -pass "file:$pass";if($LASTEXITCODE -ne 0){throw 'DECRYPT_FAIL'};$x=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"};"ENC=$h`nXZ=$x"|Set-Content crypto_v3.txt
+
+      - name: V3 Python extract and manifest bind
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib,os,re,shutil,tarfile
+          from pathlib import Path
+          root=Path('payload');shutil.rmtree(root,ignore_errors=True);root.mkdir();xz=Path(os.environ['RUNNER_TEMP'])/'payload_v3.tar.xz'
+          with tarfile.open(xz,'r:xz') as t:t.extractall(root)
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
+              return h.hexdigest()
+          for n,e in {'SigProcDll-64HF.dll':os.environ['CAND_SHA'],'HostCompat.dll':os.environ['HOST_SHA'],'C63.dll':os.environ['C63_SHA'],'SigProcLoaderContractSmoke.exe':os.environ['SMOKE_SHA']}.items():
+              p=root/n
+              if not p.is_file() or sha(p)!=e:raise SystemExit('EXACT_BINARY_FAIL '+n)
+          ok=0
+          for line in (root/'MANIFEST.sha256').read_text().splitlines():
+              m=re.match(r'^([0-9a-f]{64})  (.+)$',line)
+              if not m:continue
+              rel=m.group(2)[2:] if m.group(2).startswith('./') else m.group(2);p=root/rel
+              if not p.is_file() or sha(p)!=m.group(1):raise SystemExit('MANIFEST_FAIL '+rel)
+              ok+=1
+          ghf=list((root/'testdata').rglob('*.ghf'));b=sum(x.stat().st_size for x in ghf)
+          if len(ghf)!=int(os.environ['GHF_COUNT']) or b!=int(os.environ['GHF_BYTES']):raise SystemExit(f'GHF_FAIL {len(ghf)} {b}')
+          Path('asset_v3.txt').write_text(f'MANIFEST={ok}\nGHF={len(ghf)}\nBYTES={b}\nSHA={os.environ["CAND_SHA"]}\n');print('V3_ASSET_PASS',ok,len(ghf),b)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\asset_v3.py
+          python $env:RUNNER_TEMP\asset_v3.py 2>&1|Tee-Object asset_v3.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: V3 static ABI stack and loader gates
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';dumpbin /headers payload\SigProcDll-64HF.dll|Out-File hdr_v3.txt;dumpbin /exports payload\SigProcDll-64HF.dll|Out-File exp_v3.txt;dumpbin /dependents payload\SigProcDll-64HF.dll|Out-File dep_v3.txt;dumpbin /dependents payload\HostCompat.dll|Out-File hostdep_v3.txt
+          @'
+          import re,struct
+          from pathlib import Path
+          h=Path('hdr_v3.txt').read_text(errors='ignore');e=Path('exp_v3.txt').read_text(errors='ignore')
+          if not re.search(r'(?i)14C machine|machine \(x86\)',h) or '.stkfix' not in h:raise SystemExit('PE_GATE')
+          for x in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if x not in e:raise SystemExit('EXPORT '+x)
+          def deps(p):return {x.lower() for x in re.findall(r'(?im)^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path(p).read_text(errors='ignore'))}
+          c=deps('dep_v3.txt');hb=deps('hostdep_v3.txt')
+          if 'ucrtbase.dll' in c or c-hb:raise SystemExit('IMPORT_GATE '+repr(c-hb))
+          b=Path('payload/SigProcDll-64HF.dll').read_bytes();pe=struct.unpack_from('<I',b,0x3c)[0];n=struct.unpack_from('<H',b,pe+6)[0];osz=struct.unpack_from('<H',b,pe+20)[0];s0=pe+24+osz
+          for i in range(n):
+              o=s0+40*i;rs=struct.unpack_from('<I',b,o+16)[0];rp=struct.unpack_from('<I',b,o+20)[0];ch=struct.unpack_from('<I',b,o+36)[0]
+              if ch&0x20000000:
+                  for p in range(rp,rp+rs-6):
+                      if b[p:p+2]==b'\x81\xec' and 0x1000<=struct.unpack_from('<I',b,p+2)[0]<0x100000:raise SystemExit('UNSAFE_STACK')
+          print('V3_STATIC_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\static_v3.py
+          python $env:RUNNER_TEMP\static_v3.py;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          foreach($bed in @('inner-bed','outer-medical-bed')){$tag=if($bed -eq 'inner-bed'){'inner'}else{'outer'};$d="smoke_body_$tag";New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item payload\SigProcDll-64HF.dll,payload\SigProcLoaderContractSmoke.exe $d -Force;Copy-Item "payload\runtime\$bed\*" $d -Force;Push-Location $d;& .\SigProcLoaderContractSmoke.exe 2>&1|Tee-Object "..\loader_v3_$tag.log";$rc=$LASTEXITCODE;Pop-Location;if($rc -ne 0 -or (Get-Content "loader_v3_$tag.log" -Raw)-notmatch 'ALL_LOADER_CONTRACT_TESTS_PASS'){throw "LOADER_$tag`_FAIL"}}
+
+      - name: V3 compile and execute complete native Windows regression
+        shell: powershell
+        timeout-minutes: 80
+        run: |
+          $ErrorActionPreference='Stop';cl /nologo /O2 /W3 /MT /D_CRT_SECURE_NO_WARNINGS payload\fullreg.c /Fe:payload\fullreg.exe 2>&1|Tee-Object compile_v3.log;if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'};$c=(Resolve-Path payload\SigProcDll-64HF.dll).Path;$h=(Resolve-Path payload\HostCompat.dll).Path;$b=(Resolve-Path payload\C63.dll).Path;$t=(Resolve-Path payload\testdata).Path;$r=(Resolve-Path payload\runtime).Path;& .\payload\fullreg.exe $c $h $b $t $r 2>&1|Tee-Object fullreg_v3.log;$rc=$LASTEXITCODE;"EXIT=$rc"|Set-Content fullreg_v3_exit.txt;if($rc -ne 0){throw "FULLREG_EXIT_$rc"};$s=Get-Content fullreg_v3.log -Raw;foreach($m in @('BASELINE_CONTRACTS_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','FULL_DATA_PERFORMANCE_PASS','DETERMINISTIC_REPLAY_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){if($s -notmatch [regex]::Escape($m)){throw "MARKER $m"}};$q=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($q -ne $env:CAND_SHA){throw 'SHA_DRIFT'};"V3_FINAL_PASS`nSHA=$q"|Set-Content C8B8_FINAL_V3_PASS.lock
+
+      - name: V3 final ZIP audit
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';New-Item -ItemType Directory -Force release_v3|Out-Null;Copy-Item payload\SigProcDll-64HF.dll release_v3\SigProcDll-64HF.dll -Force;"$env:CAND_SHA  SigProcDll-64HF.dll"|Set-Content release_v3\RELEASE_SHA256SUMS.txt;Copy-Item fullreg_v3.log release_v3\full_regression.log;"WINDOWS_NATIVE_FULLREG_PASS`nSHA=$env:CAND_SHA"|Set-Content release_v3\PASS.txt;$zip='GuanHu_SigProc_Final_Release_20260809.zip';Remove-Item $zip -Force -ErrorAction SilentlyContinue;Compress-Archive release_v3\* $zip -CompressionLevel Optimal;Remove-Item audit_v3 -Recurse -Force -ErrorAction SilentlyContinue;Expand-Archive $zip audit_v3 -Force;$p='audit_v3\SigProcDll-64HF.dll';$a=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant();$o=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if((Get-Item $p).Length -ne 441344 -or $a -ne $env:CAND_SHA -or $a -ne $o){throw "PACKAGE_AUDIT_FAIL $o $a"};"PACKAGE_AUDIT_PASS`nTESTED_SHA=$o`nEXTRACTED_SHA=$a`nDLL_BYTES=441344`nZIP_BYTES=$((Get-Item $zip).Length)"|Set-Content package_v3_audit.txt
+
+      - name: V3 persist PASS
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';New-Item -ItemType Directory -Force .c8b8_final_v3_release|Out-Null;Copy-Item C8B8_FINAL_V3_PASS.lock,package_v3_audit.txt .c8b8_final_v3_release\ -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_final_v3_release;git commit -m "Record c8b8 final V3 release PASS";if($LASTEXITCODE -ne 0){throw 'PASS_COMMIT_FAIL'};git push origin "HEAD:$env:HANDOFF_BRANCH";if($LASTEXITCODE -ne 0){throw 'PASS_PUSH_FAIL'}
+
+      - name: V3 upload tested release
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guanhu-c8b8-final-v3-${{ github.run_id }}
+          path: |
+            GuanHu_SigProc_Final_Release_20260809.zip
+            release_v3/SigProcDll-64HF.dll
+            C8B8_FINAL_V3_PASS.lock
+            package_v3_audit.txt
+            asset_v3.txt
+            crypto_v3.txt
+            transport_v3.log
+            asset_v3.log
+            loader_v3_inner.log
+            loader_v3_outer.log
+            compile_v3.log
+            fullreg_v3.log
+            fullreg_v3_exit.txt
+          if-no-files-found: ignore
+          retention-days: 14
