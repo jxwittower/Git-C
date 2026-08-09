@@ -1,0 +1,47 @@
+name: c63-authoritative-probe
+on:
+  push:
+    branches: [c63-authoritative-probe-20260809]
+    paths:
+      - '.github/workflows/c63_authoritative_probe.yml'
+permissions:
+  actions: read
+  contents: read
+env:
+  C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+  CHECKPOINT_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+jobs:
+  mode:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [static_loader, baseline, sentinel, long, threads, full, determinism, realtime]
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: c8b8-decrypted-fullreg-xz-31310246212
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31310246212
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Run exact C63 mode
+        shell: powershell
+        run: |
+          & .\tools\c63_probe_mode.ps1 -Mode '${{ matrix.mode }}'
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c63-${{ matrix.mode }}-${{ github.run_id }}
+          path: |
+            mode_pass.txt
+            *.log
+            *.txt
+          if-no-files-found: ignore
+          retention-days: 30
