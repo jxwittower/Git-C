@@ -1,0 +1,269 @@
+name: hostcompat-native-rebuild-x86-quick-gate
+on:
+  push:
+    branches: [hostcompat-native-rebuild-gate-20260809]
+    paths:
+      - '.github/workflows/hostcompat_native_rebuild_quick_gate.yml'
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SOURCE_SHA: 3f9e069966a0fed13d7c0265da91fa3dfd37fd90cf60acb3572ef6232daa9439
+  SOURCE_BYTES: '179556'
+  TEST_RUN: '31302120039'
+  TEST_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  HARNESS_RUN: '31302697175'
+  HARNESS_ARTIFACT: c8b8-v3-resume-stageC-virtual1hz-31302697175
+  BRANCH: hostcompat-native-rebuild-gate-20260809
+jobs:
+  build_and_quick_gate:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore immutable GHF/runtime test assets and known-good semantic harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force testpayload,harness | Out-Null
+          gh run download $env:TEST_RUN --repo $env:GITHUB_REPOSITORY --name $env:TEST_ARTIFACT --dir testpayload
+          gh run download $env:HARNESS_RUN --repo $env:GITHUB_REPOSITORY --name $env:HARNESS_ARTIFACT --dir harness
+          if($LASTEXITCODE -ne 0){throw 'TEST_ASSET_RESTORE_FAIL'}
+          if(!(Test-Path testpayload\testdata\outer-medical-bed\02_supine.ghf)){throw 'GHF_MISSING'}
+          if(!(Test-Path harness\HostReplayWinVirtualFixed.c)){throw 'HARNESS_MISSING'}
+
+      - name: Publish three-part source mailbox
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',d.get('member',[]))
+          if not m:raise SystemExit('NO_MAIL_DOMAIN')
+          alpha=string.ascii_lowercase+string.digits
+          addr='ghnative'+''.join(secrets.choice(alpha) for _ in range(16))+'@'+m[0]['domain']
+          pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(36))
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}))
+          Path('source_mailbox.txt').write_text(addr+'\n');Path('source_subject.txt').write_text('GuanHu-NativeSrc-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('SOURCE_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          New-Item -ItemType Directory -Force .native_rebuild_handoff | Out-Null
+          Copy-Item source_mailbox.txt,source_subject.txt .native_rebuild_handoff\ -Force
+          @("SOURCE_SHA=$env:SOURCE_SHA","SOURCE_BYTES=$env:SOURCE_BYTES",'PARTS=3') | Set-Content .native_rebuild_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .native_rebuild_handoff
+          git commit -m "Publish native HostCompat source mailbox"
+          git push origin "HEAD:$env:BRANCH"
+
+      - name: Receive source bundle as three plain-text base64 parts
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import base64,json,os,re,time,urllib.request
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';pre=Path('source_subject.txt').read_text().strip()
+          wanted={f'{pre}-P{i}':i for i in range(1,4)};got={};seen=set();deadline=time.time()+420
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          while time.time()<deadline and len(got)<3:
+              q=gj(base+'/messages');items=q if isinstance(q,list) else q.get('hydra:member',q.get('member',[]))
+              for m in items:
+                  mid=m.get('id');sub=m.get('subject','')
+                  if not mid or mid in seen or sub not in wanted:continue
+                  seen.add(mid);d=gj(base+'/messages/'+mid);txt=d.get('text','') or ''
+                  if isinstance(txt,list):txt='\n'.join(txt)
+                  b=''.join(re.findall(r'[A-Za-z0-9+/=]+',txt))
+                  if len(b)<60000:continue
+                  got[wanted[sub]]=b;print('GOT_SOURCE_PART',wanted[sub],len(b))
+              if len(got)<3:time.sleep(2)
+          if len(got)!=3:raise SystemExit('SOURCE_TRANSPORT_INCOMPLETE '+repr(sorted(got)))
+          s=''.join(got[i] for i in range(1,4));Path('source.b64').write_text(s);Path('source.tar.xz').write_bytes(base64.b64decode(s,validate=True))
+          print('SOURCE_ASSEMBLED chars=%d bytes=%d'%(len(s),Path('source.tar.xz').stat().st_size))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recvsrc.py
+          python $env:RUNNER_TEMP\recvsrc.py | Tee-Object source_transport.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $h=(Get-FileHash source.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();$n=(Get-Item source.tar.xz).Length
+          if($h -ne $env:SOURCE_SHA -or "$n" -ne $env:SOURCE_BYTES){throw "SOURCE_BIND_FAIL SHA=$h BYTES=$n"}
+          New-Item -ItemType Directory -Force src | Out-Null
+          7z x -y source.tar.xz | Out-Null
+          7z x -y source.tar -osrc | Out-Null
+          if(!(Test-Path src\sigproc_rebuild_win.c)){throw 'CORE_SOURCE_MISSING'}
+          if(!(Test-Path src\sigproc_dll_hostcompat.c)){throw 'WRAPPER_SOURCE_MISSING'}
+          @("SOURCE_SHA=$h","SOURCE_BYTES=$n",'SOURCE_BINDING_PASS') | Set-Content source_binding.txt
+
+      - name: Adapt only DLL entry-point spelling for MSVC CRT startup
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p='src\sigproc_dll_hostcompat.c'
+          $s=Get-Content $p -Raw
+          $old='int SP_STDCALL DllMainCRTStartup(void *h, unsigned long reason, void *reserved)'
+          $new='int SP_STDCALL DllMain(void *h, unsigned long reason, void *reserved)'
+          if(-not $s.Contains($old)){throw 'DLLMAIN_PATCH_NEEDLE_MISSING'}
+          $s=$s.Replace($old,$new)
+          [IO.File]::WriteAllText((Resolve-Path $p),$s,(New-Object Text.UTF8Encoding($false)))
+          'ONLY_SOURCE_ADAPTATION=DllMainCRTStartup_to_DllMain' | Set-Content source_adaptation.txt
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native MSVC x86 compile and link with compiler-generated stack probes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location src
+          try {
+            cl /nologo /c /O2 /W3 /MD /GS- /std:c11 /D_CRT_SECURE_NO_WARNINGS /DSP_MINIMAL_WINDOWS /TC sigproc_rebuild_win.c sha256_portable.c sigproc_dll_hostcompat.c *> ..\compile.log
+            $crc=$LASTEXITCODE
+            if($crc -ne 0){Get-Content ..\compile.log;throw "COMPILE_FAIL RC=$crc"}
+            link /nologo /DLL /MACHINE:X86 /INCREMENTAL:NO /OPT:REF /OUT:..\SigProcDll-64HF-native.dll /DEF:SigProcStandalone.def sigproc_rebuild_win.obj sha256_portable.obj sigproc_dll_hostcompat.obj kernel32.lib *> ..\link.log
+            $lrc=$LASTEXITCODE
+            if($lrc -ne 0){Get-Content ..\link.log;throw "LINK_FAIL RC=$lrc"}
+          } finally { Pop-Location }
+          Get-Content compile.log,link.log
+          if(!(Test-Path SigProcDll-64HF-native.dll)){throw 'NATIVE_DLL_MISSING'}
+          $sha=(Get-FileHash SigProcDll-64HF-native.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("NATIVE_DLL_SHA=$sha","BYTES=$((Get-Item SigProcDll-64HF-native.dll).Length)",'BUILD=MSVC_X86_NATIVE','BINARY_POST_PATCH=NONE') | Set-Content native_build_binding.txt
+          Get-Content native_build_binding.txt
+
+      - name: Static PE ABI import and stack-probe safety gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers SigProcDll-64HF-native.dll | Out-File native_headers.txt
+          dumpbin /exports SigProcDll-64HF-native.dll | Out-File native_exports.txt
+          dumpbin /dependents SigProcDll-64HF-native.dll | Out-File native_dependents.txt
+          dumpbin /dependents testpayload\HostCompat.dll | Out-File hostcompat_dependents.txt
+          if(-not(Select-String -Path native_headers.txt -Pattern 'machine (x86)' -SimpleMatch -Quiet)){throw 'NOT_X86'}
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String -Path native_exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "EXPORT_FAIL $e"}}
+          @'
+          from pathlib import Path
+          import re,struct
+          def deps(p):return {x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path(p).read_text(errors='ignore'),re.M|re.I)}
+          c=deps('native_dependents.txt');h=deps('hostcompat_dependents.txt')
+          if 'ucrtbase.dll' in c:raise SystemExit('DIRECT_UCRTBASE_FORBIDDEN')
+          extra=sorted(c-h)
+          if extra:raise SystemExit('IMPORTS_NOT_HOSTCOMPAT_SUBSET '+repr(extra))
+          b=Path('SigProcDll-64HF-native.dll').read_bytes();u16=lambda o:struct.unpack_from('<H',b,o)[0];u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c);n=u16(pe+6);osz=u16(pe+20);s0=pe+24+osz;bad=[]
+          for i in range(n):
+              o=s0+40*i;name=b[o:o+8].split(b'\0',1)[0].decode('ascii','ignore');rs=u32(o+16);rp=u32(o+20);ch=u32(o+36)
+              if ch&0x20000000:
+                  for off in range(rp,max(rp,rp+rs-6)):
+                      if b[off:off+2]==b'\x81\xec':
+                          imm=u32(off+2)
+                          if 0x1000<=imm<0x100000:bad.append((name,off,imm))
+          if bad:raise SystemExit('UNSAFE_DIRECT_LARGE_STACK '+repr(bad))
+          Path('static_gate.txt').write_text('PE32_X86_PASS\nEXPORTS_PASS\nNO_DIRECT_UCRTBASE\nIMPORT_SUBSET_HOSTCOMPAT_PASS\nUNSAFE_DIRECT_LARGE_STACK=0\nNATIVE_COMPILER_STACK_PROBE_GATE_PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\static_gate.py
+          python $env:RUNNER_TEMP\static_gate.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Dual inner/outer loader contract before semantic gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          function RunLoader([string]$runtime,[string]$name){
+            $d=Join-Path $env:RUNNER_TEMP $name
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item "$runtime\*" $d -Force
+            Copy-Item SigProcDll-64HF-native.dll "$d\SigProcDll-64HF.dll" -Force
+            Copy-Item testpayload\SigProcLoaderContractSmoke.exe "$d\SigProcLoaderContractSmoke.exe" -Force
+            $out="$env:GITHUB_WORKSPACE\$name.stdout";$err="$env:GITHUB_WORKSPACE\$name.stderr";$log="$env:GITHUB_WORKSPACE\$name.log"
+            $p=Start-Process -FilePath "$d\SigProcLoaderContractSmoke.exe" -WorkingDirectory $d -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            Get-Content $out,$err | Set-Content $log
+            Get-Content $log
+            if($p.ExitCode -ne 0){throw "$name RC=$($p.ExitCode)"}
+            if(-not(Select-String -Path $log -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw "$name MARKER_MISSING"}
+          }
+          RunLoader 'testpayload\runtime_inner' 'loader_inner'
+          RunLoader 'testpayload\runtime_outer' 'loader_outer'
+          'DUAL_LOADER_CONTRACT_PASS' | Set-Content loader_gate.txt
+
+      - name: Build known-good diagnostic harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS harness\HostReplayWinVirtualFixed.c /Fe:diag.exe *> harness_build.log
+          if($LASTEXITCODE -ne 0){Get-Content harness_build.log;throw 'HARNESS_BUILD_FAIL'}
+
+      - name: Native 800-frame semantic health gate against C63 onset window
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP native_semantic;New-Item -ItemType Directory -Force $d|Out-Null
+          Copy-Item testpayload\runtime_outer\* $d -Force
+          Copy-Item SigProcDll-64HF-native.dll "$d\SigProcDll-64HF.dll" -Force
+          $g0=(Resolve-Path 'testpayload\testdata\outer-medical-bed\01_initial_empty.ghf').Path
+          $g1=(Resolve-Path 'testpayload\testdata\outer-medical-bed\02_supine.ghf').Path
+          $args=@('--dll','.\SigProcDll-64HF.dll','--mode','replay','--ghf',$g0,'--ghf',$g1,'--max-frames','800','--out',"$env:GITHUB_WORKSPACE\native_800.csv",'--virtual-1hz')
+          $p=Start-Process -FilePath "$env:GITHUB_WORKSPACE\diag.exe" -ArgumentList $args -WorkingDirectory $d -Wait -PassThru -RedirectStandardOutput native_800.stdout -RedirectStandardError native_800.stderr
+          Get-Content native_800.stdout,native_800.stderr | Set-Content native_800.log
+          Get-Content native_800.log
+          if($p.ExitCode -ne 0){throw "NATIVE_REPLAY_RC=$($p.ExitCode)"}
+          @'
+          import csv,collections
+          R=list(csv.DictReader(open('native_800.csv',newline='')));S=[int(r['state']) for r in R];H=[int(r['hr']) for r in R];Q=[int(r['rr']) for r in R]
+          valid=lambda x:0<x<1000 and x!=65535;C=collections.Counter(S);nz=[i for i,x in enumerate(S) if x];vh=[i for i,x in enumerate(H) if valid(x)];vr=[i for i,x in enumerate(Q) if valid(x)]
+          open('semantic_summary.txt','w').write('STATE_COUNTS=%r\nFIRST_NONZERO=%s\nFIRST_VALID_HR=%s\nFIRST_VALID_RR=%s\nVALID_HR=%d\nVALID_RR=%d\n'%(dict(C),nz[0] if nz else 'NONE',vh[0] if vh else 'NONE',vr[0] if vr else 'NONE',len(vh),len(vr)))
+          print(open('semantic_summary.txt').read())
+          if len(R)!=800 or C[1]<100 or len(vh)<100 or len(vr)<100:raise SystemExit('SEMANTIC_VOLUME_FAIL')
+          if not nz or not(600<=nz[0]<=700):raise SystemExit('OCCUPANCY_ONSET_FAIL')
+          if not vh or vh[0]>720 or not vr or vr[0]>720:raise SystemExit('VITAL_ONSET_FAIL')
+          print('NATIVE_REBUILD_800_FRAME_SEMANTIC_PASS')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\semantic.py
+          python $env:RUNNER_TEMP\semantic.py | Tee-Object semantic_validation.log
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $sha=(Get-FileHash SigProcDll-64HF-native.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @('HOSTCOMPAT_NATIVE_REBUILD_QUICK_PASS',"SHA256=$sha",'BINARY_POST_PATCH=NONE','COMPILER_STACK_PROBE_GATE=PASS','DUAL_LOADER=PASS','800_FRAME_SEMANTIC=PASS','POST_TEST_SHA_MATCH=PASS') | Set-Content NATIVE_REBUILD_QUICK_PASS.lock
+
+      - name: Persist native-built candidate and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hostcompat-native-rebuild-quick-${{ github.run_id }}
+          path: |
+            SigProcDll-64HF-native.dll
+            source_binding.txt
+            source_adaptation.txt
+            compile.log
+            link.log
+            native_build_binding.txt
+            native_headers.txt
+            native_exports.txt
+            native_dependents.txt
+            hostcompat_dependents.txt
+            static_gate.txt
+            loader_inner.log
+            loader_outer.log
+            loader_gate.txt
+            harness_build.log
+            native_800.log
+            native_800.csv
+            semantic_summary.txt
+            semantic_validation.log
+            NATIVE_REBUILD_QUICK_PASS.lock
+          if-no-files-found: error
+          retention-days: 30
