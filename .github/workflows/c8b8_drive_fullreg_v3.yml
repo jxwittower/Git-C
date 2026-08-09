@@ -90,6 +90,15 @@ jobs:
         timeout-minutes: 105
         run: |
           $PSDefaultParameterValues['Out-File:Encoding']='ascii'
+          function Select-String {
+            param(
+              [Parameter(Position=0,Mandatory=$true)][string]$Path,
+              [switch]$SimpleMatch,
+              [Parameter(Position=1,Mandatory=$true)][string]$Pattern,
+              [switch]$Quiet
+            )
+            Microsoft.PowerShell.Utility\Select-String -Path $Path -Pattern $Pattern -SimpleMatch:$SimpleMatch -Quiet:$Quiet
+          }
           & .\payload_root\payload\windows_gate.ps1
       - name: Commit exact PASS lock
         if: success()
