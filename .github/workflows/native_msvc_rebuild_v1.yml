@@ -1,0 +1,359 @@
+name: guanhu-native-msvc-rebuild-v1
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/native_msvc_rebuild_v1.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  native-build-semantic:
+    runs-on: windows-2022
+    timeout-minutes: 65
+    env:
+      SOURCE_SHA: 3f9e069966a0fed13d7c0265da91fa3dfd37fd90cf60acb3572ef6232daa9439
+      SOURCE_ENC_SHA: 2d803470dac7425bbf9a5833165f95f4f0e7e819125d0347f83e263b7dc0a513
+      FULL_RUN: '31310246212'
+      FULL_ARTIFACT: c8b8-decrypted-fullreg-xz-31310246212
+      FULL_XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: 2fac53a77568525781f4945321ca3b21b8c9bb20561d6c1f7db118a6ae8e127d
+      HANDOFF_BRANCH: c8b8-fullreg-v2-resume-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create one-time encrypted source handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, secrets, string, urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'
+          domains=req('GET',base+'/domains')
+          if isinstance(domains,list): members=domains
+          else: members=domains.get('hydra:member') or domains.get('member') or domains.get('data') or []
+          if not members: raise SystemExit('MAILTM_NO_DOMAIN')
+          domain=members[0].get('domain') or members[0].get('name')
+          if not domain: raise SystemExit('MAILTM_DOMAIN_PARSE_FAIL')
+          alphabet=string.ascii_lowercase+string.digits
+          user='ghnative'+''.join(secrets.choice(alphabet) for _ in range(14))
+          password=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32))
+          address=user+'@'+domain
+          req('POST',base+'/accounts',{'address':address,'password':password})
+          tok=req('POST',base+'/token',{'address':address,'password':password})['token']
+          Path(os.environ['RUNNER_TEMP'],'native_mail.json').write_text(json.dumps({'address':address,'password':password,'token':tok}))
+          Path('native_mailbox.txt').write_text(address+'\n')
+          Path('native_subject.txt').write_text('GuanHu-Native-Msvc-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('NATIVE_MAILBOX_READY',address)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\make_native_mail.py
+          python $env:RUNNER_TEMP\make_native_mail.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\native_private.pem
+          openssl pkey -in $env:RUNNER_TEMP\native_private.pem -pubout -out native_public.pem
+          New-Item -ItemType Directory -Force .native_msvc_handoff | Out-Null
+          Copy-Item native_public.pem .native_msvc_handoff\public.pem -Force
+          Copy-Item native_mailbox.txt .native_msvc_handoff\mailbox.txt -Force
+          Copy-Item native_subject.txt .native_msvc_handoff\subject.txt -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","SOURCE_SHA=$env:SOURCE_SHA","SOURCE_ENC_SHA=$env:SOURCE_ENC_SHA") | Set-Content .native_msvc_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .native_msvc_handoff
+          git commit -m "Publish native MSVC rebuild one-time handoff"
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_HANDOFF_COMMIT_FAIL'}
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_HANDOFF_PUSH_FAIL'}
+          'NATIVE_SOURCE_HANDOFF_PUBLISHED' | Set-Content native_handoff_gate.txt
+
+      - name: Receive encrypted native source and wrapped key
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, time, urllib.request, urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'native_mail.json').read_text())
+          token=cfg['token']; base='https://api.mail.tm'; subject=Path('native_subject.txt').read_text().strip()
+          out=Path('native_transport'); out.mkdir(exist_ok=True)
+          def get_json(url):
+              r=urllib.request.Request(url); r.add_header('Accept','application/json'); r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def get_bytes(url):
+              r=urllib.request.Request(url); r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=90) as x:return x.read()
+          deadline=time.time()+780; enc=False; key=False; seen=set()
+          while time.time()<deadline and not(enc and key):
+              listing=get_json(base+'/messages')
+              msgs=listing if isinstance(listing,list) else (listing.get('hydra:member') or listing.get('member') or listing.get('data') or [])
+              for m in msgs:
+                  if m.get('subject','')!=subject or m.get('id') in seen: continue
+                  seen.add(m.get('id'))
+                  detail=get_json(base+'/messages/'+m['id'])
+                  for a in detail.get('attachments',[]):
+                      name=a.get('filename',''); u=a.get('downloadUrl')
+                      if not u: continue
+                      data=get_bytes(urllib.parse.urljoin(base,u))
+                      if name=='hostcompat_native_source.enc': (out/name).write_bytes(data); enc=True
+                      elif name=='hostcompat_native_key.bin': (out/name).write_bytes(data); key=True
+              if not(enc and key): time.sleep(4)
+          if not(enc and key): raise SystemExit(f'NATIVE_SOURCE_MAIL_INCOMPLETE enc={enc} key={key}')
+          print('NATIVE_SOURCE_MAIL_PASS enc=1 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\receive_native_mail.py
+          python $env:RUNNER_TEMP\receive_native_mail.py | Tee-Object native_transport_gate.txt
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          $eh=(Get-FileHash native_transport\hostcompat_native_source.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($eh -ne $env:SOURCE_ENC_SHA){throw "NATIVE_SOURCE_ENC_SHA_FAIL $eh"}
+          if((Get-Item native_transport\hostcompat_native_key.bin).Length -ne 384){throw 'NATIVE_WRAPPED_KEY_SIZE_FAIL'}
+
+      - name: Decrypt and bind native source checkpoint
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\native_private.pem -in native_transport\hostcompat_native_key.bin -out $env:RUNNER_TEMP\native_aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_RSA_UNWRAP_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in native_transport\hostcompat_native_source.enc -out native_source.tar.xz -pass file:$env:RUNNER_TEMP\native_aes_pass.txt
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_SOURCE_DECRYPT_FAIL'}
+          $sh=(Get-FileHash native_source.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sh -ne $env:SOURCE_SHA){throw "NATIVE_SOURCE_SHA_FAIL $sh"}
+          New-Item -ItemType Directory -Force native_source | Out-Null
+          tar -xJf native_source.tar.xz -C native_source
+          if(!(Test-Path native_source\hostcompat_native_rebuild_src\sigproc_rebuild_win.c)){throw 'NATIVE_CORE_SOURCE_MISSING'}
+          @("NATIVE_SOURCE_BINDING_PASS","SOURCE_SHA=$sh","CORE_BYTES=$((Get-Item native_source\hostcompat_native_rebuild_src\sigproc_rebuild_win.c).Length)") | Set-Content native_source_binding.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build native MSVC x86 DLL with compiler stack probes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=(Resolve-Path 'native_source\hostcompat_native_rebuild_src').Path
+          New-Item -ItemType Directory -Force native_build | Out-Null
+          Push-Location $src
+          cl /nologo /c /O2 /MD /GS /W4 /DWIN32 /D_WINDOWS /DSP_MINIMAL_WINDOWS sigproc_rebuild_win.c sigproc_dll_hostcompat.c sha256_portable.c *> $env:GITHUB_WORKSPACE\native_compile.log
+          $crc=$LASTEXITCODE
+          if($crc -ne 0){Pop-Location; Get-Content $env:GITHUB_WORKSPACE\native_compile.log; throw "NATIVE_COMPILE_FAIL rc=$crc"}
+          link /nologo /DLL /OUT:$env:GITHUB_WORKSPACE\native_build\SigProcDll-64HF.dll /DEF:SigProcStandalone.def sigproc_rebuild_win.obj sigproc_dll_hostcompat.obj sha256_portable.obj *> $env:GITHUB_WORKSPACE\native_link.log
+          $lrc=$LASTEXITCODE
+          Pop-Location
+          if($lrc -ne 0){Get-Content native_link.log; throw "NATIVE_LINK_FAIL rc=$lrc"}
+          $h=(Get-FileHash native_build\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $bytes=(Get-Item native_build\SigProcDll-64HF.dll).Length
+          @("NATIVE_MSVC_BUILD_PASS","SHA256=$h","BYTES=$bytes","FLAGS=/O2 /MD /GS /DSP_MINIMAL_WINDOWS","NO_BINARY_POSTPATCH=1") | Set-Content native_build_binding.txt
+          Get-Content native_build_binding.txt
+
+      - name: Static native ABI imports and stack-probe gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers native_build\SigProcDll-64HF.dll | Out-File -Encoding ascii native_headers.txt
+          dumpbin /exports native_build\SigProcDll-64HF.dll | Out-File -Encoding ascii native_exports.txt
+          dumpbin /dependents native_build\SigProcDll-64HF.dll | Out-File -Encoding ascii native_dependents.txt
+          dumpbin /imports native_build\SigProcDll-64HF.dll | Out-File -Encoding ascii native_imports.txt
+          @'
+          from pathlib import Path
+          import struct,re
+          b=Path('native_build/SigProcDll-64HF.dll').read_bytes()
+          u16=lambda o:struct.unpack_from('<H',b,o)[0]; u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          if b[:2]!=b'MZ': raise SystemExit('NATIVE_MZ_FAIL')
+          pe=u32(0x3c)
+          if b[pe:pe+4]!=b'PE\0\0': raise SystemExit('NATIVE_PE_SIG_FAIL')
+          machine=u16(pe+4); magic=u16(pe+24)
+          if machine!=0x14c or magic!=0x10b: raise SystemExit(f'NATIVE_PE32_X86_FAIL machine={machine:x} magic={magic:x}')
+          exp=Path('native_exports.txt').read_text()
+          for x in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if x not in exp: raise SystemExit('NATIVE_EXPORT_MISSING_'+x)
+          deps=sorted({x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path('native_dependents.txt').read_text(),re.I|re.M)})
+          if 'bcrypt.dll' in deps: raise SystemExit('NATIVE_BCRYPT_FORBIDDEN_MINIMAL_BUILD')
+          n=u16(pe+6); osz=u16(pe+20); s0=pe+24+osz; bad=[]
+          for i in range(n):
+              o=s0+40*i; rs=u32(o+16); rp=u32(o+20); ch=u32(o+36)
+              if ch & 0x20000000:
+                  for p in range(rp,max(rp,rp+rs-6)):
+                      if b[p:p+2]==b'\x81\xec':
+                          imm=u32(p+2)
+                          if 0x1000<=imm<0x100000: bad.append((p,imm))
+          if bad: raise SystemExit('NATIVE_DIRECT_LARGE_STACK_UNPROBED '+repr(bad))
+          Path('native_static_gate.txt').write_text(f'NATIVE_STATIC_PASS\nMACHINE=0x{machine:x}\nMAGIC=0x{magic:x}\nDEPENDENTS='+','.join(deps)+'\nDIRECT_LARGE_STACK=0\n')
+          print(Path('native_static_gate.txt').read_text())
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\native_static.py
+          python $env:RUNNER_TEMP\native_static.py
+
+      - name: Persist native build checkpoint before semantic testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-msvc-build-v1-${{ github.run_id }}
+          path: |
+            native_build/SigProcDll-64HF.dll
+            native_build_binding.txt
+            native_source_binding.txt
+            native_compile.log
+            native_link.log
+            native_headers.txt
+            native_exports.txt
+            native_dependents.txt
+            native_imports.txt
+            native_static_gate.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Restore full semantic data checkpoint and V9 harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force full,xz_stage,tar_stage | Out-Null
+          gh run download $env:FULL_RUN -n $env:FULL_ARTIFACT -D full
+          $xz='full\c8b8_fullreg_payload_v2.tar.xz'
+          $xh=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($xh -ne $env:FULL_XZ_SHA){throw "NATIVE_FULL_XZ_SHA_FAIL $xh"}
+          & 7z x -y $xz '-oxz_stage' | Out-File native_full_7z_xz.log
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_FULL_7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem xz_stage -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'NATIVE_FULL_TAR_MISSING'}
+          & 7z x -y $tar '-otar_stage' | Out-File native_full_7z_tar.log
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_FULL_7Z_TAR_FAIL'}
+          Move-Item tar_stage\c8b8_fullreg_payload_v2 semantic_payload
+          python .c8b8_resume_support\install_v9_harness.py | Tee-Object native_harness_install.log
+          if($LASTEXITCODE -ne 0){throw 'NATIVE_V9_INSTALL_FAIL'}
+          Copy-Item payload\fullreg_c8b8.c semantic_payload\fullreg_c8b8.c -Force
+          Remove-Item payload -Recurse -Force
+          $hs=(Get-FileHash semantic_payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          $c63=(Get-FileHash semantic_payload\C63.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $host=(Get-FileHash semantic_payload\HostCompat.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sm=(Get-FileHash semantic_payload\SigProcLoaderContractSmoke.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hs -ne $env:HARNESS_SHA){throw "NATIVE_HARNESS_SHA_FAIL $hs"}
+          if($c63 -ne $env:C63_SHA){throw "NATIVE_C63_SHA_FAIL $c63"}
+          if($host -ne $env:HOST_SHA){throw "NATIVE_HOST_SHA_FAIL $host"}
+          if($sm -ne $env:SMOKE_SHA){throw "NATIVE_SMOKE_SHA_FAIL $sm"}
+          dumpbin /dependents semantic_payload\HostCompat.dll | Out-File -Encoding ascii host_reference_dependents.txt
+          @'
+          from pathlib import Path
+          import re
+          pat=re.compile(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',re.I|re.M)
+          n={x.lower() for x in pat.findall(Path('native_dependents.txt').read_text())}
+          h={x.lower() for x in pat.findall(Path('host_reference_dependents.txt').read_text())}
+          extra=sorted(n-h)
+          if extra: raise SystemExit('NATIVE_DEPENDENCY_NOT_HOSTCOMPAT_SUBSET '+','.join(extra))
+          Path('native_import_compat_gate.txt').write_text('NATIVE_IMPORT_COMPAT_PASS\nNATIVE='+','.join(sorted(n))+'\nHOST='+','.join(sorted(h))+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\native_import_compat.py
+          python $env:RUNNER_TEMP\native_import_compat.py
+
+      - name: Compile persistent semantic harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:native_semantic.exe semantic_payload\fullreg_c8b8.c *> native_semantic_compile.txt
+          if($LASTEXITCODE -ne 0){Get-Content native_semantic_compile.txt;throw 'NATIVE_SEMANTIC_COMPILE_FAIL'}
+
+      - name: C63 semantic control
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item semantic_payload\runtime\outer-medical-bed rt_c63 -Recurse -Force
+          $dll=(Resolve-Path 'semantic_payload\C63.dll').Path
+          $rt=(Resolve-Path 'rt_c63').Path
+          $test=(Resolve-Path 'semantic_payload\testdata').Path
+          .\native_semantic.exe calibrate $dll $rt $test *> native_c63_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content native_c63_calibration.log
+          if($rc -ne 0){throw "NATIVE_C63_CAL_FAIL rc=$rc"}
+          if(-not (Select-String native_c63_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'NATIVE_C63_CAL_MARKER_FAIL'}
+          'NATIVE_C63_CONTROL_PASS' | Set-Content native_c63_control_gate.txt
+
+      - name: Native rebuilt candidate occupied-state vitals calibration
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item semantic_payload\runtime\outer-medical-bed rt_native_cal -Recurse -Force
+          $dll=(Resolve-Path 'native_build\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_native_cal').Path
+          $test=(Resolve-Path 'semantic_payload\testdata').Path
+          .\native_semantic.exe calibrate $dll $rt $test *> native_candidate_calibration.log
+          $rc=$LASTEXITCODE
+          Get-Content native_candidate_calibration.log
+          if($rc -ne 0){throw "NATIVE_CANDIDATE_CAL_FAIL rc=$rc"}
+          if(-not (Select-String native_candidate_calibration.log -Pattern 'PERSISTENT_STATE_CALIBRATION_PASS' -SimpleMatch -Quiet)){throw 'NATIVE_CANDIDATE_CAL_MARKER_FAIL'}
+          'NATIVE_CANDIDATE_OCCUPIED_VITALS_PASS' | Set-Content native_candidate_cal_gate.txt
+
+      - name: Native candidate inner outer loader contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($pair in @(@('inner-bed','rt_native_inner','native_loader_inner.log'),@('outer-medical-bed','rt_native_outer','native_loader_outer.log'))){
+            Copy-Item ("semantic_payload\runtime\"+$pair[0]) $pair[1] -Recurse -Force
+            Copy-Item native_build\SigProcDll-64HF.dll ($pair[1]+'\SigProcDll-64HF.dll') -Force
+            Copy-Item semantic_payload\SigProcLoaderContractSmoke.exe ($pair[1]+'\SigProcLoaderContractSmoke.exe') -Force
+            Push-Location $pair[1]
+            .\SigProcLoaderContractSmoke.exe *> ("..\"+$pair[2])
+            $rc=$LASTEXITCODE
+            Pop-Location
+            Get-Content $pair[2]
+            if($rc -ne 0){throw "NATIVE_LOADER_FAIL $($pair[0]) rc=$rc"}
+            if(-not (Select-String $pair[2] -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw "NATIVE_LOADER_MARKER_FAIL $($pair[0])"}
+          }
+          'NATIVE_INNER_OUTER_LOADER_PASS' | Set-Content native_loader_gate.txt
+
+      - name: Native candidate leave warning suppression recovery sentinel
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item semantic_payload\runtime\outer-medical-bed rt_native_sentinel -Recurse -Force
+          $dll=(Resolve-Path 'native_build\SigProcDll-64HF.dll').Path
+          $rt=(Resolve-Path 'rt_native_sentinel').Path
+          $test=(Resolve-Path 'semantic_payload\testdata').Path
+          .\native_semantic.exe sentinel $dll $rt $test *> native_candidate_sentinel.log
+          $rc=$LASTEXITCODE
+          Get-Content native_candidate_sentinel.log
+          if($rc -ne 0){throw "NATIVE_SENTINEL_FAIL rc=$rc"}
+          if(-not (Select-String native_candidate_sentinel.log -Pattern 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -SimpleMatch -Quiet)){throw 'NATIVE_SENTINEL_MARKER_FAIL'}
+          $h=(Get-FileHash native_build\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("NATIVE_MSVC_FAST_SEMANTIC_PASS","SHA256=$h","SOURCE_SHA=$env:SOURCE_SHA","HARNESS_SHA=$env:HARNESS_SHA") | Set-Content NATIVE_MSVC_FAST_SEMANTIC_PASS.lock
+
+      - name: Upload native semantic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-msvc-semantic-v1-${{ github.run_id }}
+          path: |
+            native_build/SigProcDll-64HF.dll
+            native_build_binding.txt
+            native_source_binding.txt
+            native_compile.log
+            native_link.log
+            native_static_gate.txt
+            native_dependents.txt
+            host_reference_dependents.txt
+            native_import_compat_gate.txt
+            native_semantic_compile.txt
+            native_c63_calibration.log
+            native_c63_control_gate.txt
+            native_candidate_calibration.log
+            native_candidate_cal_gate.txt
+            native_loader_inner.log
+            native_loader_outer.log
+            native_loader_gate.txt
+            native_candidate_sentinel.log
+            NATIVE_MSVC_FAST_SEMANTIC_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
