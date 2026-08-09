@@ -142,7 +142,7 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/aes_pass.txt"
           echo "$EXPECTED_XZ_SHA  $RUNNER_TEMP/payload.tar.xz" | sha256sum -c -
           mkdir -p payload
-          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C payload
+          xz -dc "$RUNNER_TEMP/payload.tar.xz" | tar -xf - -C payload
           test -f payload/SigProcDll-64HF.dll
           test -f payload/HostCompat.dll
           test -f payload/C63.dll
