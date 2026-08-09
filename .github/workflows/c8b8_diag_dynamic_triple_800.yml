@@ -1,0 +1,94 @@
+name: c8b8-diagnostic-dynamic-triple-800
+on:
+  push:
+    branches: [c8b8-fullreg-v2-final-20260809]
+    paths:
+      - '.github/workflows/c8b8_diag_dynamic_triple_800.yml'
+permissions:
+  actions: read
+
+env:
+  PAYLOAD_RUN: '31302120039'
+  PAYLOAD_ARTIFACT: c8b8-v3-windows-ready-payload-31302120039
+  HARNESS_RUN: '31302697175'
+  HARNESS_ARTIFACT: c8b8-v3-resume-stageC-virtual1hz-31302697175
+jobs:
+  diag:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: candidate_c8b8
+            dll: SigProcDll-64HF.dll
+            sha: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+          - name: hostcompat_081c4
+            dll: HostCompat.dll
+            sha: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+          - name: c63_original
+            dll: C63.dll
+            sha: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore immutable payload and harness
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force payload,harness | Out-Null
+          gh run download $env:PAYLOAD_RUN --repo $env:GITHUB_REPOSITORY --name $env:PAYLOAD_ARTIFACT --dir payload
+          gh run download $env:HARNESS_RUN --repo $env:GITHUB_REPOSITORY --name $env:HARNESS_ARTIFACT --dir harness
+          if($LASTEXITCODE-ne 0){throw 'RESTORE_FAIL'}
+          $h=(Get-FileHash "payload\${{ matrix.dll }}" -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne '${{ matrix.sha }}'){throw "DLL_SHA_FAIL $h"}
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - name: Build harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /WX /D_CRT_SECURE_NO_WARNINGS harness\HostReplayWinVirtualFixed.c /Fe:diag.exe *> build_${{ matrix.name }}.txt
+          if($LASTEXITCODE-ne 0){Get-Content build_${{ matrix.name }}.txt;throw 'BUILD_FAIL'}
+      - name: Run identical first 800 outer frames
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP '${{ matrix.name }}';New-Item -ItemType Directory -Force $d|Out-Null
+          Copy-Item payload\runtime_outer\* $d -Force
+          Copy-Item "payload\${{ matrix.dll }}" "$d\SigProcDll-64HF.dll" -Force
+          $g0=(Resolve-Path 'payload\testdata\outer-medical-bed\01_initial_empty.ghf').Path
+          $g1=(Resolve-Path 'payload\testdata\outer-medical-bed\02_supine.ghf').Path
+          $args=@('--dll','.\SigProcDll-64HF.dll','--mode','replay','--ghf',$g0,'--ghf',$g1,'--max-frames','800','--out',"$env:GITHUB_WORKSPACE\${{ matrix.name }}.csv",'--virtual-1hz')
+          $p=Start-Process -FilePath "$env:GITHUB_WORKSPACE\diag.exe" -ArgumentList $args -WorkingDirectory $d -Wait -PassThru -RedirectStandardOutput "$env:GITHUB_WORKSPACE\${{ matrix.name }}.stdout" -RedirectStandardError "$env:GITHUB_WORKSPACE\${{ matrix.name }}.stderr"
+          Get-Content "${{ matrix.name }}.stdout","${{ matrix.name }}.stderr"|Set-Content "${{ matrix.name }}.log"
+          Get-Content "${{ matrix.name }}.log"
+          if($p.ExitCode-ne 0){throw "REPLAY_RC=$($p.ExitCode)"}
+      - name: Summarize semantic onset
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import csv,collections
+          p='${{ matrix.name }}.csv'
+          rows=list(csv.DictReader(open(p,newline='')))
+          c=collections.Counter(int(r['state']) for r in rows)
+          nonzero=[i for i,r in enumerate(rows) if int(r['state'])!=0]
+          validhr=[i for i,r in enumerate(rows) if 0<int(r['hr'])<1000 and int(r['hr'])!=65535]
+          validrr=[i for i,r in enumerate(rows) if 0<int(r['rr'])<1000 and int(r['rr'])!=65535]
+          with open('${{ matrix.name }}_summary.txt','w') as f:
+              f.write('DLL_SHA=${{ matrix.sha }}\nROWS=%d\nSTATE_COUNTS=%r\nFIRST_NONZERO=%s\nFIRST_VALID_HR=%s\nFIRST_VALID_RR=%s\n'%(len(rows),dict(c),nonzero[0] if nonzero else 'NONE',validhr[0] if validhr else 'NONE',validrr[0] if validrr else 'NONE'))
+          print(open('${{ matrix.name }}_summary.txt').read())
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\summary.py
+          python $env:RUNNER_TEMP\summary.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: triple800-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            ${{ matrix.name }}.log
+            ${{ matrix.name }}.csv
+            ${{ matrix.name }}_summary.txt
+            build_${{ matrix.name }}.txt
+          if-no-files-found: ignore
+          retention-days: 14
