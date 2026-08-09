@@ -1,0 +1,205 @@
+name: c8b8-threadfix-v8
+on:
+  push:
+    branches: [c8b8-threadfix-v8-20260809]
+    paths:
+      - '.github/workflows/c8b8_threadfix_v8.yml'
+permissions: {actions: read, contents: write}
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      BRANCH: c8b8-threadfix-v8-20260809
+      ROOT: c8b8_fullreg_v2_payload
+      ENC_SHA: 0a3f05c61deb236d0e9c6e9d7879fb0d0d84551a765e75dfad25967d6e6c70c8
+      XZ_SHA: 9e24503212064455f50e1f37d8ce15da52d0c2894b1570639ab5644199e6bfcd
+      PARENT_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      CAND_SHA: 87ec3f9f2748d3143136c97e652b0334d63b973338b4c802aaea08e853ad226e
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+
+      - name: Download durable staged encrypted payload
+        uses: actions/download-artifact@v4
+        with:
+          name: c8b8-staged-encrypted-fullreg-31296517289
+          path: stage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: jxwittower/Git-C
+          run-id: 31296517289
+
+      - name: Bind staged ciphertext and publish run-specific RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash 'stage\c8b8_fullreg_transport.enc' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "STAGE_SHA_FAIL $h"}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem
+          openssl pkey -in private.pem -pubout -out public.pem
+          if($LASTEXITCODE -ne 0){throw 'RSA_FAIL'}
+          $d=".c8b8_threadfix_v8_handoff\run_$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item public.pem (Join-Path $d 'public.pem') -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","PARENT_SHA=$env:PARENT_SHA","CAND_SHA=$env:CAND_SHA","ENC_SHA=$env:ENC_SHA") | Set-Content (Join-Path $d 'binding.txt')
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add $d
+          git commit -m "Publish c8b8 threadfix v8 handoff $env:GITHUB_RUN_ID"
+          git push origin "HEAD:$env:BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+          'STAGED_PAYLOAD_AND_HANDOFF_PASS' | Out-File cp01_handoff.txt
+
+      - name: Receive run-specific wrapped AES recovery key
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Continue'
+          $ok=$false
+          $rp=".c8b8_threadfix_v8_handoff/run_$env:GITHUB_RUN_ID/wrapped_key.b64"
+          $spec="origin/$env:BRANCH`:$rp"
+          for($i=0;$i -lt 180;$i++){
+            git fetch origin $env:BRANCH --quiet 2>$null
+            $txt=& git show $spec 2>$null
+            if($LASTEXITCODE -eq 0 -and $txt){
+              try{$raw=[Convert]::FromBase64String((($txt -join "`n").Trim()))}catch{$raw=$null}
+              if($raw -and $raw.Length -eq 384){[IO.File]::WriteAllBytes('wrapped_key.bin',$raw);$ok=$true;break}
+            }
+            Start-Sleep -Seconds 5
+          }
+          $ErrorActionPreference='Stop'
+          if(-not $ok){throw 'KEY_HANDOFF_TIMEOUT'}
+          'RUN_SPECIFIC_WRAPPED_KEY_PASS' | Out-File cp02_key.txt
+
+      - name: Decrypt payload and build exact 87ec candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          openssl pkeyutl -decrypt -inkey private.pem -in wrapped_key.bin -out aes.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_UNWRAP_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in stage\c8b8_fullreg_transport.enc -out payload.tar.xz -pass file:aes.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $x=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"}
+          New-Item -ItemType Directory -Force xzstage,unpacked | Out-Null
+          7z x -y payload.tar.xz "-o$pwd\xzstage" | Out-Null
+          $t=Get-ChildItem xzstage -Filter '*.tar' | Select-Object -First 1
+          if(!$t){throw 'TAR_MISSING'}
+          7z x -y $t.FullName "-o$pwd\unpacked" | Out-Null
+          Remove-Item aes.txt -Force
+          $r="unpacked\$env:ROOT"
+          $p=Join-Path $r 'SigProcDll-64HF.dll'
+          $ph=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($ph -ne $env:PARENT_SHA){throw "PARENT_SHA_FAIL $ph"}
+          python tools\c8b8\patch_thread_serial.py $p (Join-Path $r 'SigProcDll-64HF-threadsafe.dll') --report threadfix_v8_report.json | Tee-Object threadfix_v8_patch.log
+          if($LASTEXITCODE -ne 0){throw 'THREAD_PATCH_FAIL'}
+          $nh=(Get-FileHash (Join-Path $r 'SigProcDll-64HF-threadsafe.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($nh -ne $env:CAND_SHA){throw "CAND_SHA_FAIL $nh"}
+          Move-Item -Force (Join-Path $r 'SigProcDll-64HF-threadsafe.dll') $p
+          "PARENT_SHA=$ph`nCAND_SHA=$nh`nEXACT_THREADFIX_REBUILD_PASS" | Out-File cp03_candidate.txt
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+
+      - name: PE ABI and inner outer loader contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $r="unpacked\$env:ROOT"; $c=Join-Path $r 'SigProcDll-64HF.dll'
+          dumpbin /headers $c | Out-File -Encoding ascii candidate_headers.txt
+          dumpbin /exports $c | Out-File -Encoding ascii candidate_exports.txt
+          dumpbin /dependents $c | Out-File -Encoding ascii candidate_deps.txt
+          if(-not(Select-String -Path candidate_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet)){throw 'X86_FAIL'}
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String -Path candidate_exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "EXPORT_FAIL $e"}}
+          if(Select-String -Path candidate_deps.txt -Pattern 'ucrtbase.dll' -SimpleMatch -Quiet){throw 'UCRTBASE_FAIL'}
+          $bytes=[IO.File]::ReadAllBytes((Resolve-Path $c));$ascii=[Text.Encoding]::ASCII.GetString($bytes)
+          if(-not $ascii.Contains('.stkfix')){throw 'STKFIX_MISSING'}
+          if(-not $ascii.Contains('.thrfix')){throw 'THRFIX_MISSING'}
+          foreach($kind in @('inner-bed','outer-medical-bed')){
+            $d="loader_"+($kind-replace'-','_');New-Item -ItemType Directory -Force $d|Out-Null
+            Copy-Item (Join-Path $r "runtime\$kind\*") $d -Force
+            Copy-Item $c (Join-Path $d 'SigProcDll-64HF.dll') -Force
+            Copy-Item (Join-Path $r 'SigProcLoaderContractSmoke.exe') $d -Force
+            Push-Location $d; .\SigProcLoaderContractSmoke.exe *>&1 | Tee-Object ("..\loader_"+$kind+'.log');$rc=$LASTEXITCODE;Pop-Location
+            if($rc -ne 0){throw "LOADER_FAIL $kind"}
+          }
+          foreach($p in @('loader_inner-bed.log','loader_outer-medical-bed.log')){if(-not(Select-String -Path $p -Pattern 'ALL_LOADER_CONTRACT_TESTS_PASS' -SimpleMatch -Quiet)){throw "LOADER_MARKER_FAIL $p"}}
+          'PE_ABI_STACK_THREADFIX_LOADER_PASS' | Out-File cp04_loader.txt
+
+      - name: Compile x86 native regression host
+        shell: powershell
+        run: |
+          $r="unpacked\$env:ROOT"
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:native_fullreg_host.exe (Join-Path $r 'native_fullreg_host.c') 2>&1 | Tee-Object compile.log
+          if($LASTEXITCODE -ne 0){throw 'COMPILE_FAIL'}
+          'NATIVE_HOST_COMPILE_PASS' | Out-File cp05_compile.txt
+
+      - name: Same-process two-thread 2x2000 exact gate
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          $r=(Resolve-Path "unpacked\$env:ROOT").Path;$h=(Resolve-Path native_fullreg_host.exe).Path;$dll=Join-Path $r 'SigProcDll-64HF.dll';$ghf=Join-Path $r 'testdata\inner-bed\02_supine.ghf'
+          Copy-Item (Join-Path $r 'runtime\inner-bed') rt_thread -Recurse -Force
+          & $h threadstress $dll (Resolve-Path rt_thread).Path $ghf 2000 *>&1 | Tee-Object threadstress_v8.log
+          if($LASTEXITCODE -ne 0){throw "THREAD_STRESS_FAIL rc=$LASTEXITCODE"}
+          if(-not(Select-String -Path threadstress_v8.log -Pattern 'TWO_THREAD_STRESS_PASS threads=2 loops_each=2000' -SimpleMatch -Quiet)){throw 'THREAD_MARKER_FAIL'}
+          $post=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:CAND_SHA){throw 'THREAD_POST_SHA_FAIL'}
+          'SAME_PROCESS_TWO_THREAD_2X2000_PASS' | Out-File cp06_thread.txt
+
+      - name: 20000-loop nonzero stability exact gate
+        shell: powershell
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference='Stop'
+          $r=(Resolve-Path "unpacked\$env:ROOT").Path;$h=(Resolve-Path native_fullreg_host.exe).Path;$dll=Join-Path $r 'SigProcDll-64HF.dll';$ghf=Join-Path $r 'testdata\inner-bed\02_supine.ghf'
+          Copy-Item (Join-Path $r 'runtime\inner-bed') rt_stress -Recurse -Force
+          & $h stress $dll (Resolve-Path rt_stress).Path $ghf 20000 *>&1 | Tee-Object stability_v8.log
+          if($LASTEXITCODE -ne 0){throw "STABILITY_FAIL rc=$LASTEXITCODE"}
+          if(-not(Select-String -Path stability_v8.log -Pattern 'LONG_STABILITY_PASS loops=20000' -SimpleMatch -Quiet)){throw 'STABILITY_MARKER_FAIL'}
+          'NONZERO_20000_STABILITY_PASS' | Out-File cp07_stability.txt
+
+      - name: Real wall-clock 60-frame 1Hz exact gate
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference='Stop'
+          $r=(Resolve-Path "unpacked\$env:ROOT").Path;$h=(Resolve-Path native_fullreg_host.exe).Path;$dll=Join-Path $r 'SigProcDll-64HF.dll';$ghf=Join-Path $r 'testdata\inner-bed\02_supine.ghf'
+          Copy-Item (Join-Path $r 'runtime\inner-bed') rt_1hz -Recurse -Force
+          & $h realtime $dll (Resolve-Path rt_1hz).Path $ghf 60 *>&1 | Tee-Object realtime_v8.log
+          if($LASTEXITCODE -ne 0){throw "REALTIME_FAIL rc=$LASTEXITCODE"}
+          if(-not(Select-String -Path realtime_v8.log -Pattern 'REALTIME_1HZ_PASS frames=60' -SimpleMatch -Quiet)){throw 'REALTIME_MARKER_FAIL'}
+          $post=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:CAND_SHA){throw 'FINAL_SHA_FAIL'}
+          "POST_TEST_SHA=$post`nTHREADFIX_V8_CORE_NATIVE_PASS" | Out-File cp08_corepass.txt
+
+      - name: Commit exact core-native PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null
+          @('THREADFIX_V8_CORE_NATIVE_PASS',"SHA256=$env:CAND_SHA",'PARENT_SHA=c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9','TWO_THREAD=2x2000','LONG_STABILITY=20000','REALTIME_1HZ=60',"RUN_ID=$env:GITHUB_RUN_ID") | Set-Content evidence_summary\C8B8_THREADFIX_V8_CORE_PASS.lock
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/C8B8_THREADFIX_V8_CORE_PASS.lock;git commit -m 'Lock exact 87ec threadfix core native PASS';git fetch origin $env:BRANCH;git rebase "origin/$env:BRANCH";git push origin "HEAD:$env:BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'PASS_LOCK_PUSH_FAIL'}
+
+      - name: Upload exact candidate and core evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-threadfix-v8-${{ github.run_id }}
+          path: |
+            unpacked/c8b8_fullreg_v2_payload/SigProcDll-64HF.dll
+            cp*.txt
+            threadfix_v8_report.json
+            threadfix_v8_patch.log
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_deps.txt
+            loader_*.log
+            compile.log
+            threadstress_v8.log
+            stability_v8.log
+            realtime_v8.log
+            evidence_summary/C8B8_THREADFIX_V8_CORE_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
