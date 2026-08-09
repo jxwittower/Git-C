@@ -1,0 +1,185 @@
+name: exact-87ec-authoritative-clock-release
+on:
+  push:
+    branches: [87ec-final-fullreg-20260809]
+    paths: ['.github/workflows/87ec_authoritative_clock_release.yml']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      BRANCH: 87ec-final-fullreg-20260809
+      ENC_SHA: 3cbe4e8339d3f934a1766a66e48a6ca794c32a262f768f43e6b9548d5276b5d9
+      XZ_SHA: eace407afd906df9409b8e5e8c116d0f6a6e47ec398c19034b2981f1fbf8d93b
+      PARENT_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      FINAL_SHA: 87ec3f9f2748d3143136c97e652b0334d63b973338b4c802aaea08e853ad226e
+      FINAL_SIZE: '441856'
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      HOST_SAFE_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      GHF_COUNT: '13'
+      GHF_BYTES: '82484656'
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+
+      - name: Publish one-time mailbox and RSA public key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def rq(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode(); h={'Accept':'application/json'}
+              if data is not None:h['Content-Type']='application/json'
+              if token:h['Authorization']='Bearer '+token
+              with urllib.request.urlopen(urllib.request.Request(url,data=data,method=method,headers=h),timeout=30) as r:return json.load(r)
+          base='https://api.mail.tm';d=rq('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('MAIL_DOMAIN_FAIL')
+          a=string.ascii_lowercase+string.digits;addr='gh87clock'+''.join(secrets.choice(a) for _ in range(15))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          rq('POST',base+'/accounts',{'address':addr,'password':pw});tok=rq('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject.txt').write_text('GuanHu-87EC-CLOCK-'+os.environ['GITHUB_RUN_ID']+'\n');print('MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mail.py
+          python $env:RUNNER_TEMP\mail.py;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out private.pem;if($LASTEXITCODE -ne 0){throw 'RSA_GEN_FAIL'}
+          openssl pkey -in private.pem -pubout -out public.pem;if($LASTEXITCODE -ne 0){throw 'RSA_PUB_FAIL'}
+          $d=".87ec_clock_handoff\run_$env:GITHUB_RUN_ID";New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item mailbox.txt,subject.txt,public.pem $d -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","FINAL_SHA=$env:FINAL_SHA")|Set-Content (Join-Path $d binding.txt)
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add $d;git commit -m "Publish exact 87ec clock handoff run $env:GITHUB_RUN_ID";if($LASTEXITCODE -ne 0){throw 'HANDOFF_COMMIT_FAIL'};git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+
+      - name: Receive exact encrypted payload
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          c=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text());tok=c['token'];base='https://api.mail.tm';prefix=Path('subject.txt').read_text().strip();want={f'{prefix}-P{i}':i for i in range(1,5)};out=Path('transport');out.mkdir(exist_ok=True);got=set();key=False;seen=set()
+          def j(u):
+              r=urllib.request.Request(u,headers={'Accept':'application/json','Authorization':'Bearer '+tok});
+              with urllib.request.urlopen(r,timeout=45) as x:return json.load(x)
+          def b(u):
+              r=urllib.request.Request(u,headers={'Authorization':'Bearer '+tok});
+              with urllib.request.urlopen(r,timeout=150) as x:return x.read()
+          end=time.time()+2000
+          while time.time()<end and (len(got)<4 or not key):
+              q=j(base+'/messages');items=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in items:
+                  s=m.get('subject','');mid=m.get('id')
+                  if s not in want or mid in seen:continue
+                  d=j(base+'/messages/'+mid);i=want[s];found=False
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      z=b(urllib.parse.urljoin(base,u))
+                      if n in (f'c8b8_payload_part{i}.bin',f'87ec_payload_part{i}.bin'):(out/f'payload_part{i}.bin').write_bytes(z);got.add(i);found=True
+                      elif n in ('c8b8_wrapped_key.bin','87ec_wrapped_key.bin'):(out/'wrapped_key.bin').write_bytes(z);key=True;found=True
+                  if found:seen.add(mid)
+              if len(got)<4 or not key:time.sleep(4)
+          if len(got)!=4 or not key:raise SystemExit(f'TRANSPORT_FAIL parts={sorted(got)} key={key}')
+          print('TRANSPORT_PASS parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py 2>&1|Tee-Object transport.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Decrypt and extract exact 13-GHF payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$o=[IO.File]::Create('payload.enc');try{1..4|%{$s=[IO.File]::OpenRead("transport\payload_part$_.bin");try{$s.CopyTo($o)}finally{$s.Dispose()}}}finally{$o.Dispose()}
+          $eh=(Get-FileHash payload.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($eh -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $eh"};if((Get-Item transport\wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey private.pem -in transport\wrapped_key.bin -out aes.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256;if($LASTEXITCODE -ne 0){throw 'RSA_UNWRAP_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out payload.tar.xz -pass file:aes.txt;if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $xh=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $xh"};Remove-Item aes.txt -Force
+          Remove-Item xzstage,unpacked -Recurse -Force -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force xzstage,unpacked|Out-Null;7z x -y payload.tar.xz "-o$pwd\xzstage"|Tee-Object extract_xz.log;if($LASTEXITCODE -ne 0){throw 'XZ_EXTRACT_FAIL'};$tar=Get-ChildItem xzstage -Filter '*.tar'|Select-Object -First 1;if(!$tar){throw 'TAR_MISSING'};7z x -y $tar.FullName "-o$pwd\unpacked"|Tee-Object extract_tar.log;if($LASTEXITCODE -ne 0){throw 'TAR_EXTRACT_FAIL'}
+          "ENC_SHA=$eh`nXZ_SHA=$xh`nDECRYPT_EXTRACT_PASS"|Set-Content crypto_binding.txt
+
+      - name: Rebuild exact 87ec and stack-safe HostCompat
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path unpacked).Path
+          foreach($z in @(@('SigProcDll-64HF.dll',$env:PARENT_SHA),@('HostCompat.dll',$env:HOST_SHA),@('C63.dll',$env:C63_SHA),@('SigProcLoaderContractSmoke.exe',$env:SMOKE_SHA))){$p=Join-Path $r $z[0];$h=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $z[1]){throw "SOURCE_HASH_FAIL $($z[0]) $h"}}
+          $g=Get-ChildItem (Join-Path $r testdata) -Recurse -Filter '*.ghf';$bytes=($g|Measure-Object Length -Sum).Sum;if($g.Count -ne [int]$env:GHF_COUNT -or $bytes -ne [int64]$env:GHF_BYTES){throw "GHF_BIND_FAIL $($g.Count) $bytes"}
+          python tools\c8b8\patch_thread_serial.py (Join-Path $r SigProcDll-64HF.dll) (Join-Path $r SigProcDll-64HF-threadsafe.dll) --report threadfix_clock_report.json|Tee-Object threadfix_clock_patch.log;if($LASTEXITCODE -ne 0){throw 'THREADFIX_FAIL'}
+          $f=(Get-FileHash (Join-Path $r SigProcDll-64HF-threadsafe.dll) -Algorithm SHA256).Hash.ToLowerInvariant();if($f -ne $env:FINAL_SHA){throw "FINAL_SHA_REBUILD_FAIL $f"};if((Get-Item (Join-Path $r SigProcDll-64HF-threadsafe.dll)).Length -ne [int64]$env:FINAL_SIZE){throw 'FINAL_SIZE_FAIL'};Move-Item -Force (Join-Path $r SigProcDll-64HF-threadsafe.dll) (Join-Path $r SigProcDll-64HF.dll)
+          python tools\c8b8\patch_stack_generic.py (Join-Path $r HostCompat.dll) (Join-Path $r HostCompat_stackprobe.dll) --report hostcompat_clock_report.json|Tee-Object hostcompat_clock_patch.log;if($LASTEXITCODE -ne 0){throw 'HOST_PATCH_FAIL'}
+          $hh=(Get-FileHash (Join-Path $r HostCompat_stackprobe.dll) -Algorithm SHA256).Hash.ToLowerInvariant();if($hh -ne $env:HOST_SAFE_SHA){throw "HOST_SAFE_SHA_FAIL $hh"};"GHF_COUNT=$($g.Count)`nGHF_BYTES=$bytes`nFINAL_SHA=$f`nHOST_SAFE_SHA=$hh"|Set-Content exact_asset_binding.txt
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+
+      - name: Static ABI and real-clock loader preflight
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$c='unpacked\SigProcDll-64HF.dll';dumpbin /headers $c|Out-File candidate_headers.txt;dumpbin /exports $c|Out-File candidate_exports.txt;dumpbin /dependents $c|Out-File candidate_deps.txt
+          if(-not(Select-String candidate_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet)){throw 'X86_FAIL'};foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){if(-not(Select-String candidate_exports.txt -Pattern $e -SimpleMatch -Quiet)){throw "EXPORT_FAIL $e"}};if(Select-String candidate_deps.txt -Pattern 'ucrtbase.dll' -SimpleMatch -Quiet){throw 'DIRECT_UCRTBASE_FAIL'};$raw=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path $c)));if(!$raw.Contains('.stkfix') -or !$raw.Contains('.thrfix')){throw 'PATCH_SECTION_FAIL'}
+          foreach($kind in @('inner-bed','outer-medical-bed')){$d="loader_"+($kind-replace'-','_');New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item "unpacked\runtime\$kind\*" $d -Force;Copy-Item $c (Join-Path $d SigProcDll-64HF.dll) -Force;Copy-Item unpacked\SigProcLoaderContractSmoke.exe $d -Force;Push-Location $d;& .\SigProcLoaderContractSmoke.exe *>&1|Tee-Object ("..\loader_"+$kind+'.log');$rc=$LASTEXITCODE;Pop-Location;if($rc -ne 0){throw "LOADER_FAIL $kind"}}
+          'STATIC_ABI_AND_REAL_CLOCK_LOADER_PASS'|Set-Content preflight_gate.txt
+
+      - name: Compile 1-second simulated-clock native host
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';cl /nologo /O2 /W4 /MT /D_CRT_SECURE_NO_WARNINGS tools\87ec\native_fullreg_clock_host.c /Fe:native_fullreg_clock_host.exe 2>&1|Tee-Object clock_host_compile.log;if($LASTEXITCODE -ne 0){throw 'CLOCK_HOST_COMPILE_FAIL'};dumpbin /headers native_fullreg_clock_host.exe|Out-File clock_host_headers.txt;if(-not(Select-String clock_host_headers.txt -Pattern '14C machine (x86)' -SimpleMatch -Quiet)){throw 'CLOCK_HOST_NOT_X86'}
+
+      - name: Fast semantic clock probe on initial-empty plus supine
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$r=(Resolve-Path unpacked).Path;$cand=Join-Path $r SigProcDll-64HF.dll;$rt=Join-Path $r 'runtime\inner-bed';$f0=Join-Path $r 'testdata\inner-bed\01_initial_empty.ghf';$f1=Join-Path $r 'testdata\inner-bed\02_supine.ghf';& .\native_fullreg_clock_host.exe replay $cand $rt clock_probe.csv $f0 $f1 *>&1|Tee-Object clock_probe.log;$rc=$LASTEXITCODE;if($rc -ne 0){throw "CLOCK_PROBE_EXIT_$rc"}
+          @'
+          import csv,collections
+          r=list(csv.DictReader(open('clock_probe.csv',newline='')));s0=[x for x in r if int(x['source'])==0];s1=[x for x in r if int(x['source'])==1];m0=collections.Counter(int(x['main']) for x in s0);m1=collections.Counter(int(x['main']) for x in s1)
+          print('CLOCK_PROBE_COUNTS empty=',dict(m0),'supine=',dict(m1))
+          if not s0 or not s1:raise SystemExit('CLOCK_PROBE_ROWS_MISSING')
+          if any(int(x['main'])!=0 for x in s0[-30:]):raise SystemExit('CLOCK_PROBE_INITIAL_EMPTY_FAIL')
+          if not any(int(x['main']) not in (0,8) for x in s1):raise SystemExit('CLOCK_PROBE_SUPINE_OCCUPANCY_FAIL')
+          print('CLOCK_PROBE_SEMANTIC_PASS')
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\probe.py;python $env:RUNNER_TEMP\probe.py 2>&1|Tee-Object clock_probe_semantic.log;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Execute corrected authoritative complete regression on exact 87ec
+        shell: powershell
+        timeout-minutes: 95
+        run: |
+          $ErrorActionPreference='Stop';python tools\87ec\run_complete_regression_87ec.py unpacked native_fullreg_clock_host.exe authoritative_evidence 2>&1|Tee-Object authoritative_fullreg.log;$rc=$LASTEXITCODE;"EXIT=$rc"|Set-Content authoritative_exit.txt;if($rc -ne 0){throw "AUTHORITATIVE_FULLREG_EXIT_$rc"};$s=Get-Content authoritative_fullreg.log -Raw;foreach($m in @('EXACT_BINARY_SHA_BINDING_PASS','DETERMINISTIC_REPLAY_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','C63_HOSTCOMPAT_COMPARISON_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','FULL_DATA_PERFORMANCE_PASS','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){if($s -notmatch [regex]::Escape($m)){throw "MISSING_MARKER $m"}};$post=(Get-FileHash unpacked\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($post -ne $env:FINAL_SHA){throw "POST_TEST_SHA_FAIL $post"};"EXACT_SHA=$post`nOFFLINE_1S_CLOCK_REPLAY=PASS`nREAL_NATIVE_1HZ=PASS`nFULL_13_GHF=PASS`nTHREAD_2X2000=PASS`nSTABILITY_20000=PASS"|Set-Content EXACT_87EC_AUTHORITATIVE_FULLREG_PASS.lock
+
+      - name: Build final ZIP and audit extracted DLL SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';New-Item -ItemType Directory -Force release|Out-Null;Copy-Item unpacked\SigProcDll-64HF.dll release\SigProcDll-64HF.dll -Force;"$env:FINAL_SHA  SigProcDll-64HF.dll"|Set-Content release\RELEASE_SHA256SUMS.txt;Copy-Item EXACT_87EC_AUTHORITATIVE_FULLREG_PASS.lock release\NATIVE_WINDOWS_FULL_REGRESSION_PASS.txt;Copy-Item authoritative_fullreg.log release\authoritative_full_regression.log
+          $zip='GuanHu_SigProc_Final_Release_20260809.zip';Remove-Item $zip -Force -ErrorAction SilentlyContinue;Compress-Archive release\* $zip -CompressionLevel Optimal;if((Get-Item $zip).Length -le 0){throw 'ZIP_EMPTY'};Remove-Item package_audit -Recurse -Force -ErrorAction SilentlyContinue;Expand-Archive $zip package_audit -Force;$p='package_audit\SigProcDll-64HF.dll';if((Get-Item $p).Length -ne [int64]$env:FINAL_SIZE){throw 'ZIP_DLL_SIZE_FAIL'};$a=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant();$o=(Get-FileHash unpacked\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($a -ne $env:FINAL_SHA -or $a -ne $o){throw "PACKAGE_SHA_FAIL tested=$o extracted=$a"};"PACKAGE_AUDIT_PASS`nTESTED_SHA=$o`nEXTRACTED_SHA=$a`nDLL_BYTES=$((Get-Item $p).Length)`nZIP_BYTES=$((Get-Item $zip).Length)"|Set-Content package_audit.txt
+
+      - name: Persist exact release PASS lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';New-Item -ItemType Directory -Force evidence_summary|Out-Null;@('EXACT_87EC_AUTHORITATIVE_NATIVE_RELEASE_PASS',"SHA256=$env:FINAL_SHA",'FULL_13_GHF=PASS','OFFLINE_1S_CLOCK_REPLAY=PASS','REALTIME_1HZ_60=PASS','TWO_THREAD_2X2000=PASS','LONG_STABILITY_20000=PASS','PACKAGE_AUDIT=PASS',"RUN_ID=$env:GITHUB_RUN_ID")|Set-Content evidence_summary\EXACT_87EC_AUTHORITATIVE_RELEASE_PASS.lock;Copy-Item package_audit.txt evidence_summary\authoritative_package_audit.txt -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/EXACT_87EC_AUTHORITATIVE_RELEASE_PASS.lock evidence_summary/authoritative_package_audit.txt;git commit -m 'Lock exact 87ec authoritative native full-regression release PASS';if($LASTEXITCODE -ne 0){throw 'PASS_COMMIT_FAIL'};git fetch origin $env:BRANCH;git rebase "origin/$env:BRANCH";git push origin "HEAD:$env:BRANCH";if($LASTEXITCODE -ne 0){throw 'PASS_PUSH_FAIL'}
+
+      - name: Upload exact tested DLL ZIP and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-87ec-authoritative-release-${{ github.run_id }}
+          path: |
+            GuanHu_SigProc_Final_Release_20260809.zip
+            release/SigProcDll-64HF.dll
+            release/RELEASE_SHA256SUMS.txt
+            EXACT_87EC_AUTHORITATIVE_FULLREG_PASS.lock
+            package_audit.txt
+            authoritative_fullreg.log
+            authoritative_exit.txt
+            authoritative_evidence/**
+            clock_probe.csv
+            clock_probe.log
+            clock_probe_semantic.log
+            clock_host_compile.log
+            exact_asset_binding.txt
+            preflight_gate.txt
+            loader_inner-bed.log
+            loader_outer-medical-bed.log
+            crypto_binding.txt
+            threadfix_clock_report.json
+            hostcompat_clock_report.json
+            evidence_summary/EXACT_87EC_AUTHORITATIVE_RELEASE_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 30
