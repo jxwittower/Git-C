@@ -1,0 +1,16 @@
+name: rc3-chunk07-subblocks
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_chunk07_subblocks.yml']
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          dd if=.rc3delta/chunk_07 of="$RUNNER_TEMP/b12" bs=1 skip=6144 count=512 status=none
+          split -b 64 -d -a 1 "$RUNNER_TEMP/b12" "$RUNNER_TEMP/s_"
+          sha256sum "$RUNNER_TEMP"/s_*
+          cat "$RUNNER_TEMP/b12"
