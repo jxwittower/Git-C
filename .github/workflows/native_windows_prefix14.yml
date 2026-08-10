@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/rc3.delta.enc.b64"
-          for i in $(seq -w 0 9); do
+          for i in $(seq -w 00 09); do
             f=".rc3delta/chunk_${i}"
             test -s "$f"
             cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"
