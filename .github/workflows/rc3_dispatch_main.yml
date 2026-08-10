@@ -1,0 +1,16 @@
+name: rc3-dispatch-main
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_dispatch_main.yml']
+permissions:
+  actions: write
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch exact RC3 native Windows gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run native_windows_prefix14.yml --repo ${{ github.repository }} --ref rc3-native-gate-20260810r
