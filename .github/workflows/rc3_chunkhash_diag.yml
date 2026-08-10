@@ -1,0 +1,12 @@
+name: rc3-chunkhash-diag
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_chunkhash_diag.yml']
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: sha256sum .rc3delta/chunk_*
