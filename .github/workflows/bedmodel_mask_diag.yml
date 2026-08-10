@@ -33,13 +33,16 @@ jobs:
       - name: Run controlled bed model mask matrix
         shell: powershell
         run: |
-          $ErrorActionPreference='Continue'
+          $ErrorActionPreference='Stop'
           $payload=Resolve-Path 'baseline_artifact\payload'
           $h=(Get-FileHash "$payload\HostCompat.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
           if($h -ne $env:HOST_SHA){ throw "HOST_SHA_FAIL $h" }
-          $base=[System.IO.File]::ReadAllBytes("$payload\runtime\inner-bed\file_bed_model_v1")
+          $modelPath="$payload\runtime\inner-bed\file_bed_model_v1"
+          $base=[System.IO.File]::ReadAllBytes($modelPath)
+          if($base.Length -ne 30348){ throw "BED_MODEL_SIZE_FAIL $($base.Length)" }
+          $max=[UInt64]::MaxValue
           $variants=@(
-            @{Name='ACCEPT0'; Mask=[UInt64]0xffffffffffffffff; Accepted=0},
+            @{Name='ACCEPT0'; Mask=$max; Accepted=0},
             @{Name='MASK0'; Mask=[UInt64]0; Accepted=180},
             @{Name='MASK1'; Mask=[UInt64]1; Accepted=180},
             @{Name='MASK2'; Mask=[UInt64]3; Accepted=180},
@@ -47,7 +50,7 @@ jobs:
             @{Name='MASK8'; Mask=[UInt64]255; Accepted=180},
             @{Name='MASK16'; Mask=[UInt64]65535; Accepted=180},
             @{Name='MASK32'; Mask=[UInt64]4294967295; Accepted=180},
-            @{Name='MASK64'; Mask=[UInt64]0xffffffffffffffff; Accepted=180}
+            @{Name='MASK64'; Mask=$max; Accepted=180}
           )
           Remove-Item bedmodel_mask_probe.txt -ErrorAction SilentlyContinue
           foreach($v in $variants){
@@ -70,6 +73,7 @@ jobs:
             "$($v.Name) EXIT=$rc" | Tee-Object bedmodel_mask_probe.txt -Append
           }
           Get-Content bedmodel_mask_probe.txt
+          if(!(Test-Path bedmodel_mask_probe.txt)){ throw 'MASK_PROBE_OUTPUT_MISSING' }
       - if: always()
         uses: actions/upload-artifact@v4
         with:
