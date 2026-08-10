@@ -1,0 +1,54 @@
+name: c8b8-vs-host-current-runner
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/c8b8_vs_host_current_runner.yml']
+permissions:
+  actions: read
+  contents: read
+jobs:
+  compare:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '9034484495'
+          path: art
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - name: Bind candidate and HostCompat hashes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $c=(Get-FileHash art\payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();$h=(Get-FileHash art\payload\HostCompat.dll -Algorithm SHA256).Hash.ToLowerInvariant();"CANDIDATE_SHA=$c`nHOST_SHA=$h"|Tee-Object bind.txt
+          if($c-ne'c8b8f496c665452fe07f15bad993b8bf37fb8cfb1651715cb6abd4b562878201'){throw $c}
+          if($h-ne'081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'){throw $h}
+      - name: Run exact contract smoke for old C8B8 and HostCompat
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          foreach($name in @('c8b8','host')){New-Item -ItemType Directory -Force $name|Out-Null;Copy-Item art\payload\runtime\inner-bed\* "$name\" -Force;Copy-Item art\payload\SigProcLoaderContractSmoke.exe "$name\" -Force}
+          Copy-Item art\payload\SigProcDll-64HF.dll c8b8\SigProcDll-64HF.dll -Force
+          Copy-Item art\payload\HostCompat.dll host\SigProcDll-64HF.dll -Force
+          foreach($name in @('c8b8','host')){Push-Location $name;.\SigProcLoaderContractSmoke.exe *>&1|Tee-Object -FilePath "..\$name.txt";"$name`_EXIT=$LASTEXITCODE"|Add-Content "..\$name.txt";Pop-Location}
+          Get-Content c8b8.txt;Get-Content host.txt
+          exit 0
+      - name: Probe native debugger availability
+        shell: powershell
+        run: |
+          $tools=@('cdb.exe','windbg.exe','procdump.exe','dumpbin.exe')
+          foreach($t in $tools){$x=Get-Command $t -ErrorAction SilentlyContinue;if($x){"$t=$($x.Source)"}else{"$t=NOT_FOUND"}} | Set-Content debugger_probe.txt
+          Get-Content debugger_probe.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c8b8-vs-host-current-${{ github.run_id }}
+          path: |
+            bind.txt
+            c8b8.txt
+            host.txt
+            debugger_probe.txt
+          retention-days: 7
