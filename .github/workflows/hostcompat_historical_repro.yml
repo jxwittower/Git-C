@@ -1,0 +1,71 @@
+name: hostcompat-historical-repro
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/hostcompat_historical_repro.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  repro:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '9034484495'
+          path: art
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Bind exact historical payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $want=@{'HostCompat.dll'='081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804';'C63.dll'='56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb';'fullreg.c'='f946ba5e503f7f921aec0e9b4632981540d7487004596b5940053bc817694b14'}
+          foreach($k in $want.Keys){$h=(Get-FileHash "art\payload\$k" -Algorithm SHA256).Hash.ToLowerInvariant();if($h-ne$want[$k]){throw "$k $h"}}
+          'HISTORICAL_PAYLOAD_BIND_PASS'|Out-File bind.txt
+      - name: Compile historical fullreg exactly
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg_hist.exe art\payload\fullreg.c *>&1|Tee-Object compile.txt
+          if($LASTEXITCODE-ne0){throw "COMPILE $LASTEXITCODE"}
+      - name: Run historical HostCompat baseline path and stop at missing candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          .\fullreg_hist.exe missing_candidate.dll art\payload\HostCompat.dll art\payload\C63.dll art\payload\runtime\inner-bed art\payload\runtime\outer-medical-bed art\payload\testdata *>&1 | Tee-Object historical_path.txt
+          "HISTORICAL_PATH_EXIT=$LASTEXITCODE"|Add-Content historical_path.txt
+          Get-Content historical_path.txt
+          exit 0
+      - name: Run standalone contract smoke against same HostCompat and runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          New-Item -ItemType Directory -Force smoke_host|Out-Null
+          Copy-Item art\payload\runtime\inner-bed\* smoke_host\ -Force
+          Copy-Item art\payload\HostCompat.dll smoke_host\SigProcDll-64HF.dll -Force
+          Copy-Item art\payload\SigProcLoaderContractSmoke.exe smoke_host\ -Force
+          Push-Location smoke_host
+          .\SigProcLoaderContractSmoke.exe *>&1|Tee-Object -FilePath ..\standalone_smoke.txt
+          "STANDALONE_EXIT=$LASTEXITCODE"|Add-Content ..\standalone_smoke.txt
+          Pop-Location
+          Get-Content standalone_smoke.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hostcompat-historical-repro-${{ github.run_id }}
+          path: |
+            bind.txt
+            compile.txt
+            historical_path.txt
+            standalone_smoke.txt
+          retention-days: 7
