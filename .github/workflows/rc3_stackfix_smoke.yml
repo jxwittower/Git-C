@@ -1,0 +1,175 @@
+name: rc3-stackfix-native-smoke
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_stackfix_smoke.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  SMOKE_SHA: 'a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+  STACKFIX_SHA: '908510ae883885fbc6b5d7df5b083c9d96570b8075194acef433bee8dafc53c3'
+jobs:
+  stackfix-smoke:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - name: Bind baseline and encrypted delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum baseline_artifact/payload/HostCompat.dll | awk '{print $1}')" = "$HOST_SHA"
+          test "$(sha256sum baseline_artifact/payload/SigProcLoaderContractSmoke.exe | awk '{print $1}')" = "$SMOKE_SHA"
+          : > "$RUNNER_TEMP/rc3.delta.enc.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"; done
+          test "$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")" = 74904
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')" = "$DELTA_B64_SHA"
+          base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')" = "$DELTA_ENC_SHA"
+          echo STACKFIX_INPUT_BINDING_PASS
+      - name: Create one-time RSA key
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .secure_rc3_stackfix
+          mkdir -p .secure_rc3_stackfix
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private_stackfix.pem"
+          openssl pkey -in "$RUNNER_TEMP/private_stackfix.pem" -pubout -out .secure_rc3_stackfix/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3_stackfix/public.pem
+          git commit -m 'Publish RC3 stackfix smoke RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Receive wrapped AES key
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 240); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3_stackfix/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          base64 -d .secure_rc3_stackfix/key.enc.b64 > "$RUNNER_TEMP/key_stackfix.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private_stackfix.pem" -in "$RUNNER_TEMP/key_stackfix.enc" -out "$RUNNER_TEMP/pass_stackfix.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          test -s "$RUNNER_TEMP/pass_stackfix.txt"
+      - name: Reconstruct exact frozen RC3 and apply SHA-bound stack probe repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass_stackfix.txt"
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')" = "$DELTA_XZ_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import lzma,struct,os,hashlib
+          base=Path('baseline_artifact/payload/HostCompat.dll').read_bytes()
+          raw=lzma.decompress((Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz').read_bytes())
+          assert raw[:4]==b'R3D1'
+          target,nops=struct.unpack_from('<II',raw,4); pos=12; out=bytearray()
+          for _ in range(nops):
+              op=raw[pos:pos+1]; pos+=1
+              if op==b'C':
+                  src,n=struct.unpack_from('<II',raw,pos); pos+=8; out.extend(base[src:src+n])
+              elif op==b'L':
+                  n,=struct.unpack_from('<I',raw,pos); pos+=4; out.extend(raw[pos:pos+n]); pos+=n
+              else: raise SystemExit('BAD_DELTA_OPCODE')
+          assert pos==len(raw) and len(out)==target
+          Path('candidate').mkdir(exist_ok=True)
+          Path('candidate/RC3-frozen.dll').write_bytes(out)
+          print('FROZEN_RC3_SHA256='+hashlib.sha256(out).hexdigest())
+          PY
+          test "$(sha256sum candidate/RC3-frozen.dll | awk '{print $1}')" = "$RC3_SHA"
+          python tools/apply_windows_stackprobe_fix.py candidate/RC3-frozen.dll candidate/SigProcDll-64HF.dll --report stackfix_report.json
+          sf=$(sha256sum candidate/SigProcDll-64HF.dll | awk '{print $1}')
+          test "$sf" = "$STACKFIX_SHA"
+          test "$(wc -c < candidate/SigProcDll-64HF.dll)" = 442880
+          echo "STACKFIX_SHA256=$sf" | tee stackfix_binding.txt
+          echo EXACT_STACKFIX_RECONSTRUCTION_PASS | tee -a stackfix_binding.txt
+          rm -f "$RUNNER_TEMP/pass_stackfix.txt" "$RUNNER_TEMP/key_stackfix.enc" "$RUNNER_TEMP/private_stackfix.pem"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Gate PE ABI after stack repair
+        shell: cmd
+        run: |
+          dumpbin /headers candidate\SigProcDll-64HF.dll > stackfix_headers.txt
+          dumpbin /exports candidate\SigProcDll-64HF.dll > stackfix_exports.txt
+          dumpbin /imports candidate\SigProcDll-64HF.dll > stackfix_imports.txt
+          findstr /C:"14C machine (x86)" stackfix_headers.txt > nul || exit /b 31
+          findstr /C:".stkfix" stackfix_headers.txt > nul || exit /b 32
+          findstr /C:"_SigProc@24" stackfix_exports.txt > nul || exit /b 33
+          findstr /C:"_SigProc_Init@8" stackfix_exports.txt > nul || exit /b 34
+          findstr /C:"_SigProc_Stat@0" stackfix_exports.txt > nul || exit /b 35
+          findstr /C:"_SigProc_Fini@0" stackfix_exports.txt > nul || exit /b 36
+          findstr /I /C:"ucrtbase.dll" stackfix_imports.txt > nul && exit /b 37 || ver > nul
+          echo STACKFIX_PE_ABI_PASS> stackfix_pe_gate.txt
+      - name: Native real-license full-runtime contract smoke
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force smoke_work | Out-Null
+          Copy-Item candidate\SigProcDll-64HF.dll smoke_work\SigProcDll-64HF.dll -Force
+          Copy-Item baseline_artifact\payload\SigProcLoaderContractSmoke.exe smoke_work\ -Force
+          Copy-Item baseline_artifact\payload\runtime\inner-bed\* smoke_work\ -Force
+          Push-Location smoke_work
+          .\SigProcLoaderContractSmoke.exe *> ..\stackfix_loader_smoke.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          Get-Content stackfix_loader_smoke.txt
+          if($rc -ne 0){ throw "STACKFIX_LOADER_CONTRACT_FAIL rc=$rc" }
+          if(-not (Select-String stackfix_loader_smoke.txt -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS')){ throw 'STACKFIX_PASS_MARKER_MISSING' }
+          'STACKFIX_NATIVE_REAL_LICENSE_FULL_RUNTIME_PASS' | Out-File stackfix_smoke_gate.txt
+      - name: Repeat full-runtime service-style smoke 50 times
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location smoke_work
+          for($i=1;$i -le 50;$i++){
+            .\SigProcLoaderContractSmoke.exe *> $null
+            if($LASTEXITCODE -ne 0){ throw "STACKFIX_REPEAT_FAIL iteration=$i rc=$LASTEXITCODE" }
+          }
+          Pop-Location
+          'STACKFIX_REPEAT_50_PASS' | Out-File stackfix_repeat_gate.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc3-stackfix-native-smoke-${{ github.run_id }}
+          path: |
+            stackfix_report.json
+            stackfix_binding.txt
+            stackfix_headers.txt
+            stackfix_exports.txt
+            stackfix_imports.txt
+            stackfix_pe_gate.txt
+            stackfix_loader_smoke.txt
+            stackfix_smoke_gate.txt
+            stackfix_repeat_gate.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3_stackfix
+          git add -A .secure_rc3_stackfix || true
+          if ! git diff --cached --quiet; then git commit -m 'Remove RC3 stackfix smoke RSA handoff'; git push origin HEAD:${GITHUB_REF_NAME} || true; fi
