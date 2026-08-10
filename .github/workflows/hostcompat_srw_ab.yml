@@ -1,0 +1,54 @@
+name: hostcompat-srw-ab
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/hostcompat_srw_ab.yml']
+permissions:
+  actions: read
+  contents: read
+jobs:
+  ab:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '9034484495'
+          path: art
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - name: Prepare original and no-SRW variants
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($d in @('orig','nosrw')){New-Item -ItemType Directory -Force $d|Out-Null;Copy-Item art\payload\runtime\inner-bed\* "$d\" -Force;Copy-Item art\payload\SigProcLoaderContractSmoke.exe "$d\" -Force;Copy-Item art\payload\HostCompat.dll "$d\SigProcDll-64HF.dll" -Force}
+          @'
+          from pathlib import Path
+          p=Path('nosrw/SigProcDll-64HF.dll');b=bytearray(p.read_bytes())
+          for rva in (0x63e78,0x63e7e):
+            off=rva-0x1000+0x400
+            old=bytes(b[off:off+6]);print(hex(rva),hex(off),old.hex())
+            assert old[0:2]==b'\xff\x25',old.hex()
+            b[off:off+6]=b'\xc2\x04\x00\x90\x90\x90'
+          p.write_bytes(b)
+          print('PATCHED_SHA256',__import__('hashlib').sha256(b).hexdigest())
+          '@ | python -
+      - name: Run A original and B no-SRW contract smoke
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          Push-Location orig; .\SigProcLoaderContractSmoke.exe *> ..\orig.txt; "ORIG_EXIT=$LASTEXITCODE"|Add-Content ..\orig.txt; Pop-Location
+          Push-Location nosrw; .\SigProcLoaderContractSmoke.exe *> ..\nosrw.txt; "NOSRW_EXIT=$LASTEXITCODE"|Add-Content ..\nosrw.txt; Pop-Location
+          Write-Host '=== ORIGINAL ==='; Get-Content orig.txt
+          Write-Host '=== NO SRW ==='; Get-Content nosrw.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hostcompat-srw-ab-${{ github.run_id }}
+          path: |
+            orig.txt
+            nosrw.txt
+          retention-days: 7
