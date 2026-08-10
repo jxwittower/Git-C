@@ -1,0 +1,81 @@
+name: baseline-realcall-isolated-diagnostic
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/baseline_realcall_isolated_diag.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  C63_SHA: '56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+jobs:
+  isolate:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Bind baselines and compile unbuffered probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=Resolve-Path 'baseline_artifact\payload'
+          $hh=(Get-FileHash "$p\HostCompat.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ch=(Get-FileHash "$p\C63.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hh -ne $env:HOST_SHA){ throw "HOST_SHA_FAIL $hh" }
+          if($ch -ne $env:C63_SHA){ throw "C63_SHA_FAIL $ch" }
+          cmd /c "cl /nologo /O2 /W4 /TC diagnostics\sigproc_realcall_stage_probe.c /Fe:realcall_probe.exe > probe_build.txt 2>&1"
+          if($LASTEXITCODE -ne 0){ Get-Content probe_build.txt; throw "PROBE_BUILD_FAIL $LASTEXITCODE" }
+          Get-Content probe_build.txt
+      - name: Run HostCompat and C63 in isolated child processes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=Resolve-Path 'baseline_artifact\payload'
+          $runtime=Resolve-Path "$p\runtime\inner-bed"
+          $ghf=Resolve-Path "$p\testdata\inner-bed\02_supine.ghf"
+          $dlls=@(
+            @{Name='HOST'; Path=(Resolve-Path "$p\HostCompat.dll")},
+            @{Name='C63'; Path=(Resolve-Path "$p\C63.dll")}
+          )
+          $counts=@(1,2,5,25)
+          $summary=@()
+          foreach($d in $dlls){
+            foreach($n in $counts){
+              $out="probe_$($d.Name)_$n.txt"
+              $err="probe_$($d.Name)_$n.err.txt"
+              $proc=Start-Process -FilePath (Resolve-Path '.\realcall_probe.exe') -ArgumentList @("`"$($d.Path)`"","`"$runtime`"","`"$ghf`"",$n) -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+              $code=[Int64]$proc.ExitCode
+              $hex=('0x{0:X8}' -f ([UInt32]$proc.ExitCode))
+              "===== TARGET=$($d.Name) CALLS=$n EXIT_DEC=$code EXIT_HEX=$hex =====" | Tee-Object -FilePath baseline_realcall_summary.txt -Append
+              if(Test-Path $out){ Get-Content $out | Tee-Object -FilePath baseline_realcall_summary.txt -Append }
+              if((Test-Path $err) -and ((Get-Item $err).Length -gt 0)){ '--- STDERR ---' | Tee-Object -FilePath baseline_realcall_summary.txt -Append; Get-Content $err | Tee-Object -FilePath baseline_realcall_summary.txt -Append }
+              $summary += [PSCustomObject]@{Target=$d.Name;Calls=$n;ExitDecimal=$code;ExitHex=$hex;Output=$out;Error=$err}
+            }
+          }
+          $summary | Format-Table -AutoSize | Out-String | Tee-Object -FilePath baseline_realcall_matrix.txt
+          Get-Content baseline_realcall_matrix.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-realcall-isolated-${{ github.run_id }}
+          path: |
+            probe_build.txt
+            baseline_realcall_summary.txt
+            baseline_realcall_matrix.txt
+            probe_*.txt
+          if-no-files-found: ignore
+          retention-days: 14
