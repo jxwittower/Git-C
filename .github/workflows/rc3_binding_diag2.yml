@@ -1,0 +1,28 @@
+name: rc3-binding-diag2
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_binding_diag2.yml']
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Explicit encrypted delta diagnostics
+        shell: bash
+        run: |
+          set -u
+          : > "$RUNNER_TEMP/all.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do
+            echo "$f $(wc -c < "$f") $(sha256sum "$f" | awk '{print $1}')"
+            cat "$f" >> "$RUNNER_TEMP/all.b64"
+          done
+          echo TOTAL_BYTES=$(wc -c < "$RUNNER_TEMP/all.b64")
+          echo TOTAL_SHA=$(sha256sum "$RUNNER_TEMP/all.b64" | awk '{print $1}')
+          set +e
+          base64 -d "$RUNNER_TEMP/all.b64" > "$RUNNER_TEMP/all.enc"
+          rc=$?
+          set -e
+          echo BASE64_RC=$rc
+          echo ENC_BYTES=$(wc -c < "$RUNNER_TEMP/all.enc")
+          echo ENC_SHA=$(sha256sum "$RUNNER_TEMP/all.enc" | awk '{print $1}')
