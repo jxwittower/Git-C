@@ -43,7 +43,7 @@ jobs:
       - name: Run HostCompat and C63 in isolated child processes
         shell: powershell
         run: |
-          $ErrorActionPreference='Stop'
+          $ErrorActionPreference='Continue'
           $p=Resolve-Path 'baseline_artifact\payload'
           $runtime=Resolve-Path "$p\runtime\inner-bed"
           $ghf=Resolve-Path "$p\testdata\inner-bed\02_supine.ghf"
@@ -58,8 +58,9 @@ jobs:
               $out="probe_$($d.Name)_$n.txt"
               $err="probe_$($d.Name)_$n.err.txt"
               $proc=Start-Process -FilePath (Resolve-Path '.\realcall_probe.exe') -ArgumentList @("`"$($d.Path)`"","`"$runtime`"","`"$ghf`"",$n) -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
-              $code=[Int64]$proc.ExitCode
-              $hex=('0x{0:X8}' -f ([UInt32]$proc.ExitCode))
+              $code=[Int32]$proc.ExitCode
+              $unsigned=[BitConverter]::ToUInt32([BitConverter]::GetBytes($code),0)
+              $hex=('0x{0:X8}' -f $unsigned)
               "===== TARGET=$($d.Name) CALLS=$n EXIT_DEC=$code EXIT_HEX=$hex =====" | Tee-Object -FilePath baseline_realcall_summary.txt -Append
               if(Test-Path $out){ Get-Content $out | Tee-Object -FilePath baseline_realcall_summary.txt -Append }
               if((Test-Path $err) -and ((Get-Item $err).Length -gt 0)){ '--- STDERR ---' | Tee-Object -FilePath baseline_realcall_summary.txt -Append; Get-Content $err | Tee-Object -FilePath baseline_realcall_summary.txt -Append }
