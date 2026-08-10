@@ -1,0 +1,79 @@
+name: bedmodel-mask-diagnostic
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/bedmodel_mask_diag.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Compile Init probe
+        shell: cmd
+        run: |
+          cl /nologo /O2 /W4 /TC diagnostics\sigproc_init_seh_probe.c /Fe:initprobe.exe
+      - name: Run controlled bed model mask matrix
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          $payload=Resolve-Path 'baseline_artifact\payload'
+          $h=(Get-FileHash "$payload\HostCompat.dll" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:HOST_SHA){ throw "HOST_SHA_FAIL $h" }
+          $base=[System.IO.File]::ReadAllBytes("$payload\runtime\inner-bed\file_bed_model_v1")
+          $variants=@(
+            @{Name='ACCEPT0'; Mask=[UInt64]0xffffffffffffffff; Accepted=0},
+            @{Name='MASK0'; Mask=[UInt64]0; Accepted=180},
+            @{Name='MASK1'; Mask=[UInt64]1; Accepted=180},
+            @{Name='MASK2'; Mask=[UInt64]3; Accepted=180},
+            @{Name='MASK4'; Mask=[UInt64]15; Accepted=180},
+            @{Name='MASK8'; Mask=[UInt64]255; Accepted=180},
+            @{Name='MASK16'; Mask=[UInt64]65535; Accepted=180},
+            @{Name='MASK32'; Mask=[UInt64]4294967295; Accepted=180},
+            @{Name='MASK64'; Mask=[UInt64]0xffffffffffffffff; Accepted=180}
+          )
+          Remove-Item bedmodel_mask_probe.txt -ErrorAction SilentlyContinue
+          foreach($v in $variants){
+            $d="mask_$($v.Name)"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item initprobe.exe "$d\initprobe.exe"
+            Copy-Item "$payload\HostCompat.dll" "$d\SigProcDll-64HF.dll"
+            Copy-Item "$payload\runtime\inner-bed\filter_brth" "$d\filter_brth"
+            Copy-Item "$payload\runtime\inner-bed\filter_hrt3" "$d\filter_hrt3"
+            Copy-Item "$payload\runtime\inner-bed\file_sig" "$d\file_sig"
+            $b=[byte[]]$base.Clone()
+            [BitConverter]::GetBytes([UInt32]$v.Accepted).CopyTo($b,68)
+            [BitConverter]::GetBytes([UInt64]$v.Mask).CopyTo($b,84)
+            [System.IO.File]::WriteAllBytes("$d\file_bed_model_v1",$b)
+            "===== $($v.Name) MASK=0x$('{0:X16}' -f [UInt64]$v.Mask) ACCEPTED=$($v.Accepted) =====" | Tee-Object bedmodel_mask_probe.txt -Append
+            Push-Location $d
+            & .\initprobe.exe SigProcDll-64HF.dll 3 2>&1 | Tee-Object ..\bedmodel_mask_probe.txt -Append
+            $rc=$LASTEXITCODE
+            Pop-Location
+            "$($v.Name) EXIT=$rc" | Tee-Object bedmodel_mask_probe.txt -Append
+          }
+          Get-Content bedmodel_mask_probe.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bedmodel-mask-diagnostic-${{ github.run_id }}
+          path: bedmodel_mask_probe.txt
+          if-no-files-found: ignore
+          retention-days: 14
