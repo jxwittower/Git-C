@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse, struct, hashlib, json
 
 EXPECTED_INPUT_SHA = '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+# RC3-specific RVAs, verified against llvm-objdump disassembly of the frozen PE.
 SITES = [
     (0x1209, 0x2290),
     (0x2A04, 0x214C),
@@ -52,6 +53,7 @@ def main():
     sec = opt + opt_size
     sec_align = struct.unpack_from('<I', b, opt + 32)[0]
     file_align = struct.unpack_from('<I', b, opt + 36)[0]
+    size_headers = struct.unpack_from('<I', b, opt + 60)[0]
 
     sections=[]
     text=None
@@ -68,45 +70,56 @@ def main():
         raise SystemExit('NO_SECTION_HEADER_SLACK')
 
     tvs,tva,trs,trp,_=text
+    # The site set is derived from instruction-level llvm-objdump audit, not
+    # from blind byte scanning (0x81ec may occur inside unrelated immediates).
+    # Here we bind every expected site to its exact original instruction bytes.
     for rva, imm in SITES:
         fo=trp+(rva-tva)
         exp=b'\x81\xec'+struct.pack('<I',imm)
         if bytes(b[fo:fo+6]) != exp:
             raise SystemExit(f'PREPATCH_SITE_MISMATCH rva=0x{rva:x} got={bytes(b[fo:fo+6]).hex()} expected={exp.hex()}')
 
+    # Probe helper. The call-site byte after each CALL selects the allocation
+    # size from the table. It advances the saved return address by one byte,
+    # probes one page at a time, then leaves ESP exactly as the original
+    # `sub esp, imm32` would have done. This is the same helper design already
+    # validated on real Windows Server 2022 with the HostCompat build.
     helper_code=bytes.fromhex(
-        '5152'
-        '8b542408'
-        '0fb602'
-        '42'
-        '89542408'
-        'e800000000'
-        '59'
-        '8d893d000000'
-        '8b0481'
-        '8d54240c'
-        '3d00100000'
-        '7214'
-        '81ea00100000'
-        '8512'
-        '2d00100000'
-        '3d00100000'
-        '77ec'
-        '29c2'
-        '8512'
-        '8b4c2408'
-        '894afc'
-        '89d0'
-        '5a59'
-        '8d60fc'
-        'c3'
-        '9090'
+        '5152'                  # push ecx; push edx
+        '8b542408'              # mov edx,[esp+8] (saved return address)
+        '0fb602'                # movzx eax,byte ptr [edx]
+        '42'                    # inc edx
+        '89542408'              # mov [esp+8],edx (skip selector byte on return)
+        'e800000000'            # call $+5
+        '59'                    # pop ecx
+        '8d893d000000'          # lea ecx,[ecx+0x3d] -> size table
+        '8b0481'                # mov eax,[ecx+eax*4]
+        '8d54240c'              # lea edx,[esp+0xc] -> caller ESP before CALL
+        '3d00100000'            # cmp eax,0x1000
+        '7214'                  # jb tail
+        '81ea00100000'          # sub edx,0x1000
+        '8512'                  # test [edx],edx (touch page)
+        '2d00100000'            # sub eax,0x1000
+        '3d00100000'            # cmp eax,0x1000
+        '77ec'                  # ja loop
+        '29c2'                  # sub edx,eax
+        '8512'                  # test [edx],edx (touch tail page)
+        '8b4c2408'              # mov ecx,[esp+8] saved return
+        '894afc'                # mov [edx-4],ecx (place return at new top-4)
+        '89d0'                  # mov eax,edx
+        '5a59'                  # pop edx; pop ecx
+        '8d60fc'                # lea esp,[eax-4]
+        'c3'                    # ret
+        '90'                    # one-byte padding; table starts at helper+0x50
     )
     table=b''.join(struct.pack('<I', imm) for _,imm in SITES)
     helper=helper_code+table
-    if len(helper_code) != 0x51 or len(helper) != 0x51 + 4*len(SITES):
+    # CALL $+5 pushes helper offset 0x13; LEA adds 0x3d, so the table must
+    # start at section offset 0x50 (= 0x13 + 0x3d).
+    if len(helper_code) != 0x50 or len(helper) != 0x50 + 4*len(SITES):
         raise SystemExit(f'HELPER_LAYOUT_ERROR code={len(helper_code)} total={len(helper)}')
 
+    # New section after the highest-VA section. Preserve all original bytes.
     last=max(sections,key=lambda x:x[2])
     nva=align(last[2]+max(last[1],last[3]),sec_align)
     nrp=align(len(b),file_align)
@@ -121,8 +134,8 @@ def main():
     struct.pack_into('<IIIIIIHHI', b, so+8,
                      len(helper), nva, nrs, nrp, 0,0,0,0,0x60000020)
     struct.pack_into('<H', b, fh+2, ns+1)
-    struct.pack_into('<I', b, opt+56, align(nva+len(helper),sec_align))
-    struct.pack_into('<I', b, opt+4, struct.unpack_from('<I',b,opt+4)[0]+nrs)
+    struct.pack_into('<I', b, opt+56, align(nva+len(helper),sec_align)) # SizeOfImage
+    struct.pack_into('<I', b, opt+4, struct.unpack_from('<I',b,opt+4)[0]+nrs) # SizeOfCode
 
     patches=[]
     for idx,(rva,imm) in enumerate(SITES):
