@@ -8,60 +8,87 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: write
 
-defaults:
-  run:
-    shell: powershell
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  C63_SHA: '56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+  SMOKE_SHA: 'a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+  FULLREG_SHA: 'f946ba5e503f7f921aec0e9b4632981540d7487004596b5940053bc817694b14'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
 
 jobs:
   native-rc3:
     runs-on: windows-2022
-    timeout-minutes: 45
-    env:
-      DRIVE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
-      ENC_SHA: 28654a7d311f58f9a0893b778739681fda29bc6b337468ea41cc068f454ae801
-      ENC_BYTES: 173824
-      XZ_SHA: 1fb3af89fc41d2f63a78f9fea9ce74845d70c23eabed177d7d6cd426cd4e24b0
-      DLL_SHA: 1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92
-      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    timeout-minutes: 55
     steps:
-      - name: Checkout
+      - name: Checkout exact test branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Download exact encrypted RC3 payload with Drive curl fallbacks
+      - name: Download verified prior Windows payload artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          merge-multiple: true
+
+      - name: Bind baseline artifact and real GHF corpus
+        shell: powershell
         run: |
           $ErrorActionPreference='Stop'
-          $out="$env:RUNNER_TEMP\payload.enc"
-          $urls=@(
-            "https://drive.usercontent.google.com/download?id=$env:DRIVE_ID&export=download&confirm=t",
-            "https://drive.google.com/uc?export=download&id=$env:DRIVE_ID&confirm=t"
-          )
-          $ok=$false
-          $attempt=0
-          foreach($u in $urls){
-            $attempt++
-            Remove-Item $out -Force -ErrorAction SilentlyContinue
-            & curl.exe -L --fail --silent --show-error --connect-timeout 20 --max-time 90 -o $out $u
-            $curlrc=$LASTEXITCODE
-            if($curlrc -ne 0 -or !(Test-Path $out)){
-              "ATTEMPT=$attempt CURL_RC=$curlrc NO_FILE=1" | Add-Content drive_download_probe.txt
-              continue
-            }
-            $n=(Get-Item $out).Length
-            $h=(Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
-            "ATTEMPT=$attempt BYTES=$n SHA256=$h" | Add-Content drive_download_probe.txt
-            if(($n -eq [int64]$env:ENC_BYTES) -and ($h -eq $env:ENC_SHA)){
-              $ok=$true
-              break
+          $p = Resolve-Path 'baseline_artifact\payload'
+          $checks = @{
+            'HostCompat.dll' = $env:HOST_SHA
+            'C63.dll' = $env:C63_SHA
+            'SigProcLoaderContractSmoke.exe' = $env:SMOKE_SHA
+            'fullreg.c' = $env:FULLREG_SHA
+          }
+          foreach($name in $checks.Keys){
+            $f = Join-Path $p $name
+            if(!(Test-Path $f)){ throw "BASELINE_MISSING $name" }
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($h -ne $checks[$name]){ throw "BASELINE_SHA_MISMATCH $name $h" }
+          }
+          $ghf = Get-ChildItem (Join-Path $p 'testdata') -Recurse -Filter '*.ghf'
+          if($ghf.Count -ne 13){ throw "GHF_COUNT_MISMATCH $($ghf.Count)" }
+          foreach($bed in @('inner-bed','outer-medical-bed')){
+            foreach($f in @('file_bed_model_v1','file_bias','file_sig','filter_brth','filter_hrt3')){
+              $q = Join-Path $p "runtime\$bed\$f"
+              if(!(Test-Path $q)){ throw "RUNTIME_MISSING $bed/$f" }
             }
           }
-          Get-Content drive_download_probe.txt
-          if(-not $ok){ throw 'EXACT_ENCRYPTED_PAYLOAD_DOWNLOAD_FAIL' }
-          "ENC_BYTES=$((Get-Item $out).Length)`nENC_SHA256=$((Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant())`nEXACT_ENCRYPTED_PAYLOAD_DOWNLOAD_PASS" | Tee-Object encrypted_payload.txt
+          "VERIFIED_ARTIFACT_ID=$env:ARTIFACT_ID`nHOST_SHA256=$env:HOST_SHA`nC63_SHA256=$env:C63_SHA`nSMOKE_SHA256=$env:SMOKE_SHA`nFULLREG_SHA256=$env:FULLREG_SHA`nGHF_FILES=13`nBASELINE_ARTIFACT_BINDING_PASS" | Tee-Object baseline_binding.txt
+
+      - name: Assemble and bind encrypted RC3 delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/rc3.delta.enc.b64"
+          for i in $(seq -w 0 9); do
+            f=".rc3delta/chunk_${i}"
+            test -s "$f"
+            cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"
+          done
+          b64_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")
+          b64_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')
+          test "$b64_bytes" = 74904
+          test "$b64_sha" = "$DELTA_B64_SHA"
+          base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
+          enc_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.xz.enc")
+          enc_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')
+          test "$enc_bytes" = 56176
+          test "$enc_sha" = "$DELTA_ENC_SHA"
+          printf 'DELTA_B64_BYTES=%s\nDELTA_B64_SHA256=%s\nDELTA_ENC_BYTES=%s\nDELTA_ENC_SHA256=%s\nENCRYPTED_DELTA_BINDING_PASS\n' "$b64_bytes" "$b64_sha" "$enc_bytes" "$enc_sha" | tee delta_binding.txt
 
       - name: Create one-time RSA transport key
         shell: bash
@@ -78,7 +105,7 @@ jobs:
           git push origin HEAD:${GITHUB_REF_NAME}
           echo EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED
 
-      - name: Wait for wrapped AES passphrase
+      - name: Wait for RSA-wrapped AES passphrase
         shell: bash
         run: |
           set -euo pipefail
@@ -91,58 +118,100 @@ jobs:
           test "$ok" = 1
           base64 -d .secure_rc3/key.enc.b64 > "$RUNNER_TEMP/key.enc"
           openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          test -s "$RUNNER_TEMP/pass.txt"
           echo RSA_WRAPPED_AES_KEY_RECEIVED
 
-      - name: Decrypt and bind exact RC3 payload
+      - name: Reconstruct exact RC3 from verified HostCompat
         shell: bash
         run: |
           set -euo pipefail
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
-          test "$(sha256sum "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')" = "$XZ_SHA"
-          mkdir -p payload
-          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C payload
-          for f in SigProcDll-64HF.dll SigProcLoaderContractSmoke.exe file_sig filter_brth filter_hrt3; do test -s "payload/$f"; done
-          test "$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')" = "$DLL_SHA"
-          test "$(sha256sum payload/SigProcLoaderContractSmoke.exe | awk '{print $1}')" = "$SMOKE_SHA"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          delta_xz_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')
+          test "$delta_xz_sha" = "$DELTA_XZ_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, lzma, struct
+          base = Path('baseline_artifact/payload/HostCompat.dll').read_bytes()
+          packed = Path(__import__('os').environ['RUNNER_TEMP']) / 'rc3.delta.xz'
+          raw = lzma.decompress(packed.read_bytes())
+          if raw[:4] != b'R3D1': raise SystemExit('DELTA_MAGIC_FAIL')
+          target_size, op_count = struct.unpack_from('<II', raw, 4)
+          pos = 12
+          out = bytearray()
+          for _ in range(op_count):
+              if pos >= len(raw): raise SystemExit('DELTA_TRUNCATED')
+              op = raw[pos:pos+1]; pos += 1
+              if op == b'C':
+                  src, n = struct.unpack_from('<II', raw, pos); pos += 8
+                  if src + n > len(base): raise SystemExit('DELTA_COPY_RANGE_FAIL')
+                  out.extend(base[src:src+n])
+              elif op == b'L':
+                  n, = struct.unpack_from('<I', raw, pos); pos += 4
+                  if pos + n > len(raw): raise SystemExit('DELTA_LITERAL_RANGE_FAIL')
+                  out.extend(raw[pos:pos+n]); pos += n
+              else:
+                  raise SystemExit(f'DELTA_OPCODE_FAIL {op!r}')
+          if pos != len(raw): raise SystemExit(f'DELTA_TRAILING_BYTES {len(raw)-pos}')
+          if len(out) != target_size: raise SystemExit(f'DELTA_SIZE_FAIL {len(out)} {target_size}')
+          p = Path('rc3_payload')
+          p.mkdir(exist_ok=True)
+          q = p / 'SigProcDll-64HF.dll'
+          q.write_bytes(out)
+          print('DELTA_OPS', op_count)
+          print('RC3_BYTES', len(out))
+          print('RC3_SHA256', hashlib.sha256(out).hexdigest())
+          PY
+          rc3_sha=$(sha256sum rc3_payload/SigProcDll-64HF.dll | awk '{print $1}')
+          rc3_bytes=$(wc -c < rc3_payload/SigProcDll-64HF.dll)
+          test "$rc3_sha" = "$RC3_SHA"
+          test "$rc3_bytes" = 442368
           rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/private.pem"
-          echo RC3_PAYLOAD_BINDING_PASS | tee payload_binding.txt
+          printf 'DELTA_XZ_SHA256=%s\nRC3_BYTES=%s\nRC3_SHA256=%s\nEXACT_RC3_RECONSTRUCTION_PASS\n' "$delta_xz_sha" "$rc3_bytes" "$rc3_sha" | tee rc3_reconstruction.txt
 
       - name: Configure MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
 
-      - name: Static PE ABI evidence
+      - name: Record and gate exact PE ABI
         shell: cmd
         run: |
           ver > windows_environment.txt
           echo PROCESSOR_ARCHITECTURE=%PROCESSOR_ARCHITECTURE%>> windows_environment.txt
           where dumpbin >> windows_environment.txt
-          dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
-          dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
-          dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
+          dumpbin /headers rc3_payload\SigProcDll-64HF.dll > pe_headers.txt
+          dumpbin /exports rc3_payload\SigProcDll-64HF.dll > pe_exports.txt
+          dumpbin /imports rc3_payload\SigProcDll-64HF.dll > pe_imports.txt
           findstr /C:"14C machine (x86)" pe_headers.txt > nul || exit /b 31
           findstr /C:"_SigProc@24" pe_exports.txt > nul || exit /b 32
           findstr /C:"_SigProc_Init@8" pe_exports.txt > nul || exit /b 33
           findstr /C:"_SigProc_Stat@0" pe_exports.txt > nul || exit /b 34
           findstr /C:"_SigProc_Fini@0" pe_exports.txt > nul || exit /b 35
           findstr /I /C:"ucrtbase.dll" pe_imports.txt > nul && exit /b 36 || ver > nul
+          echo EXACT_PE32_X86_EXPORT_IMPORT_GATE_PASS> pe_gate.txt
 
-      - name: Native loader contract
-        shell: cmd
-        working-directory: payload
-        run: |
-          SigProcLoaderContractSmoke.exe > ..\loader_smoke.txt 2>&1
-          set RC=%ERRORLEVEL%
-          type ..\loader_smoke.txt
-          if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul || exit /b 91
-
-      - name: Repeated load-init-zero-fini stability
+      - name: Native LoadLibrary Init Stat zero-input Fini contract
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
-          Push-Location payload
+          New-Item -ItemType Directory -Force smoke_work | Out-Null
+          Copy-Item rc3_payload\SigProcDll-64HF.dll smoke_work\SigProcDll-64HF.dll -Force
+          Copy-Item baseline_artifact\payload\SigProcLoaderContractSmoke.exe smoke_work\ -Force
+          Copy-Item baseline_artifact\payload\runtime\inner-bed\* smoke_work\ -Force
+          Push-Location smoke_work
+          .\SigProcLoaderContractSmoke.exe *> ..\loader_smoke.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          Get-Content loader_smoke.txt
+          if($rc -ne 0){ throw "LOADER_CONTRACT_FAIL rc=$rc" }
+          if(-not (Select-String -Path loader_smoke.txt -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS')){ throw 'LOADER_PASS_MARKER_MISSING' }
+          'NATIVE_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS' | Out-File loader_gate.txt
+
+      - name: Repeated service-style load-init-fini stability
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location smoke_work
           for($i=1;$i -le 200;$i++){
             .\SigProcLoaderContractSmoke.exe *> $null
             if($LASTEXITCODE -ne 0){ throw "SEQUENTIAL_SMOKE_FAIL iteration=$i rc=$LASTEXITCODE" }
@@ -150,7 +219,7 @@ jobs:
           Pop-Location
           'SEQUENTIAL_200_LOAD_INIT_ZERO_FINI_PASS' | Out-File sequential_gate.txt
 
-      - name: Isolated parallel process stress
+      - name: Isolated parallel-process loader stress
         shell: powershell
         run: |
           $ErrorActionPreference='Stop'
@@ -158,7 +227,7 @@ jobs:
           for($j=0;$j -lt 4;$j++){
             $d="stress_$j"
             New-Item -ItemType Directory -Force $d | Out-Null
-            Copy-Item payload\* $d\ -Force
+            Copy-Item smoke_work\* $d\ -Force
             $jobs += Start-Job -ArgumentList (Resolve-Path $d) -ScriptBlock {
               param($dir)
               Set-Location $dir
@@ -176,29 +245,78 @@ jobs:
           if(($res | Where-Object {$_ -ne 'PASS'}).Count -ne 0){ throw "PARALLEL_STRESS_FAIL $res" }
           'PARALLEL_4X50_ISOLATED_PROCESS_PASS' | Out-File parallel_gate.txt
 
-      - name: Final native gate
+      - name: Compile exact real-GHF regression harness
+        shell: cmd
         run: |
-          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
-          if($h -ne $env:DLL_SHA){ throw 'POST_TEST_SHA_CHANGED' }
-          "NATIVE_WINDOWS_RC3_PASS SHA256=$h" | Out-File RC3_NATIVE_WINDOWS_PASS.lock
+          copy /Y baseline_artifact\payload\fullreg.c fullreg.c > nul
+          cl /nologo /O2 /W4 /TC fullreg.c /Fe:fullreg.exe > fullreg_build.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type fullreg_build.txt
+          if not "%RC%"=="0" exit /b %RC%
+          if not exist fullreg.exe exit /b 61
+          echo FULLREG_MSVC_X86_BUILD_PASS> fullreg_build_gate.txt
 
-      - name: Upload evidence
+      - name: Full Aug03 real-GHF regression determinism long-run thread stress realtime
+        shell: cmd
+        run: |
+          fullreg.exe rc3_payload\SigProcDll-64HF.dll baseline_artifact\payload\HostCompat.dll baseline_artifact\payload\C63.dll baseline_artifact\payload\runtime\inner-bed baseline_artifact\payload\runtime\outer-medical-bed baseline_artifact\payload\testdata > fullreg.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type fullreg.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"HOSTCOMPAT_REAL_NONZERO_PASS" fullreg.txt > nul || exit /b 71
+          findstr /C:"C63_REAL_NONZERO_PASS" fullreg.txt > nul || exit /b 72
+          findstr /C:"SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS" fullreg.txt > nul || exit /b 73
+          findstr /C:"DETERMINISTIC_REPLAY_PASS" fullreg.txt > nul || exit /b 74
+          findstr /C:"LONG_STABILITY_PASS" fullreg.txt > nul || exit /b 75
+          findstr /C:"TWO_THREAD_STRESS_PASS" fullreg.txt > nul || exit /b 76
+          findstr /C:"REALTIME_1HZ_PASS" fullreg.txt > nul || exit /b 77
+          findstr /C:"PERFORMANCE_PASS" fullreg.txt > nul || exit /b 78
+          findstr /C:"COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS" fullreg.txt > nul || exit /b 79
+          echo COMPLETE_NATIVE_WINDOWS_REAL_GHF_GATE_PASS> fullreg_gate.txt
+
+      - name: Final immutable SHA gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash rc3_payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:RC3_SHA){ throw "POST_TEST_SHA_CHANGED $h" }
+          "NATIVE_WINDOWS_RC3_REAL_GHF_PASS SHA256=$h" | Out-File RC3_NATIVE_WINDOWS_PASS.lock
+
+      - name: Upload non-proprietary evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rc3-native-windows-evidence-${{ github.run_id }}
+          name: rc3-native-windows-real-ghf-evidence-${{ github.run_id }}
           path: |
-            drive_download_probe.txt
-            encrypted_payload.txt
-            payload_binding.txt
+            baseline_binding.txt
+            delta_binding.txt
+            rc3_reconstruction.txt
             windows_environment.txt
             pe_headers.txt
             pe_exports.txt
             pe_imports.txt
+            pe_gate.txt
             loader_smoke.txt
+            loader_gate.txt
             sequential_gate.txt
             parallel_results.txt
             parallel_gate.txt
+            fullreg_build.txt
+            fullreg_build_gate.txt
+            fullreg.txt
+            fullreg_gate.txt
             RC3_NATIVE_WINDOWS_PASS.lock
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
+
+      - name: Remove one-time RSA handoff from branch
+        if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3
+          git add -A .secure_rc3 || true
+          if ! git diff --cached --quiet; then
+            git commit -m 'Remove RC3 one-time RSA handoff'
+            git push origin HEAD:${GITHUB_REF_NAME} || true
+          fi
