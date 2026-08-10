@@ -1,0 +1,193 @@
+name: native-windows-rc3-initdiag
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/native_windows_rc3_initdiag.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+env:
+  ARTIFACT_ID: '9034484495'
+  SOURCE_RUN_ID: '31300993195'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  C63_SHA: '56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+jobs:
+  initdiag:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          merge-multiple: true
+      - name: Bind baseline and encrypted delta
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($x in @(@('HostCompat.dll',$env:HOST_SHA),@('C63.dll',$env:C63_SHA))){
+            $p="baseline_artifact\payload\$($x[0])"; $h=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant(); if($h -ne $x[1]){throw "SHA $p $h"}
+          }
+          @'
+          from pathlib import Path
+          import os,hashlib,base64
+          b=b''.join(Path(f'.rc3delta/chunk_{i:02d}').read_bytes() for i in range(10))
+          assert len(b)==74904
+          assert hashlib.sha256(b).hexdigest()==os.environ['DELTA_B64_SHA']
+          e=base64.b64decode(b,validate=True)
+          assert len(e)==56176
+          assert hashlib.sha256(e).hexdigest()==os.environ['DELTA_ENC_SHA']
+          (Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz.enc').write_bytes(e)
+          print('BASELINE_AND_ENCRYPTED_DELTA_BINDING_PASS')
+          '@ | python -
+      - name: Create one-time RSA key
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .secure_rc3diag; mkdir -p .secure_rc3diag
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure_rc3diag/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3diag/public.pem
+          git commit -m 'Publish RC3 initdiag one-time RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Wait for wrapped AES key
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 240); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3diag/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          python - <<'PY'
+          from pathlib import Path
+          import base64,os
+          b=base64.b64decode(Path('.secure_rc3diag/key.enc.b64').read_text().strip(),validate=True)
+          (Path(os.environ['RUNNER_TEMP'])/'key.enc').write_bytes(b)
+          PY
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+      - name: Reconstruct exact RC3
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          python - <<'PY'
+          from pathlib import Path
+          import os,hashlib,lzma,struct
+          dx=(Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz').read_bytes(); assert hashlib.sha256(dx).hexdigest()==os.environ['DELTA_XZ_SHA']
+          base=Path('baseline_artifact/payload/HostCompat.dll').read_bytes(); raw=lzma.decompress(dx); assert raw[:4]==b'R3D1'
+          size,nops=struct.unpack_from('<II',raw,4); p=12; out=bytearray()
+          for _ in range(nops):
+            op=raw[p:p+1];p+=1
+            if op==b'C': s,n=struct.unpack_from('<II',raw,p);p+=8;out.extend(base[s:s+n])
+            elif op==b'L': n,=struct.unpack_from('<I',raw,p);p+=4;out.extend(raw[p:p+n]);p+=n
+            else: raise AssertionError(op)
+          assert p==len(raw); assert len(out)==size==442368; assert hashlib.sha256(out).hexdigest()==os.environ['RC3_SHA']
+          Path('rc3').mkdir(exist_ok=True); Path('rc3/SigProcDll-64HF.dll').write_bytes(out)
+          print('EXACT_RC3_RECONSTRUCTION_PASS',hashlib.sha256(out).hexdigest())
+          PY
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/private.pem"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build SEH Init diagnostic
+        shell: powershell
+        run: |
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <stdio.h>
+          #include <stdint.h>
+          typedef int (__stdcall *InitFn)(char*,void*);
+          static LONG filter(EXCEPTION_POINTERS *ep, HMODULE target) {
+            MEMORY_BASIC_INFORMATION mbi; char path[MAX_PATH]={0};
+            uintptr_t a=(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+            uintptr_t b=(uintptr_t)target;
+            printf("EXCEPTION_CODE=0x%08lX\n",ep->ExceptionRecord->ExceptionCode);
+            printf("EXCEPTION_ADDRESS=%p\n",ep->ExceptionRecord->ExceptionAddress);
+            printf("TARGET_BASE=%p\n",target);
+            if(a>=b) printf("TARGET_RVA=0x%08lX\n",(unsigned long)(a-b));
+            if(VirtualQuery(ep->ExceptionRecord->ExceptionAddress,&mbi,sizeof(mbi))==sizeof(mbi)){
+              printf("FAULT_ALLOCATION_BASE=%p\n",mbi.AllocationBase);
+              if(GetModuleFileNameA((HMODULE)mbi.AllocationBase,path,MAX_PATH)) printf("FAULT_MODULE=%s\n",path);
+            }
+            if(ep->ExceptionRecord->NumberParameters>0) printf("EXCEPTION_INFO0=0x%p\n",(void*)ep->ExceptionRecord->ExceptionInformation[0]);
+            if(ep->ExceptionRecord->NumberParameters>1) printf("EXCEPTION_INFO1=0x%p\n",(void*)ep->ExceptionRecord->ExceptionInformation[1]);
+            fflush(stdout); return EXCEPTION_EXECUTE_HANDLER;
+          }
+          int main(int argc,char**argv){
+            static const unsigned char auth[]={0x06,0,0,0,0xab,0x10,0x15,0x0e,0x10,0x1a,0x54,0x16,0x17,0x15,0x16,0x9d,0x1f,0x1d,0x0f,0xe5,0x58,0x5c,0x5e,0x60,0x60,0x64,0x66,0x6f,0x38,0x1a,0x5f,0x4b,0xb6,0x21};
+            char product[96]; HMODULE h; InitFn fn; int rc=-999;
+            if(argc!=2){fprintf(stderr,"usage: initseh dll\n");return 2;}
+            memset(product,0xA5,sizeof(product)); product[95]=0;
+            printf("DLL=%s\n",argv[1]); h=LoadLibraryA(argv[1]); printf("LOAD=%p LASTERROR=%lu\n",h,GetLastError()); if(!h)return 3;
+            fn=(InitFn)GetProcAddress(h,"_SigProc_Init@8"); printf("INIT_ADDR=%p\n",fn); if(!fn)return 4;
+            __try { rc=fn(product,(void*)auth); printf("INIT_RETURN=%d\n",rc); printf("PRODUCT=%s\n",product); }
+            __except(filter(GetExceptionInformation(),h)) { printf("INIT_SEH_CAUGHT=1\n"); FreeLibrary(h); return 100; }
+            FreeLibrary(h); return rc?0:5;
+          }
+          '@ | Set-Content initseh.c -Encoding ASCII
+          cl /nologo /O2 /W4 /MT /TC initseh.c /Fe:initseh.exe > initseh_build.txt 2>&1
+          if($LASTEXITCODE -ne 0){Get-Content initseh_build.txt; throw "BUILD_FAIL $LASTEXITCODE"}
+      - name: Run HostCompat and C63 controls
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          foreach($name in @('host','c63')){ New-Item -ItemType Directory -Force $name | Out-Null; Copy-Item baseline_artifact\payload\runtime\inner-bed\* "$name\" -Force }
+          Copy-Item baseline_artifact\payload\HostCompat.dll host\SigProcDll-64HF.dll -Force
+          Copy-Item baseline_artifact\payload\C63.dll c63\SigProcDll-64HF.dll -Force
+          Push-Location host; ..\initseh.exe .\SigProcDll-64HF.dll *> ..\host_initseh.txt; "HOST_EXIT=$LASTEXITCODE" | Add-Content ..\host_initseh.txt; Pop-Location
+          Push-Location c63; ..\initseh.exe .\SigProcDll-64HF.dll *> ..\c63_initseh.txt; "C63_EXIT=$LASTEXITCODE" | Add-Content ..\c63_initseh.txt; Pop-Location
+          Get-Content host_initseh.txt; Get-Content c63_initseh.txt
+      - name: Run exact RC3 under SEH
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          New-Item -ItemType Directory -Force rc3work | Out-Null
+          Copy-Item baseline_artifact\payload\runtime\inner-bed\* rc3work\ -Force
+          Copy-Item rc3\SigProcDll-64HF.dll rc3work\SigProcDll-64HF.dll -Force
+          Push-Location rc3work; ..\initseh.exe .\SigProcDll-64HF.dll *> ..\rc3_initseh.txt; "RC3_EXIT=$LASTEXITCODE" | Add-Content ..\rc3_initseh.txt; Pop-Location
+          Get-Content rc3_initseh.txt
+      - name: Record RC3 disassembly around fault-prone init chain
+        shell: cmd
+        run: |
+          dumpbin /headers rc3\SigProcDll-64HF.dll > rc3_headers.txt
+          dumpbin /disasm rc3\SigProcDll-64HF.dll > rc3_disasm.txt
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc3-init-seh-evidence-${{ github.run_id }}
+          path: |
+            initseh_build.txt
+            host_initseh.txt
+            c63_initseh.txt
+            rc3_initseh.txt
+            rc3_headers.txt
+            rc3_disasm.txt
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove one-time handoff
+        if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3diag
+          git add -A .secure_rc3diag || true
+          if ! git diff --cached --quiet; then git config user.name windows-dll-test-bot; git config user.email windows-dll-test-bot@users.noreply.github.com; git commit -m 'Remove RC3 initdiag RSA handoff'; git push origin HEAD:${GITHUB_REF_NAME} || true; fi
