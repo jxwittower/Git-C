@@ -1,0 +1,14 @@
+name: rc3-chunk07-blocks
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_chunk07_blocks.yml']
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          split -b 512 -d -a 2 .rc3delta/chunk_07 "$RUNNER_TEMP/b_"
+          sha256sum "$RUNNER_TEMP"/b_*
