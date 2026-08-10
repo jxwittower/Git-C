@@ -1,0 +1,44 @@
+name: rc3-repair-v2
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_repair_v2.yml']
+permissions:
+  contents: write
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Repair exact byte and verify authoritative total SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p=Path('.rc3delta/chunk_07')
+          b=bytearray(p.read_bytes())
+          assert len(b)==8000, len(b)
+          assert b[6591]==ord('o'), (6591,b[6591])
+          b[6591]=ord('O')
+          p.write_bytes(b)
+          h=hashlib.sha256(b).hexdigest()
+          print('REPAIRED_CHUNK07_SHA256='+h)
+          assert h=='5552c9be9f9d0863bbfc29f47fe371596ce7a3abe1a2a36eabfcc239b911708e', h
+          parts=[Path(f'.rc3delta/chunk_{i:02d}').read_bytes() for i in range(10)]
+          allb=b''.join(parts)
+          assert len(allb)==74904, len(allb)
+          total=hashlib.sha256(allb).hexdigest()
+          print('TOTAL_B64_SHA256='+total)
+          assert total=='28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30', total
+          PY
+          printf '\n# exact-delta-authoritative-repair-20260810\n' >> .github/workflows/native_windows_prefix14.yml
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .rc3delta/chunk_07 .github/workflows/native_windows_prefix14.yml
+          git commit -m 'Repair RC3 encrypted delta and trigger native gate'
+          git push origin HEAD:${GITHUB_REF_NAME}
