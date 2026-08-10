@@ -1,106 +1,98 @@
-name: native-windows-prefix14
+name: rc3-native-windows-gate
 
 on:
   push:
+    branches: [rc3-native-gate-20260810r]
     paths:
       - '.github/workflows/native_windows_prefix14.yml'
   workflow_dispatch:
-  schedule:
-    - cron: '0 * * * *'
 
 permissions:
   contents: write
 
 defaults:
   run:
-    shell: bash
+    shell: powershell
 
 jobs:
-  native-smoke-prefix:
+  native-rc3:
     runs-on: windows-2022
-    timeout-minutes: 25
+    timeout-minutes: 45
+    env:
+      DRIVE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
+      ENC_SHA: 28654a7d311f58f9a0893b778739681fda29bc6b337468ea41cc068f454ae801
+      XZ_SHA: 1fb3af89fc41d2f63a78f9fea9ce74845d70c23eabed177d7d6cd426cd4e24b0
+      DLL_SHA: 1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: true
 
-      - name: Assemble encrypted prefix
+      - name: Download encrypted RC3 payload
         run: |
-          set -euo pipefail
-          : > "$RUNNER_TEMP/payload-prefix.enc.b64"
-          for i in $(seq -w 0 13); do
-            f=".payload9/chunk_${i}"
-            test -s "$f"
-            cat "$f" >> "$RUNNER_TEMP/payload-prefix.enc.b64"
-          done
-          base64 -d "$RUNNER_TEMP/payload-prefix.enc.b64" > "$RUNNER_TEMP/payload-prefix.raw"
-          raw_bytes=$(wc -c < "$RUNNER_TEMP/payload-prefix.raw")
-          usable_bytes=$((raw_bytes - (raw_bytes % 16)))
-          test "$usable_bytes" -gt 16
-          head -c "$usable_bytes" "$RUNNER_TEMP/payload-prefix.raw" > "$RUNNER_TEMP/payload-prefix.enc"
-          bytes=$(wc -c < "$RUNNER_TEMP/payload-prefix.enc")
-          echo "ENCRYPTED_PREFIX_RAW_BYTES=$raw_bytes" | tee prefix_gate.txt
-          echo "ENCRYPTED_PREFIX_USABLE_BYTES=$bytes" | tee -a prefix_gate.txt
-          test $((bytes % 16)) -eq 0
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check --quiet gdown
+          if($LASTEXITCODE -ne 0){ throw 'GDOWN_INSTALL_FAIL' }
+          gdown $env:DRIVE_ID -O $env:RUNNER_TEMP\payload.enc
+          if($LASTEXITCODE -ne 0){ throw 'GDOWN_DOWNLOAD_FAIL' }
+          $h=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          $n=(Get-Item $env:RUNNER_TEMP\payload.enc).Length
+          "ENC_BYTES=$n`nENC_SHA256=$h" | Tee-Object encrypted_payload.txt
+          if($h -ne $env:ENC_SHA){ throw "ENC_SHA_MISMATCH $h" }
 
       - name: Create one-time RSA transport key
+        shell: bash
         run: |
           set -euo pipefail
-          rm -rf .secureprefix14
-          mkdir -p .secureprefix14
+          rm -rf .secure_rc3
+          mkdir -p .secure_rc3
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
-          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secureprefix14/public.pem
-          git config user.name "windows-dll-test-bot"
-          git config user.email "windows-dll-test-bot@users.noreply.github.com"
-          git add .secureprefix14/public.pem
-          git commit -m "Publish one-time RSA key for Windows prefix smoke"
-          git push
-          echo "EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out .secure_rc3/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3/public.pem
+          git commit -m 'Publish RC3 one-time RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+          echo EPHEMERAL_RSA_PUBLIC_KEY_PUBLISHED
 
-      - name: Wait for RSA-wrapped AES key
+      - name: Wait for wrapped AES passphrase
+        shell: bash
         run: |
           set -euo pipefail
           ok=0
-          for i in $(seq 1 180); do
-            git pull --ff-only >/dev/null 2>&1 || true
-            if [ -s .secureprefix14/key.enc.b64 ]; then ok=1; break; fi
+          for i in $(seq 1 240); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3/key.enc.b64 ]; then ok=1; break; fi
             sleep 5
           done
           test "$ok" = 1
-          echo "RSA_WRAPPED_AES_KEY_RECEIVED"
+          base64 -d .secure_rc3/key.enc.b64 > "$RUNNER_TEMP/key.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          echo RSA_WRAPPED_AES_KEY_RECEIVED
 
-      - name: Decrypt encrypted prefix and stream-extract completed tar entries
+      - name: Decrypt and bind exact RC3 payload
+        shell: bash
         run: |
           set -euo pipefail
-          base64 -d .secureprefix14/key.enc.b64 > "$RUNNER_TEMP/key.enc"
-          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -nopad -in "$RUNNER_TEMP/payload-prefix.enc" -out "$RUNNER_TEMP/payload-prefix.xz" -pass file:"$RUNNER_TEMP/pass.txt"
-          set +e
-          xz -dc "$RUNNER_TEMP/payload-prefix.xz" > "$RUNNER_TEMP/payload-prefix.tar" 2> xz_prefix_stderr.txt
-          xz_rc=$?
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt"
+          test "$(sha256sum "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')" = "$XZ_SHA"
           mkdir -p payload
-          tar -xf "$RUNNER_TEMP/payload-prefix.tar" -C payload 2> tar_prefix_stderr.txt
-          tar_rc=$?
-          set -e
-          echo "XZ_PREFIX_RC=$xz_rc" | tee -a prefix_gate.txt
-          echo "TAR_PREFIX_RC=$tar_rc" | tee -a prefix_gate.txt
-          ls -la payload | tee payload_listing.txt
-          for f in SigProcDll-64HF.dll SigProcLoaderContractSmoke.exe file_sig filter_brth filter_hrt3; do
-            if [ -s "payload/$f" ]; then echo "PRESENT $f $(wc -c < payload/$f)"; else echo "MISSING $f"; exit 71; fi
-          done | tee extracted_files.txt
-          dll_sha=$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')
-          echo "DLL_SHA256=$dll_sha" | tee -a prefix_gate.txt
-          test "$dll_sha" = "081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804"
+          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C payload
+          for f in SigProcDll-64HF.dll SigProcLoaderContractSmoke.exe file_sig filter_brth filter_hrt3; do test -s "payload/$f"; done
+          test "$(sha256sum payload/SigProcDll-64HF.dll | awk '{print $1}')" = "$DLL_SHA"
+          test "$(sha256sum payload/SigProcLoaderContractSmoke.exe | awk '{print $1}')" = "$SMOKE_SHA"
           rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/private.pem"
-          echo "PREFIX_RECOVERY_GATE_PASS" | tee -a prefix_gate.txt
+          echo RC3_PAYLOAD_BINDING_PASS | tee payload_binding.txt
 
-      - name: Configure MSVC x86 tools
+      - name: Configure MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
 
-      - name: Record native Windows PE contract
+      - name: Static PE ABI evidence
         shell: cmd
         run: |
           ver > windows_environment.txt
@@ -109,9 +101,14 @@ jobs:
           dumpbin /headers payload\SigProcDll-64HF.dll > pe_headers.txt
           dumpbin /exports payload\SigProcDll-64HF.dll > pe_exports.txt
           dumpbin /imports payload\SigProcDll-64HF.dll > pe_imports.txt
-          dumpbin /headers payload\SigProcLoaderContractSmoke.exe > smoke_headers.txt
+          findstr /C:"14C machine (x86)" pe_headers.txt > nul || exit /b 31
+          findstr /C:"_SigProc@24" pe_exports.txt > nul || exit /b 32
+          findstr /C:"_SigProc_Init@8" pe_exports.txt > nul || exit /b 33
+          findstr /C:"_SigProc_Stat@0" pe_exports.txt > nul || exit /b 34
+          findstr /C:"_SigProc_Fini@0" pe_exports.txt > nul || exit /b 35
+          findstr /I /C:"ucrtbase.dll" pe_imports.txt > nul && exit /b 36 || ver > nul
 
-      - name: Execute PE32 host-contract smoke on native Windows
+      - name: Native loader contract
         shell: cmd
         working-directory: payload
         run: |
@@ -119,40 +116,68 @@ jobs:
           set RC=%ERRORLEVEL%
           type ..\loader_smoke.txt
           if not "%RC%"=="0" exit /b %RC%
-          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul
-          if errorlevel 1 exit /b 91
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke.txt > nul || exit /b 91
 
-      - name: Mark native gate
-        run: echo "NATIVE_WINDOWS_LOADLIBRARY_INIT_STAT_ZERO_INPUT_FINI_PASS" > native_gate.txt
+      - name: Repeated load-init-zero-fini stability
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location payload
+          for($i=1;$i -le 200;$i++){
+            .\SigProcLoaderContractSmoke.exe *> $null
+            if($LASTEXITCODE -ne 0){ throw "SEQUENTIAL_SMOKE_FAIL iteration=$i rc=$LASTEXITCODE" }
+          }
+          Pop-Location
+          'SEQUENTIAL_200_LOAD_INIT_ZERO_FINI_PASS' | Out-File sequential_gate.txt
 
-      - name: Upload non-proprietary evidence
+      - name: Isolated parallel process stress
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $jobs=@()
+          for($j=0;$j -lt 4;$j++){
+            $d="stress_$j"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item payload\* $d\ -Force
+            $jobs += Start-Job -ArgumentList (Resolve-Path $d) -ScriptBlock {
+              param($dir)
+              Set-Location $dir
+              for($i=1;$i -le 50;$i++){
+                .\SigProcLoaderContractSmoke.exe *> $null
+                if($LASTEXITCODE -ne 0){ return "FAIL $i $LASTEXITCODE" }
+              }
+              return 'PASS'
+            }
+          }
+          Wait-Job $jobs | Out-Null
+          $res=$jobs | Receive-Job
+          $jobs | Remove-Job -Force
+          $res | Set-Content parallel_results.txt
+          if(($res | Where-Object {$_ -ne 'PASS'}).Count -ne 0){ throw "PARALLEL_STRESS_FAIL $res" }
+          'PARALLEL_4X50_ISOLATED_PROCESS_PASS' | Out-File parallel_gate.txt
+
+      - name: Final native gate
+        run: |
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:DLL_SHA){ throw 'POST_TEST_SHA_CHANGED' }
+          "NATIVE_WINDOWS_RC3_PASS SHA256=$h" | Out-File RC3_NATIVE_WINDOWS_PASS.lock
+
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: native-windows-prefix14-evidence
+          name: rc3-native-windows-evidence-${{ github.run_id }}
           path: |
-            prefix_gate.txt
-            xz_prefix_stderr.txt
-            tar_prefix_stderr.txt
-            payload_listing.txt
-            extracted_files.txt
+            encrypted_payload.txt
+            payload_binding.txt
             windows_environment.txt
             pe_headers.txt
             pe_exports.txt
             pe_imports.txt
-            smoke_headers.txt
             loader_smoke.txt
-            native_gate.txt
+            sequential_gate.txt
+            parallel_results.txt
+            parallel_gate.txt
+            RC3_NATIVE_WINDOWS_PASS.lock
           if-no-files-found: ignore
-          retention-days: 3
-
-      - name: Remove ephemeral RSA handoff
-        if: always()
-        run: |
-          git pull --ff-only || true
-          rm -rf .secureprefix14
-          git add -A .secureprefix14 || true
-          if ! git diff --cached --quiet; then
-            git commit -m "Remove one-time RSA key for Windows prefix smoke"
-            git push || true
-          fi
+          retention-days: 7
