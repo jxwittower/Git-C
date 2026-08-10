@@ -75,18 +75,17 @@ jobs:
         run: |
           set -euo pipefail
           : > "$RUNNER_TEMP/rc3.delta.enc.b64"
-          for i in $(seq -w 00 09); do
-            f=".rc3delta/chunk_${i}"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do
             test -s "$f"
             cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"
           done
           b64_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")
-          b64_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')
+          b64_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')
           test "$b64_bytes" = 74904
           test "$b64_sha" = "$DELTA_B64_SHA"
           base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
           enc_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.xz.enc")
-          enc_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')
+          enc_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')
           test "$enc_bytes" = 56176
           test "$enc_sha" = "$DELTA_ENC_SHA"
           printf 'DELTA_B64_BYTES=%s\nDELTA_B64_SHA256=%s\nDELTA_ENC_BYTES=%s\nDELTA_ENC_SHA256=%s\nENCRYPTED_DELTA_BINDING_PASS\n' "$b64_bytes" "$b64_sha" "$enc_bytes" "$enc_sha" | tee delta_binding.txt
@@ -127,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass.txt"
-          delta_xz_sha=$(sha256sum "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')
+          delta_xz_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')
           test "$delta_xz_sha" = "$DELTA_XZ_SHA"
           python - <<'PY'
           from pathlib import Path
