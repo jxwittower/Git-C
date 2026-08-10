@@ -40,6 +40,7 @@ jobs:
           path: baseline_artifact
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
+          run-id: '31300993195'
           merge-multiple: true
 
       - name: Bind baseline artifact and real GHF corpus
