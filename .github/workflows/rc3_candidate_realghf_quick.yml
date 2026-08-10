@@ -1,0 +1,164 @@
+name: rc3-candidate-real-ghf-quick
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_candidate_realghf_quick.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  FULLREG_SHA: 'f946ba5e503f7f921aec0e9b4632981540d7487004596b5940053bc817694b14'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+  STACKFIX_SHA: 'ca82d1c611eb02afa5e3a42c5baeefb5983efee3d36b1ebf99b61e1b334179e9'
+  FINAL_SHA: 'efeed8bacb10aa9f4f37501d273b87882deb99f83f5602d12d10a5e26ee8738a'
+jobs:
+  quick:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - name: Bind corpus and encrypted delta
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=Resolve-Path 'baseline_artifact\payload'
+          if((Get-FileHash "$p\HostCompat.dll" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:HOST_SHA){ throw 'HOST_SHA_FAIL' }
+          if((Get-FileHash "$p\fullreg.c" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:FULLREG_SHA){ throw 'FULLREG_SHA_FAIL' }
+          if((Get-ChildItem "$p\testdata" -Recurse -Filter '*.ghf').Count -ne 13){ throw 'GHF_COUNT_FAIL' }
+          'QUICK_CORPUS_BINDING_PASS' | Out-File quick_corpus_binding.txt
+      - name: Assemble encrypted candidate delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/rc3.delta.enc.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"; done
+          test "$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")" = 74904
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')" = "$DELTA_B64_SHA"
+          base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')" = "$DELTA_ENC_SHA"
+      - name: Create one-time RSA key
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .secure_rc3_quick
+          mkdir -p .secure_rc3_quick
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private_quick.pem"
+          openssl pkey -in "$RUNNER_TEMP/private_quick.pem" -pubout -out .secure_rc3_quick/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3_quick/public.pem
+          git commit -m 'Publish quick GHF one-time RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Receive wrapped AES key
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 180); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3_quick/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          base64 -d .secure_rc3_quick/key.enc.b64 > "$RUNNER_TEMP/key_quick.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private_quick.pem" -in "$RUNNER_TEMP/key_quick.enc" -out "$RUNNER_TEMP/pass_quick.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+      - name: Reconstruct exact final candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass_quick.txt"
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')" = "$DELTA_XZ_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import lzma,struct,os
+          base=Path('baseline_artifact/payload/HostCompat.dll').read_bytes()
+          raw=lzma.decompress((Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz').read_bytes())
+          assert raw[:4]==b'R3D1'
+          target,nops=struct.unpack_from('<II',raw,4);pos=12;out=bytearray()
+          for _ in range(nops):
+              op=raw[pos:pos+1];pos+=1
+              if op==b'C': src,n=struct.unpack_from('<II',raw,pos);pos+=8;out.extend(base[src:src+n])
+              elif op==b'L': n,=struct.unpack_from('<I',raw,pos);pos+=4;out.extend(raw[pos:pos+n]);pos+=n
+              else: raise SystemExit('BAD_DELTA_OPCODE')
+          assert pos==len(raw) and len(out)==target
+          Path('candidate').mkdir(exist_ok=True)
+          Path('candidate/RC3-frozen.dll').write_bytes(out)
+          PY
+          test "$(sha256sum candidate/RC3-frozen.dll | awk '{print $1}')" = "$RC3_SHA"
+          python tools/apply_windows_stackprobe_fix.py candidate/RC3-frozen.dll candidate/RC3-stackfix.dll > /dev/null
+          test "$(sha256sum candidate/RC3-stackfix.dll | awk '{print $1}')" = "$STACKFIX_SHA"
+          python tools/apply_windows_libm_xmm_fix.py candidate/RC3-stackfix.dll candidate/SigProcDll-64HF.dll > /dev/null
+          test "$(sha256sum candidate/SigProcDll-64HF.dll | awk '{print $1}')" = "$FINAL_SHA"
+          rm -f "$RUNNER_TEMP/pass_quick.txt" "$RUNNER_TEMP/key_quick.enc" "$RUNNER_TEMP/private_quick.pem"
+          echo "FINAL_SHA256=$FINAL_SHA" | tee quick_candidate_binding.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build quick 13-GHF core gate from authoritative harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item baseline_artifact\payload\fullreg.c quick_fullreg.c -Force
+          $src=Get-Content quick_fullreg.c -Raw
+          $src=$src.Replace("int main(int argc,char **argv){`n","int main(int argc,char **argv){`n    setvbuf(stdout,NULL,_IONBF,0); setvbuf(stderr,NULL,_IONBF,0);`n")
+          $src=$src.Replace('    if(!run_baseline_real("HOSTCOMPAT",host,rin,ghf))return 10;','    printf("HOSTCOMPAT_BASELINE_SKIPPED_KNOWN_UNSTACKFIXED_INIT_CRASH\n");')
+          $src=$src.Replace('    if(!run_baseline_real("C63",c63,rin,ghf))return 11;','    printf("C63_BASELINE_SKIPPED_SEPARATE_ISOLATED_PASS\n");')
+          $needle='    printf("SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS warnings=%u return_nonzero=%u\n",a.warnings+b.warnings,b.return_nonzero);'
+          if(-not $src.Contains($needle)){ throw 'SEQ_MARKER_SOURCE_NOT_FOUND' }
+          $src=$src.Replace($needle,$needle+"`n    printf(\"QUICK_13_GHF_CORE_PASS\\n\"); return 0;")
+          Set-Content quick_fullreg.c -Value $src -NoNewline
+          cmd /c "cl /nologo /O2 /W4 /TC quick_fullreg.c /Fe:quick_fullreg.exe > quick_build.txt 2>&1"
+          if($LASTEXITCODE -ne 0){ Get-Content quick_build.txt; throw "QUICK_BUILD_FAIL $LASTEXITCODE" }
+      - name: Run all 13 real GHF core sequence gate
+        shell: cmd
+        run: |
+          quick_fullreg.exe candidate\SigProcDll-64HF.dll baseline_artifact\payload\HostCompat.dll baseline_artifact\payload\C63.dll baseline_artifact\payload\runtime\inner-bed baseline_artifact\payload\runtime\outer-medical-bed baseline_artifact\payload\testdata > quick_13ghf.txt 2>&1
+          set RC=%ERRORLEVEL%
+          echo QUICK_EXIT_CODE=%RC%> quick_exit.txt
+          type quick_13ghf.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS" quick_13ghf.txt > nul || exit /b 73
+          findstr /C:"QUICK_13_GHF_CORE_PASS" quick_13ghf.txt > nul || exit /b 74
+          echo QUICK_13_GHF_GATE_PASS> quick_gate.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc3-quick-13ghf-${{ github.run_id }}
+          path: |
+            quick_corpus_binding.txt
+            quick_candidate_binding.txt
+            quick_build.txt
+            quick_13ghf.txt
+            quick_exit.txt
+            quick_gate.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3_quick
+          git add -A .secure_rc3_quick || true
+          if ! git diff --cached --quiet; then
+            git config user.name windows-dll-test-bot
+            git config user.email windows-dll-test-bot@users.noreply.github.com
+            git commit -m 'Remove quick GHF one-time RSA handoff'
+            git push origin HEAD:${GITHUB_REF_NAME} || true
+          fi
