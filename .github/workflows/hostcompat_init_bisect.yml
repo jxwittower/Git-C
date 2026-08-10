@@ -1,0 +1,70 @@
+name: hostcompat-init-bisect
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/hostcompat_init_bisect.yml']
+permissions:
+  actions: read
+  contents: read
+jobs:
+  bisect:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '9034484495'
+          path: art
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - name: Prepare binary call-skip variants
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import hashlib,shutil
+          base=Path('art/payload/HostCompat.dll').read_bytes()
+          # PE .text RVA 0x1000 -> raw 0x400. Patch CALL rel32 (5 bytes) with NOPs.
+          sites={'reset1':0x63822,'qpf':0x6383e,'reset2':0x638b7,'filters':0x638c4,'sig':0x638e8,'bed':0x638fe}
+          variants={
+            'orig':[],
+            'skip_r1':['reset1'],
+            'skip_r2':['reset2'],
+            'skip_both_r':['reset1','reset2'],
+            'skip_qpf':['qpf'],
+            'skip_both_r_qpf':['reset1','reset2','qpf'],
+          }
+          for name,which in variants.items():
+            d=Path(name);d.mkdir(exist_ok=True)
+            b=bytearray(base)
+            for key in which:
+              rva=sites[key];off=rva-0x1000+0x400
+              old=bytes(b[off:off+5]);print(name,key,hex(rva),old.hex())
+              assert old[0]==0xE8,(name,key,old.hex())
+              b[off:off+5]=b'\x90'*5
+            (d/'SigProcDll-64HF.dll').write_bytes(b)
+            shutil.copy2('art/payload/SigProcLoaderContractSmoke.exe',d/'SigProcLoaderContractSmoke.exe')
+            for f in Path('art/payload/runtime/inner-bed').iterdir(): shutil.copy2(f,d/f.name)
+            print(name,hashlib.sha256(b).hexdigest())
+          '@ | python -
+      - name: Execute all variants as isolated processes
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          foreach($d in @('orig','skip_r1','skip_r2','skip_both_r','skip_qpf','skip_both_r_qpf')){
+            Push-Location $d
+            .\SigProcLoaderContractSmoke.exe *> "..\$d.txt"
+            "$d`_EXIT=$LASTEXITCODE" | Add-Content "..\$d.txt"
+            Pop-Location
+          }
+          foreach($d in @('orig','skip_r1','skip_r2','skip_both_r','skip_qpf','skip_both_r_qpf')){Write-Host "=== $d ===";Get-Content "$d.txt"}
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hostcompat-init-bisect-${{ github.run_id }}
+          path: '*.txt'
+          retention-days: 7
