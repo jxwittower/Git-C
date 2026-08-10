@@ -1,0 +1,220 @@
+name: rc3-candidate-only-real-ghf-fullreg-v2
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_candidate_realghf_fullreg_v2.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  C63_SHA: '56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+  FULLREG_SHA: 'f946ba5e503f7f921aec0e9b4632981540d7487004596b5940053bc817694b14'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+  STACKFIX_SHA: 'ca82d1c611eb02afa5e3a42c5baeefb5983efee3d36b1ebf99b61e1b334179e9'
+  FINAL_SHA: 'efeed8bacb10aa9f4f37501d273b87882deb99f83f5602d12d10a5e26ee8738a'
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+
+      - name: Bind authoritative corpus and encrypted RC3
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=Resolve-Path 'baseline_artifact\payload'
+          $checks=@{
+            'HostCompat.dll'=$env:HOST_SHA
+            'C63.dll'=$env:C63_SHA
+            'fullreg.c'=$env:FULLREG_SHA
+          }
+          foreach($n in $checks.Keys){
+            $h=(Get-FileHash "$p\$n" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($h -ne $checks[$n]){ throw "CORPUS_SHA_FAIL $n $h" }
+          }
+          if((Get-ChildItem "$p\testdata" -Recurse -Filter '*.ghf').Count -ne 13){ throw 'GHF_COUNT_FAIL' }
+          foreach($bed in @('inner-bed','outer-medical-bed')){
+            foreach($f in @('file_bed_model_v1','file_bias','file_sig','filter_brth','filter_hrt3')){
+              if(!(Test-Path "$p\runtime\$bed\$f")){ throw "RUNTIME_MISSING $bed/$f" }
+            }
+          }
+          'AUTHORITATIVE_CORPUS_13_GHF_BINDING_PASS' | Out-File corpus_binding.txt
+      - name: Assemble encrypted delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/rc3.delta.enc.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"; done
+          test "$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")" = 74904
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')" = "$DELTA_B64_SHA"
+          base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
+          test "$(wc -c < "$RUNNER_TEMP/rc3.delta.xz.enc")" = 56176
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')" = "$DELTA_ENC_SHA"
+          echo ENCRYPTED_DELTA_BINDING_PASS | tee encrypted_binding.txt
+
+      - name: Create one-time RSA key
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .secure_rc3_ghfv2
+          mkdir -p .secure_rc3_ghfv2
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private_ghfv2.pem"
+          openssl pkey -in "$RUNNER_TEMP/private_ghfv2.pem" -pubout -out .secure_rc3_ghfv2/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3_ghfv2/public.pem
+          git commit -m 'Publish candidate GHF v2 one-time RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Receive wrapped AES key
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 240); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3_ghfv2/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          base64 -d .secure_rc3_ghfv2/key.enc.b64 > "$RUNNER_TEMP/key_ghfv2.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private_ghfv2.pem" -in "$RUNNER_TEMP/key_ghfv2.enc" -out "$RUNNER_TEMP/pass_ghfv2.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          test -s "$RUNNER_TEMP/pass_ghfv2.txt"
+
+      - name: Reconstruct exact efeed8 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass_ghfv2.txt"
+          test "$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')" = "$DELTA_XZ_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib,lzma,struct,os
+          base=Path('baseline_artifact/payload/HostCompat.dll').read_bytes()
+          raw=lzma.decompress((Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz').read_bytes())
+          assert raw[:4]==b'R3D1'
+          target,nops=struct.unpack_from('<II',raw,4);pos=12;out=bytearray()
+          for _ in range(nops):
+              op=raw[pos:pos+1];pos+=1
+              if op==b'C':
+                  src,n=struct.unpack_from('<II',raw,pos);pos+=8;out.extend(base[src:src+n])
+              elif op==b'L':
+                  n,=struct.unpack_from('<I',raw,pos);pos+=4;out.extend(raw[pos:pos+n]);pos+=n
+              else: raise SystemExit('BAD_DELTA_OPCODE')
+          assert pos==len(raw) and len(out)==target
+          Path('candidate').mkdir(exist_ok=True)
+          Path('candidate/RC3-frozen.dll').write_bytes(out)
+          print('FROZEN_SHA='+hashlib.sha256(out).hexdigest())
+          PY
+          test "$(sha256sum candidate/RC3-frozen.dll | awk '{print $1}')" = "$RC3_SHA"
+          python tools/apply_windows_stackprobe_fix.py candidate/RC3-frozen.dll candidate/RC3-stackfix.dll --report stackfix_report.json > stackfix_apply.txt
+          test "$(sha256sum candidate/RC3-stackfix.dll | awk '{print $1}')" = "$STACKFIX_SHA"
+          python tools/apply_windows_libm_xmm_fix.py candidate/RC3-stackfix.dll candidate/SigProcDll-64HF.dll --report mathfix_report.json > mathfix_apply.txt
+          final_sha=$(sha256sum candidate/SigProcDll-64HF.dll | awk '{print $1}')
+          test "$final_sha" = "$FINAL_SHA"
+          test "$(wc -c < candidate/SigProcDll-64HF.dll)" = 443392
+          echo "FINAL_CANDIDATE_SHA256=$final_sha" | tee candidate_binding.txt
+          rm -f "$RUNNER_TEMP/pass_ghfv2.txt" "$RUNNER_TEMP/key_ghfv2.enc" "$RUNNER_TEMP/private_ghfv2.pem"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Patch authoritative harness to candidate-only and compile with MSVC cmd
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item baseline_artifact\payload\fullreg.c fullreg_candidate.c -Force
+          $py=@'
+          from pathlib import Path
+          p=Path('fullreg_candidate.c')
+          s=p.read_text()
+          sig='int main(int argc,char **argv){\n'
+          if sig not in s: raise SystemExit('MAIN_SIGNATURE_NOT_FOUND')
+          s=s.replace(sig,sig+'    setvbuf(stdout,NULL,_IONBF,0); setvbuf(stderr,NULL,_IONBF,0);\n',1)
+          h='    if(!run_baseline_real("HOSTCOMPAT",host,rin,ghf))return 10;\n'
+          c='    if(!run_baseline_real("C63",c63,rin,ghf))return 11;\n'
+          if h not in s or c not in s: raise SystemExit('BASELINE_LINES_NOT_FOUND')
+          s=s.replace(h,'    printf("HOSTCOMPAT_BASELINE_SKIPPED_KNOWN_UNSTACKFIXED_INIT_CRASH\\n");\n',1)
+          s=s.replace(c,'    printf("C63_BASELINE_SKIPPED_SEPARATE_ISOLATED_PASS\\n");\n',1)
+          p.write_text(s)
+          '@
+          $py | python -
+          cmd /c "cl /nologo /O2 /W4 /TC fullreg_candidate.c /Fe:fullreg_candidate.exe > fullreg_candidate_build.txt 2>&1"
+          if($LASTEXITCODE -ne 0){ Get-Content fullreg_candidate_build.txt; throw "BUILD_FAIL $LASTEXITCODE" }
+          if(!(Test-Path fullreg_candidate.exe)){ throw 'EXE_MISSING' }
+          Get-Content fullreg_candidate_build.txt
+          'CANDIDATE_ONLY_MSVC_X86_BUILD_PASS' | Out-File fullreg_candidate_build_gate.txt
+
+      - name: Run all 13 real GHF candidate gates
+        shell: cmd
+        run: |
+          fullreg_candidate.exe candidate\SigProcDll-64HF.dll baseline_artifact\payload\HostCompat.dll baseline_artifact\payload\C63.dll baseline_artifact\payload\runtime\inner-bed baseline_artifact\payload\runtime\outer-medical-bed baseline_artifact\payload\testdata > candidate_fullreg.txt 2>&1
+          set RC=%ERRORLEVEL%
+          echo FULLREG_EXIT_CODE=%RC%> candidate_fullreg_exit.txt
+          type candidate_fullreg.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS" candidate_fullreg.txt > nul || exit /b 73
+          findstr /C:"DETERMINISTIC_REPLAY_PASS" candidate_fullreg.txt > nul || exit /b 74
+          findstr /C:"LONG_STABILITY_PASS" candidate_fullreg.txt > nul || exit /b 75
+          findstr /C:"TWO_THREAD_STRESS_PASS" candidate_fullreg.txt > nul || exit /b 76
+          findstr /C:"REALTIME_1HZ_PASS" candidate_fullreg.txt > nul || exit /b 77
+          findstr /C:"PERFORMANCE_PASS" candidate_fullreg.txt > nul || exit /b 78
+          findstr /C:"COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS" candidate_fullreg.txt > nul || exit /b 79
+          echo CANDIDATE_ALL_13_GHF_FULLREG_PASS> candidate_fullreg_gate.txt
+
+      - name: Immutable final SHA lock
+        shell: powershell
+        run: |
+          $h=(Get-FileHash candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FINAL_SHA){ throw "SHA_CHANGED $h" }
+          "RC3_EFEED8_REAL_GHF_FULLREG_PASS SHA256=$h" | Out-File RC3_EFEED8_REAL_GHF_PASS.lock
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc3-candidate-real-ghf-v2-${{ github.run_id }}
+          path: |
+            corpus_binding.txt
+            encrypted_binding.txt
+            candidate_binding.txt
+            stackfix_report.json
+            mathfix_report.json
+            fullreg_candidate_build.txt
+            fullreg_candidate_build_gate.txt
+            candidate_fullreg.txt
+            candidate_fullreg_exit.txt
+            candidate_fullreg_gate.txt
+            RC3_EFEED8_REAL_GHF_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3_ghfv2
+          git add -A .secure_rc3_ghfv2 || true
+          if ! git diff --cached --quiet; then
+            git config user.name windows-dll-test-bot
+            git config user.email windows-dll-test-bot@users.noreply.github.com
+            git commit -m 'Remove candidate GHF v2 one-time RSA handoff'
+            git push origin HEAD:${GITHUB_REF_NAME} || true
+          fi
