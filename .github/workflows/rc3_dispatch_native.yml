@@ -1,0 +1,20 @@
+name: rc3-dispatch-native
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_dispatch_native.yml']
+permissions:
+  actions: write
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch existing Windows native gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/native_windows_prefix14.yml/dispatches" -f ref="${GITHUB_REF_NAME}"
+          echo NATIVE_WINDOWS_GATE_DISPATCHED
