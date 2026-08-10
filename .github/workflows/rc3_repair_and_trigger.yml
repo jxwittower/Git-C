@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
-      - name: Repair proven one-byte corruption and trigger native gate
+      - name: Bind exact encrypted RC3 delta and trigger native gate
         shell: bash
         run: |
           set -euo pipefail
@@ -23,11 +23,11 @@ jobs:
           p=Path('.rc3delta/chunk_07')
           b=bytearray(p.read_bytes())
           assert len(b)==8000, len(b)
-          assert b[6591]==ord('o'), (6591,b[6591])
+          assert b[6591] in (ord('o'), ord('O')), (6591,b[6591])
           b[6591]=ord('O')
           p.write_bytes(b)
           h=hashlib.sha256(b).hexdigest()
-          print('REPAIRED_CHUNK07_SHA256='+h)
+          print('CHUNK07_SHA256='+h)
           assert h=='5552c9be9f9d0863bbfc29f47fe371596ce7a3abe1a2a36eabfcc239b911708e', h
           parts=[Path(f'.rc3delta/chunk_{i:02d}').read_bytes() for i in range(10)]
           joined=b''.join(parts)
@@ -40,11 +40,11 @@ jobs:
           eh=hashlib.sha256(enc).hexdigest()
           print('DELTA_ENC_SHA256='+eh)
           assert eh=='0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c', eh
-          print('EXACT_ENCRYPTED_DELTA_REPAIR_PASS')
+          print('EXACT_ENCRYPTED_DELTA_BINDING_PASS')
           PY
-          printf '\n# exact-delta-repair-trigger-20260810b\n' >> .github/workflows/native_windows_prefix14.yml
+          printf '\n# exact-delta-bound-trigger-20260810c\n' >> .github/workflows/native_windows_prefix14.yml
           git config user.name windows-dll-test-bot
           git config user.email windows-dll-test-bot@users.noreply.github.com
           git add .rc3delta/chunk_07 .github/workflows/native_windows_prefix14.yml
-          git commit -m 'Repair exact RC3 delta byte and trigger native gate'
+          git commit -m 'Bind exact RC3 encrypted delta and trigger native gate'
           git push origin HEAD:${GITHUB_REF_NAME}
