@@ -21,6 +21,7 @@ jobs:
     env:
       DRIVE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
       ENC_SHA: 28654a7d311f58f9a0893b778739681fda29bc6b337468ea41cc068f454ae801
+      ENC_BYTES: 173824
       XZ_SHA: 1fb3af89fc41d2f63a78f9fea9ce74845d70c23eabed177d7d6cd426cd4e24b0
       DLL_SHA: 1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92
       SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
@@ -31,17 +32,36 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Download encrypted RC3 payload
+      - name: Download exact encrypted RC3 payload with Drive curl fallbacks
         run: |
           $ErrorActionPreference='Stop'
-          python -m pip install --disable-pip-version-check --quiet gdown
-          if($LASTEXITCODE -ne 0){ throw 'GDOWN_INSTALL_FAIL' }
-          gdown $env:DRIVE_ID -O $env:RUNNER_TEMP\payload.enc
-          if($LASTEXITCODE -ne 0){ throw 'GDOWN_DOWNLOAD_FAIL' }
-          $h=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
-          $n=(Get-Item $env:RUNNER_TEMP\payload.enc).Length
-          "ENC_BYTES=$n`nENC_SHA256=$h" | Tee-Object encrypted_payload.txt
-          if($h -ne $env:ENC_SHA){ throw "ENC_SHA_MISMATCH $h" }
+          $out="$env:RUNNER_TEMP\payload.enc"
+          $urls=@(
+            "https://drive.usercontent.google.com/download?id=$env:DRIVE_ID&export=download&confirm=t",
+            "https://drive.google.com/uc?export=download&id=$env:DRIVE_ID&confirm=t"
+          )
+          $ok=$false
+          $attempt=0
+          foreach($u in $urls){
+            $attempt++
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+            & curl.exe -L --fail --silent --show-error --connect-timeout 20 --max-time 90 -o $out $u
+            $curlrc=$LASTEXITCODE
+            if($curlrc -ne 0 -or !(Test-Path $out)){
+              "ATTEMPT=$attempt CURL_RC=$curlrc NO_FILE=1" | Add-Content drive_download_probe.txt
+              continue
+            }
+            $n=(Get-Item $out).Length
+            $h=(Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant()
+            "ATTEMPT=$attempt BYTES=$n SHA256=$h" | Add-Content drive_download_probe.txt
+            if(($n -eq [int64]$env:ENC_BYTES) -and ($h -eq $env:ENC_SHA)){
+              $ok=$true
+              break
+            }
+          }
+          Get-Content drive_download_probe.txt
+          if(-not $ok){ throw 'EXACT_ENCRYPTED_PAYLOAD_DOWNLOAD_FAIL' }
+          "ENC_BYTES=$((Get-Item $out).Length)`nENC_SHA256=$((Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant())`nEXACT_ENCRYPTED_PAYLOAD_DOWNLOAD_PASS" | Tee-Object encrypted_payload.txt
 
       - name: Create one-time RSA transport key
         shell: bash
@@ -168,6 +188,7 @@ jobs:
         with:
           name: rc3-native-windows-evidence-${{ github.run_id }}
           path: |
+            drive_download_probe.txt
             encrypted_payload.txt
             payload_binding.txt
             windows_environment.txt
