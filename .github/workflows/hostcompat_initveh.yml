@@ -1,0 +1,96 @@
+name: hostcompat-init-veh
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/hostcompat_initveh.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  veh:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '9034484495'
+          path: payload_art
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Build VEH diagnostic
+        shell: powershell
+        run: |
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <stdio.h>
+          #include <stdint.h>
+          typedef int (__stdcall *InitFn)(char*,void*);
+          static FILE *gfp=0; static HMODULE gh=0;
+          static LONG CALLBACK veh(EXCEPTION_POINTERS *ep){
+            MEMORY_BASIC_INFORMATION mbi; char path[MAX_PATH]={0}; uintptr_t a=(uintptr_t)ep->ExceptionRecord->ExceptionAddress,b=(uintptr_t)gh;
+            if(gfp){
+              fprintf(gfp,"VEH_CODE=0x%08lX\n",ep->ExceptionRecord->ExceptionCode);
+              fprintf(gfp,"VEH_ADDR=%p\n",ep->ExceptionRecord->ExceptionAddress);
+              fprintf(gfp,"TARGET_BASE=%p\n",gh);
+              if(gh && a>=b) fprintf(gfp,"TARGET_RVA=0x%08lX\n",(unsigned long)(a-b));
+              if(VirtualQuery(ep->ExceptionRecord->ExceptionAddress,&mbi,sizeof(mbi))==sizeof(mbi)){
+                fprintf(gfp,"FAULT_ALLOC_BASE=%p\n",mbi.AllocationBase);
+                if(GetModuleFileNameA((HMODULE)mbi.AllocationBase,path,MAX_PATH)) fprintf(gfp,"FAULT_MODULE=%s\n",path);
+              }
+              if(ep->ExceptionRecord->NumberParameters>0) fprintf(gfp,"INFO0=0x%p\n",(void*)ep->ExceptionRecord->ExceptionInformation[0]);
+              if(ep->ExceptionRecord->NumberParameters>1) fprintf(gfp,"INFO1=0x%p\n",(void*)ep->ExceptionRecord->ExceptionInformation[1]);
+              fflush(gfp); FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(gfp)));
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+          }
+          int main(int argc,char**argv){
+            static const unsigned char auth[]={0x06,0,0,0,0xab,0x10,0x15,0x0e,0x10,0x1a,0x54,0x16,0x17,0x15,0x16,0x9d,0x1f,0x1d,0x0f,0xe5,0x58,0x5c,0x5e,0x60,0x60,0x64,0x66,0x6f,0x38,0x1a,0x5f,0x4b,0xb6,0x21};
+            char product[96]={0}; InitFn fn; int rc;
+            if(argc!=3)return 2;
+            gfp=fopen(argv[2],"wb"); if(!gfp)return 3; setvbuf(gfp,NULL,_IONBF,0);
+            AddVectoredExceptionHandler(1,veh);
+            fprintf(gfp,"BEFORE_LOAD\n");
+            gh=LoadLibraryA(argv[1]); fprintf(gfp,"AFTER_LOAD=%p LASTERROR=%lu\n",gh,GetLastError()); if(!gh)return 4;
+            fn=(InitFn)GetProcAddress(gh,"_SigProc_Init@8"); fprintf(gfp,"INIT_ADDR=%p INIT_RVA=0x%08lX\n",fn,(unsigned long)((uintptr_t)fn-(uintptr_t)gh)); if(!fn)return 5;
+            fprintf(gfp,"BEFORE_INIT\n"); rc=fn(product,(void*)auth); fprintf(gfp,"AFTER_INIT rc=%d product=%s\n",rc,product);
+            FreeLibrary(gh); fclose(gfp); return rc?0:6;
+          }
+          '@ | Set-Content initveh.c -Encoding ASCII
+          cl /nologo /O2 /W4 /MT /TC initveh.c /Fe:initveh.exe > build.txt 2>&1
+          if($LASTEXITCODE -ne 0){Get-Content build.txt; throw "BUILD $LASTEXITCODE"}
+      - name: Run HostCompat with exact inner runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          New-Item -ItemType Directory -Force work | Out-Null
+          Copy-Item payload_art\payload\HostCompat.dll work\SigProcDll-64HF.dll -Force
+          Copy-Item payload_art\payload\runtime\inner-bed\* work\ -Force
+          Copy-Item initveh.exe work\ -Force
+          Push-Location work
+          .\initveh.exe .\SigProcDll-64HF.dll hostveh.txt
+          "PROCESS_EXIT=$LASTEXITCODE" | Add-Content hostveh.txt
+          Get-Content hostveh.txt
+          Pop-Location
+          exit 0
+      - name: Dump HostCompat disassembly
+        shell: cmd
+        run: |
+          dumpbin /disasm payload_art\payload\HostCompat.dll > hostcompat_disasm.txt
+          dumpbin /headers payload_art\payload\HostCompat.dll > hostcompat_headers.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hostcompat-init-veh-${{ github.run_id }}
+          path: |
+            work/hostveh.txt
+            build.txt
+            hostcompat_headers.txt
+            hostcompat_disasm.txt
+          retention-days: 7
