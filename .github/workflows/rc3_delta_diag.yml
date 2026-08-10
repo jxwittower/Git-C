@@ -1,0 +1,27 @@
+name: rc3-delta-diag
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_delta_diag.yml']
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diagnose exact encrypted delta
+        shell: bash
+        run: |
+          set -u
+          ls -l .rc3delta
+          printf 'SEQ='; seq -w 00 09 | tr '\n' ','; echo
+          : > "$RUNNER_TEMP/remote.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do
+            printf '%s bytes=' "$f"; wc -c < "$f"
+            cat "$f" >> "$RUNNER_TEMP/remote.b64"
+          done
+          echo B64_BYTES=$(wc -c < "$RUNNER_TEMP/remote.b64")
+          echo B64_SHA=$(sha256sum "$RUNNER_TEMP/remote.b64" | awk '{print $1}')
+          base64 -d "$RUNNER_TEMP/remote.b64" > "$RUNNER_TEMP/remote.enc"
+          echo ENC_BYTES=$(wc -c < "$RUNNER_TEMP/remote.enc")
+          echo ENC_SHA=$(sha256sum "$RUNNER_TEMP/remote.enc" | awk '{print $1}')
