@@ -1,0 +1,14 @@
+name: rc3-chunk07-exact64
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_chunk07_exact64.yml']
+jobs:
+  diag:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          printf 'TEXT='; dd if=.rc3delta/chunk_07 bs=1 skip=6528 count=64 status=none; echo
+          dd if=.rc3delta/chunk_07 bs=1 skip=6528 count=64 status=none | od -An -tx1 -v
