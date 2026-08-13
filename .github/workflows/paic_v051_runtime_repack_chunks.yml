@@ -1,4 +1,4 @@
-name: PAIC V051 Runtime Repack Chunks
+name: PAIC V060 Offline Score Tools
 
 on:
   push:
@@ -8,143 +8,109 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
-  repack:
+  score_tools:
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - name: Download validated runtime artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: paic-v051-runtime-win64
-          path: payload
-          repository: jxwittower/Git-C
-          run-id: 31722986453
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify expected payload
+      - name: Download and verify official Windows engine packages
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          if (!(Test-Path payload\runtime\pythonw.exe)) { throw 'pythonw.exe missing from validated artifact' }
-          if (!(Test-Path payload\runtime\python311.dll)) { throw 'python311.dll missing from validated artifact' }
-          if (!(Get-ChildItem payload\runtime -Recurse -Filter qwindows.dll | Select-Object -First 1)) { throw 'qwindows.dll missing from validated artifact' }
-          Get-Content payload\PORTABLE_RUNTIME_BUILD.txt
-
-      - name: Build deterministic transfer ZIP
+          $ErrorActionPreference='Stop'
+          $msUrl='https://github.com/musescore/MuseScore/releases/download/v4.7.4/MuseScore-Studio-4.7.4.260706075-x86_64.msi'
+          $avUrl='https://github.com/Audiveris/audiveris/releases/download/5.11.0/Audiveris-5.11.0-windowsConsole-x86_64.msi'
+          Invoke-WebRequest -UseBasicParsing -Uri $msUrl -OutFile MuseScore.msi
+          Invoke-WebRequest -UseBasicParsing -Uri $avUrl -OutFile Audiveris.msi
+          $msh=(Get-FileHash MuseScore.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          $avh=(Get-FileHash Audiveris.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($msh -ne '64fe70e5cb9ffe159d047d1e88db567bd101f60d36b0de28feb674716929a378'){throw "MuseScore hash mismatch $msh"}
+          if($avh -ne '5f1b4e96a12c53c7da426814b76e599363c4181e291855996e0a6878dda95f71'){throw "Audiveris hash mismatch $avh"}
+      - name: Administrative extract - no end-user installation
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          if (Test-Path runtime-transfer.zip) { Remove-Item runtime-transfer.zip -Force }
-          Compress-Archive -Path payload\runtime,payload\PORTABLE_RUNTIME_PACKAGES.txt,payload\PORTABLE_RUNTIME_BUILD.txt -DestinationPath runtime-transfer.zip -CompressionLevel Optimal
-          $hash = (Get-FileHash runtime-transfer.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          $size = (Get-Item runtime-transfer.zip).Length
-          "runtime-transfer.zip SHA256=$hash SIZE=$size" | Set-Content transfer-manifest.txt
-          Write-Host "runtime-transfer.zip bytes=$size sha256=$hash"
-
-      - name: Split transfer ZIP into 240 MiB chunks
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force engines\musescore,engines\audiveris | Out-Null
+          $msTarget=(Resolve-Path engines\musescore).Path
+          $avTarget=(Resolve-Path engines\audiveris).Path
+          $p=Start-Process msiexec.exe -ArgumentList @('/a',(Resolve-Path MuseScore.msi).Path,'/qn',"TARGETDIR=$msTarget") -Wait -PassThru
+          if($p.ExitCode -ne 0){throw "MuseScore administrative extraction failed $($p.ExitCode)"}
+          $p=Start-Process msiexec.exe -ArgumentList @('/a',(Resolve-Path Audiveris.msi).Path,'/qn',"TARGETDIR=$avTarget") -Wait -PassThru
+          if($p.ExitCode -ne 0){throw "Audiveris administrative extraction failed $($p.ExitCode)"}
+      - name: Locate engines and run functional smoke
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $input = [System.IO.File]::OpenRead((Resolve-Path runtime-transfer.zip))
-          try {
-            $chunkSize = 240MB
-            $buffer = New-Object byte[] (4MB)
-            $index = 1
-            while ($input.Position -lt $input.Length) {
-              $name = ('runtime-transfer.part{0:d2}' -f $index)
-              $out = [System.IO.File]::Create((Join-Path $PWD $name))
-              try {
-                $remaining = [Math]::Min($chunkSize, $input.Length - $input.Position)
-                while ($remaining -gt 0) {
-                  $want = [Math]::Min($buffer.Length, $remaining)
-                  $read = $input.Read($buffer, 0, [int]$want)
-                  if ($read -le 0) { break }
-                  $out.Write($buffer, 0, $read)
-                  $remaining -= $read
-                }
-              } finally { $out.Dispose() }
-              $partHash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
-              $partSize = (Get-Item $name).Length
-              "$name SHA256=$partHash SIZE=$partSize" | Add-Content transfer-manifest.txt
-              $index++
-            }
-          } finally { $input.Dispose() }
-          Get-Content transfer-manifest.txt
-          if ((Get-ChildItem runtime-transfer.part*).Count -gt 8) { throw 'Unexpectedly many transfer chunks' }
-
-      - name: Upload manifest
-        uses: actions/upload-artifact@v4
+          $ErrorActionPreference='Stop'
+          $ms=Get-ChildItem engines\musescore -Recurse -File | Where-Object {$_.Name -in @('MuseScoreStudio4.exe','MuseScore4.exe','MuseScore.exe')} | Select-Object -First 1
+          if(!$ms){throw 'MuseScore executable not found after administrative extraction'}
+          $av=Get-ChildItem engines\audiveris -Recurse -File | Where-Object {$_.Name -match '^Audiveris.*\.exe$'} | Select-Object -First 1
+          if(!$av){throw 'Audiveris executable not found after administrative extraction'}
+          @'
+          <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+          <!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+          <score-partwise version="3.1"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list><part id="P1"><measure number="1"><attributes><divisions>1</divisions><key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><type>whole</type></note></measure></part></score-partwise>
+          '@ | Set-Content smoke.musicxml -Encoding utf8
+          $out=(Join-Path $PWD 'smoke.mid')
+          $p=Start-Process $ms.FullName -ArgumentList @('-o',$out,(Resolve-Path smoke.musicxml).Path) -Wait -PassThru
+          if($p.ExitCode -ne 0 -or !(Test-Path $out)){throw "MuseScore conversion smoke failed $($p.ExitCode)"}
+          $p=Start-Process $av.FullName -ArgumentList @('-help') -Wait -PassThru
+          if($p.ExitCode -ne 0){throw "Audiveris CLI smoke failed $($p.ExitCode)"}
+          @(
+            "MuseScoreExe=$($ms.FullName.Substring($PWD.Path.Length+1))",
+            "AudiverisExe=$($av.FullName.Substring($PWD.Path.Length+1))",
+            'MuseScore MusicXML to MIDI smoke=PASS',
+            'Audiveris CLI smoke=PASS',
+            'MuseScore source=https://github.com/musescore/MuseScore tag=v4.7.4',
+            'Audiveris source=https://github.com/Audiveris/audiveris tag=5.11.0'
+          ) | Set-Content engines\SCORE_TOOLS_BUILD.txt
+      - name: Package score engines and exact 90 MiB chunks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          7z a -tzip -mx=6 score-tools.zip engines | Out-Null
+          $bundleHash=(Get-FileHash score-tools.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "bundle=score-tools.zip sha256=$bundleHash size=$((Get-Item score-tools.zip).Length)" | Set-Content score-tools-manifest.txt
+          New-Item -ItemType Directory -Force parts | Out-Null
+          $input=[IO.File]::OpenRead((Resolve-Path score-tools.zip));$chunk=90MB;$buffer=New-Object byte[] (8MB);$i=1
+          try{while($input.Position -lt $input.Length){$name=('parts/scoretools.part{0:D2}.bin' -f $i);$out=[IO.File]::Create($name);try{$remaining=[Math]::Min($chunk,$input.Length-$input.Position);while($remaining -gt 0){$want=[Math]::Min($buffer.Length,$remaining);$read=$input.Read($buffer,0,[int]$want);if($read -le 0){break};$out.Write($buffer,0,$read);$remaining-=$read}}finally{$out.Dispose()};$ph=(Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant();"$(Split-Path $name -Leaf) sha256=$ph size=$((Get-Item $name).Length)"|Add-Content score-tools-manifest.txt;$i++}}finally{$input.Dispose()}
+          Get-Content score-tools-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-scoretools-manifest, path: score-tools-manifest.txt, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-scoretools-part01, path: parts/scoretools.part01.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-runtime-transfer-manifest
-          path: transfer-manifest.txt
-          compression-level: 0
-          retention-days: 3
-
-      - name: Upload part01
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-runtime-part01
-          path: runtime-transfer.part01
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part02
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-runtime-part02
-          path: runtime-transfer.part02
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part03
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-runtime-part03
-          path: runtime-transfer.part03
+          name: paic-v060-scoretools-part02
+          path: parts/scoretools.part02.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part04
-        uses: actions/upload-artifact@v4
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-runtime-part04
-          path: runtime-transfer.part04
+          name: paic-v060-scoretools-part03
+          path: parts/scoretools.part03.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part05
-        uses: actions/upload-artifact@v4
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-runtime-part05
-          path: runtime-transfer.part05
+          name: paic-v060-scoretools-part04
+          path: parts/scoretools.part04.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part06
-        uses: actions/upload-artifact@v4
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-runtime-part06
-          path: runtime-transfer.part06
+          name: paic-v060-scoretools-part05
+          path: parts/scoretools.part05.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part07
-        uses: actions/upload-artifact@v4
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-runtime-part07
-          path: runtime-transfer.part07
+          name: paic-v060-scoretools-part06
+          path: parts/scoretools.part06.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part08
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-runtime-part08
-          path: runtime-transfer.part08
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
+          retention-days: 5
