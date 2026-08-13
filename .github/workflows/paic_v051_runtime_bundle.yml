@@ -43,6 +43,7 @@ jobs:
             'PySide6>=6.7,<7' `
             'numpy==1.26.4' `
             'scipy>=1.12,<2' `
+            'pandas>=2.2,<3' `
             'sounddevice>=0.5,<1' `
             'opencv-contrib-python>=4.10,<5' `
             'partitura>=1.7,<2' `
@@ -61,14 +62,7 @@ jobs:
             'mediapipe==0.10.21' `
             'onnxruntime>=1.19,<2' `
             'python-rtmidi>=1.5,<2'
-
-      - name: Install Basic Pitch high accuracy transcription when compatible
-        id: basicpitch
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          .\runtime\python.exe -m pip install --disable-pip-version-check --prefer-binary 'basic-pitch==0.4.0'
-          .\runtime\python.exe -c "import basic_pitch; print('BASIC_PITCH_OK')"
+          .\runtime\python.exe -m pip check
 
       - name: Bundle Microsoft VC runtime DLLs
         shell: pwsh
@@ -83,15 +77,18 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if (!(Test-Path runtime\python.exe)) { throw 'python.exe missing' }
           if (!(Test-Path runtime\pythonw.exe)) { throw 'pythonw.exe missing' }
+          if (!(Test-Path runtime\python311.dll)) { throw 'python311.dll missing' }
           $qwindows = Get-ChildItem runtime -Recurse -Filter qwindows.dll | Select-Object -First 1
           if (!$qwindows) { throw 'qwindows.dll missing' }
           $env:QT_QPA_PLATFORM = 'offscreen'
-          .\runtime\python.exe -c "import numpy,scipy,sounddevice,cv2,partitura,verovio,music21,pretty_midi,mido,parangonar,pianoplayer,mediapipe,onnxruntime,rtmidi; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('PAIC_CORE_RUNTIME_OK')"
+          .\runtime\python.exe -c "import numpy,scipy,pandas,sounddevice,cv2,partitura,verovio,music21,pretty_midi,mido,parangonar,pianoplayer,mediapipe,onnxruntime,rtmidi; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('PAIC_CORE_RUNTIME_OK')"
           $tmp = Join-Path $env:RUNNER_TEMP 'paic-relocated-runtime'
           if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
           Move-Item runtime $tmp
-          & "$tmp\python.exe" -c "import numpy,cv2,partitura,verovio,parangonar,mediapipe; from PySide6.QtWidgets import QApplication; a=QApplication([]); print('PAIC_RELOCATION_OK')"
+          & "$tmp\python.exe" -c "import numpy,pandas,cv2,partitura,verovio,parangonar,mediapipe,onnxruntime; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('PAIC_RELOCATION_OK')"
+          if ($LASTEXITCODE -ne 0) { throw 'relocated runtime smoke failed' }
           Move-Item $tmp runtime
 
       - name: Write runtime manifest
@@ -99,13 +96,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\runtime\python.exe -m pip freeze | Sort-Object | Set-Content PORTABLE_RUNTIME_PACKAGES.txt
-          $bp = 'optional-not-installed'
-          if ('${{ steps.basicpitch.outcome }}' -eq 'success') { $bp = 'installed' }
           @(
             'Piano AI Coach V0.5.1 Portable Runtime',
             'CPython: 3.11.15 x86_64-pc-windows-msvc',
-            'Runtime SHA256: ebfd13f290b79fc0cd874304e80944d81a368edc2c7cd94994a7d5104cc0c6b3',
-            "Basic Pitch: $bp",
+            'Runtime source SHA256: ebfd13f290b79fc0cd874304e80944d81a368edc2c7cd94994a7d5104cc0c6b3',
+            'Basic Pitch/TensorFlow: intentionally isolated from this core runtime; not bundled in V0.5.1 core because TensorFlow 2.15 ml-dtypes conflicts with MediaPipe JAX dependencies.',
+            'Core dependency check: PASS',
             'Core relocation smoke: PASS'
           ) | Set-Content PORTABLE_RUNTIME_BUILD.txt
 
