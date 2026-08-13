@@ -1,4 +1,4 @@
-name: PAIC V051 Split Validated Runtime Artifact
+name: PAIC Full AI Runtime Drive Chunks
 
 on:
   push:
@@ -12,128 +12,109 @@ permissions:
   contents: read
 
 jobs:
-  split:
+  split_core:
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Download original validated artifact ZIP bytes
+      - name: Download and validate core artifact
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $headers = @{
-            Authorization = "Bearer $env:GH_TOKEN"
-            Accept = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/jxwittower/Git-C/actions/artifacts/9190213214/zip' -OutFile runtime-artifact.zip
-          $hash = (Get-FileHash runtime-artifact.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          $size = (Get-Item runtime-artifact.zip).Length
-          if ($hash -ne 'edf0cb543b24a8bef755e66205386acd332688c4bd4b6fcf5a6fbfb8e1f01da7') { throw "Artifact hash mismatch: $hash" }
-          "runtime-artifact.zip SHA256=$hash SIZE=$size" | Set-Content transfer-manifest.txt
-          Write-Host "Validated artifact bytes=$size sha256=$hash"
-
-      - name: Split exact artifact bytes into 240 MiB chunks
+          $ErrorActionPreference='Stop'
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/jxwittower/Git-C/actions/artifacts/9191837331/zip' -OutFile core.zip
+          $h=(Get-FileHash core.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne '5b0ce00ad359d37656909b6e15ca475521882199cf77d74c9f83a7933bedd673'){throw "core hash mismatch $h"}
+          "bundle=core.zip sha256=$h size=$((Get-Item core.zip).Length)" | Set-Content core-manifest.txt
+      - name: Split core into 90 MiB exact chunks
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $input = [System.IO.File]::OpenRead((Resolve-Path runtime-artifact.zip))
-          try {
-            $chunkSize = 240MB
-            $buffer = New-Object byte[] (8MB)
-            $index = 1
-            while ($input.Position -lt $input.Length) {
-              $name = ('runtime-artifact.part{0:d2}' -f $index)
-              $out = [System.IO.File]::Create((Join-Path $PWD $name))
-              try {
-                $remaining = [Math]::Min($chunkSize, $input.Length - $input.Position)
-                while ($remaining -gt 0) {
-                  $want = [Math]::Min($buffer.Length, $remaining)
-                  $read = $input.Read($buffer, 0, [int]$want)
-                  if ($read -le 0) { break }
-                  $out.Write($buffer, 0, $read)
-                  $remaining -= $read
-                }
-              } finally { $out.Dispose() }
-              $partHash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
-              $partSize = (Get-Item $name).Length
-              "$name SHA256=$partHash SIZE=$partSize" | Add-Content transfer-manifest.txt
-              $index++
-            }
-          } finally { $input.Dispose() }
-          Get-Content transfer-manifest.txt
-          $parts = (Get-ChildItem runtime-artifact.part*).Count
-          if ($parts -lt 2 -or $parts -gt 8) { throw "Unexpected part count: $parts" }
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force parts | Out-Null
+          $input=[IO.File]::OpenRead((Resolve-Path core.zip)); $chunk=90MB; $buffer=New-Object byte[] (8MB); $i=1
+          try { while($input.Position -lt $input.Length){ $name=('parts/core.part{0:D2}.bin' -f $i); $out=[IO.File]::Create($name); try{$remaining=[Math]::Min($chunk,$input.Length-$input.Position); while($remaining -gt 0){$want=[Math]::Min($buffer.Length,$remaining);$read=$input.Read($buffer,0,[int]$want);if($read -le 0){break};$out.Write($buffer,0,$read);$remaining-=$read}}finally{$out.Dispose()};$ph=(Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant();"$(Split-Path $name -Leaf) sha256=$ph size=$((Get-Item $name).Length)"|Add-Content core-manifest.txt;$i++}} finally{$input.Dispose()}
+          Get-Content core-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-manifest, path: core-manifest.txt, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part01, path: parts/core.part01.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part02, path: parts/core.part02.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part03, path: parts/core.part03.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part04, path: parts/core.part04.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part05, path: parts/core.part05.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part06, path: parts/core.part06.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part07, path: parts/core.part07.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part08, path: parts/core.part08.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part09, path: parts/core.part09.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-core-part10, path: parts/core.part10.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paic-v060-core-part11
+          path: parts/core.part11.bin
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paic-v060-core-part12
+          path: parts/core.part12.bin
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 5
 
-      - name: Upload manifest
-        uses: actions/upload-artifact@v4
+  split_transcribe:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download and validate transcription artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri 'https://api.github.com/repos/jxwittower/Git-C/actions/artifacts/9191786171/zip' -OutFile transcribe.zip
+          $h=(Get-FileHash transcribe.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne '2a23d831b671c2ef678c0392146903516cf338bb92986d8b7dd5acf893e24c89'){throw "transcribe hash mismatch $h"}
+          "bundle=transcribe.zip sha256=$h size=$((Get-Item transcribe.zip).Length)" | Set-Content transcribe-manifest.txt
+      - name: Split transcription into 90 MiB exact chunks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force parts | Out-Null
+          $input=[IO.File]::OpenRead((Resolve-Path transcribe.zip)); $chunk=90MB; $buffer=New-Object byte[] (8MB); $i=1
+          try { while($input.Position -lt $input.Length){ $name=('parts/transcribe.part{0:D2}.bin' -f $i); $out=[IO.File]::Create($name); try{$remaining=[Math]::Min($chunk,$input.Length-$input.Position); while($remaining -gt 0){$want=[Math]::Min($buffer.Length,$remaining);$read=$input.Read($buffer,0,[int]$want);if($read -le 0){break};$out.Write($buffer,0,$read);$remaining-=$read}}finally{$out.Dispose()};$ph=(Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant();"$(Split-Path $name -Leaf) sha256=$ph size=$((Get-Item $name).Length)"|Add-Content transcribe-manifest.txt;$i++}} finally{$input.Dispose()}
+          Get-Content transcribe-manifest.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-manifest, path: transcribe-manifest.txt, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part01, path: parts/transcribe.part01.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part02, path: parts/transcribe.part02.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part03, path: parts/transcribe.part03.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part04, path: parts/transcribe.part04.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part05, path: parts/transcribe.part05.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part06, path: parts/transcribe.part06.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
+        with: {name: paic-v060-transcribe-part07, path: parts/transcribe.part07.bin, compression-level: 0, retention-days: 5}
+      - uses: actions/upload-artifact@v4
         with:
-          name: paic-v051-exact-manifest
-          path: transfer-manifest.txt
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part01
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part01
-          path: runtime-artifact.part01
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part02
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part02
-          path: runtime-artifact.part02
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part03
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part03
-          path: runtime-artifact.part03
+          name: paic-v060-transcribe-part08
+          path: parts/transcribe.part08.bin
           if-no-files-found: ignore
           compression-level: 0
-          retention-days: 3
-      - name: Upload part04
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part04
-          path: runtime-artifact.part04
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part05
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part05
-          path: runtime-artifact.part05
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part06
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part06
-          path: runtime-artifact.part06
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part07
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part07
-          path: runtime-artifact.part07
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
-      - name: Upload part08
-        uses: actions/upload-artifact@v4
-        with:
-          name: paic-v051-exact-part08
-          path: runtime-artifact.part08
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 3
+          retention-days: 5
