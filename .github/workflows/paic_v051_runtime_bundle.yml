@@ -1,4 +1,4 @@
-name: PAIC V051 Portable Runtime Bundle
+name: PAIC Full Offline Runtime Bundle
 
 on:
   push:
@@ -11,107 +11,81 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  core:
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
-      - name: Download verified CPython 3.11 x64 portable runtime
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/astral-sh/python-build-standalone/releases/download/20260807/cpython-3.11.15%2B20260807-x86_64-pc-windows-msvc-install_only_stripped.tar.gz'
-          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile python-runtime.tar.gz
-          $hash = (Get-FileHash python-runtime.tar.gz -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne 'ebfd13f290b79fc0cd874304e80944d81a368edc2c7cd94994a7d5104cc0c6b3') { throw "Runtime hash mismatch: $hash" }
-          tar -xzf python-runtime.tar.gz
-          if (!(Test-Path python\python.exe)) { throw 'python.exe missing after extraction' }
-          Move-Item python runtime
-          .\runtime\python.exe -c "import sys; print(sys.version); print(sys.executable)"
-
-      - name: Prepare pip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .\runtime\python.exe -m ensurepip --upgrade
-          .\runtime\python.exe -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
-
-      - name: Install core desktop, score, audio and alignment engines
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .\runtime\python.exe -m pip install --disable-pip-version-check --prefer-binary `
-            'PySide6>=6.7,<7' `
-            'numpy==1.26.4' `
-            'scipy>=1.12,<2' `
-            'pandas>=2.2,<3' `
-            'sounddevice>=0.5,<1' `
-            'opencv-contrib-python>=4.10,<5' `
-            'partitura>=1.7,<2' `
-            'verovio>=5,<6' `
-            'music21>=9,<10' `
-            'pretty-midi>=0.2.10,<1' `
-            'mido>=1.3,<2' `
-            'parangonar==3.2.0' `
-            'pianoplayer==3.0.2'
-
-      - name: Install camera hand AI and MIDI runtime
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .\runtime\python.exe -m pip install --disable-pip-version-check --prefer-binary `
-            'mediapipe==0.10.21' `
-            'onnxruntime>=1.19,<2' `
-            'python-rtmidi>=1.5,<2'
-          .\runtime\python.exe -m pip check
-
-      - name: Bundle Microsoft VC runtime DLLs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($dll in @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','concrt140.dll')) {
-            $src = Join-Path $env:WINDIR "System32\$dll"
-            if (Test-Path $src) { Copy-Item $src runtime\ -Force }
-          }
-
-      - name: Portable relocation and import smoke test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (!(Test-Path runtime\python.exe)) { throw 'python.exe missing' }
-          if (!(Test-Path runtime\pythonw.exe)) { throw 'pythonw.exe missing' }
-          if (!(Test-Path runtime\python311.dll)) { throw 'python311.dll missing' }
-          $qwindows = Get-ChildItem runtime -Recurse -Filter qwindows.dll | Select-Object -First 1
-          if (!$qwindows) { throw 'qwindows.dll missing' }
-          $env:QT_QPA_PLATFORM = 'offscreen'
-          .\runtime\python.exe -c "import numpy,scipy,pandas,sounddevice,cv2,partitura,verovio,music21,pretty_midi,mido,parangonar,pianoplayer,mediapipe,onnxruntime,rtmidi; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('PAIC_CORE_RUNTIME_OK')"
-          $tmp = Join-Path $env:RUNNER_TEMP 'paic-relocated-runtime'
-          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-          Move-Item runtime $tmp
-          & "$tmp\python.exe" -c "import numpy,pandas,cv2,partitura,verovio,parangonar,mediapipe,onnxruntime; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('PAIC_RELOCATION_OK')"
-          if ($LASTEXITCODE -ne 0) { throw 'relocated runtime smoke failed' }
-          Move-Item $tmp runtime
-
-      - name: Write runtime manifest
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .\runtime\python.exe -m pip freeze | Sort-Object | Set-Content PORTABLE_RUNTIME_PACKAGES.txt
-          @(
-            'Piano AI Coach V0.5.1 Portable Runtime',
-            'CPython: 3.11.15 x86_64-pc-windows-msvc',
-            'Runtime source SHA256: ebfd13f290b79fc0cd874304e80944d81a368edc2c7cd94994a7d5104cc0c6b3',
-            'Basic Pitch/TensorFlow: intentionally isolated from this core runtime; not bundled in V0.5.1 core because TensorFlow 2.15 ml-dtypes conflicts with MediaPipe JAX dependencies.',
-            'Core dependency check: PASS',
-            'Core relocation smoke: PASS'
-          ) | Set-Content PORTABLE_RUNTIME_BUILD.txt
-
-      - name: Upload self-contained runtime tree
-        uses: actions/upload-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: paic-v051-runtime-win64
-          path: |
-            runtime
-            PORTABLE_RUNTIME_PACKAGES.txt
-            PORTABLE_RUNTIME_BUILD.txt
+          python-version: '3.11.9'
+          architecture: 'x64'
+      - name: Copy relocatable core runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $prefix=(& python -c "import sys; print(sys.prefix)").Trim()
+          robocopy $prefix runtime /E /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -gt 7) { throw "robocopy failed $LASTEXITCODE" }
+      - name: Install core AI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          .\runtime\python.exe -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
+          .\runtime\python.exe -m pip install --disable-pip-version-check --prefer-binary 'PySide6>=6.7,<7' 'numpy==1.26.4' 'scipy>=1.12,<2' 'pandas>=2.2,<3' 'sounddevice>=0.5,<1' 'opencv-contrib-python>=4.10,<5' 'partitura>=1.7,<2' 'verovio>=5,<6' 'music21>=9,<10' 'pretty-midi>=0.2.10,<1' 'mido>=1.3,<2' 'parangonar==3.2.0' 'pianoplayer==3.0.2' 'mediapipe==0.10.21' 'onnxruntime>=1.19,<2' 'python-rtmidi>=1.5,<2'
+          .\runtime\python.exe -m pip check
+      - name: Core relocation gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $env:QT_QPA_PLATFORM='offscreen'
+          .\runtime\python.exe -c "import numpy,pandas,cv2,partitura,verovio,parangonar,pianoplayer,mediapipe,onnxruntime,rtmidi; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('CORE_OK')"
+          $tmp=Join-Path $env:RUNNER_TEMP 'paic-core-relocated'
+          Move-Item runtime $tmp
+          & "$tmp\python.exe" -c "import pandas,cv2,parangonar,mediapipe,onnxruntime; from PySide6.QtWidgets import QApplication; a=QApplication([]); print('CORE_RELOCATED_OK')"
+          if ($LASTEXITCODE -ne 0) { throw 'core relocation failed' }
+          Move-Item $tmp runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paic-full-core-runtime
+          path: runtime
           compression-level: 6
-          retention-days: 3
+          retention-days: 5
+
+  transcribe:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+          architecture: 'x64'
+      - name: Copy isolated transcription runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $prefix=(& python -c "import sys; print(sys.prefix)").Trim()
+          robocopy $prefix runtime_transcribe /E /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -gt 7) { throw "robocopy failed $LASTEXITCODE" }
+      - name: Install Basic Pitch TensorFlow engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          .\runtime_transcribe\python.exe -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
+          .\runtime_transcribe\python.exe -m pip install --disable-pip-version-check --prefer-binary 'basic-pitch==0.4.0'
+          .\runtime_transcribe\python.exe -m pip check
+          .\runtime_transcribe\python.exe -c "import tensorflow,basic_pitch; from basic_pitch import ICASSP_2022_MODEL_PATH; assert ICASSP_2022_MODEL_PATH.exists(); print('BASIC_PITCH_TF_OK')"
+      - name: Transcription relocation gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $tmp=Join-Path $env:RUNNER_TEMP 'paic-transcribe-relocated'
+          Move-Item runtime_transcribe $tmp
+          & "$tmp\python.exe" -c "import tensorflow,basic_pitch; from basic_pitch import ICASSP_2022_MODEL_PATH; assert ICASSP_2022_MODEL_PATH.exists(); print('TRANSCRIBE_RELOCATED_OK')"
+          if ($LASTEXITCODE -ne 0) { throw 'transcription relocation failed' }
+          Move-Item $tmp runtime_transcribe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paic-full-transcribe-runtime
+          path: runtime_transcribe
+          compression-level: 6
+          retention-days: 5
