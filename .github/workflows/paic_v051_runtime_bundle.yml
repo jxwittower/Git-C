@@ -25,7 +25,9 @@ jobs:
           $ErrorActionPreference='Stop'
           $prefix=(& python -c "import sys; print(sys.prefix)").Trim()
           robocopy $prefix runtime /E /NFL /NDL /NJH /NJS /NP
-          if ($LASTEXITCODE -gt 7) { throw "robocopy failed $LASTEXITCODE" }
+          $rc=$LASTEXITCODE
+          if ($rc -gt 7) { throw "robocopy failed $rc" }
+          $global:LASTEXITCODE=0
       - name: Install core AI
         shell: pwsh
         run: |
@@ -40,6 +42,7 @@ jobs:
           $env:QT_QPA_PLATFORM='offscreen'
           .\runtime\python.exe -c "import numpy,pandas,cv2,partitura,verovio,parangonar,pianoplayer,mediapipe,onnxruntime,rtmidi; from PySide6.QtWidgets import QApplication,QWidget; a=QApplication([]); w=QWidget(); print('CORE_OK')"
           $tmp=Join-Path $env:RUNNER_TEMP 'paic-core-relocated'
+          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
           Move-Item runtime $tmp
           & "$tmp\python.exe" -c "import pandas,cv2,parangonar,mediapipe,onnxruntime; from PySide6.QtWidgets import QApplication; a=QApplication([]); print('CORE_RELOCATED_OK')"
           if ($LASTEXITCODE -ne 0) { throw 'core relocation failed' }
@@ -65,7 +68,9 @@ jobs:
           $ErrorActionPreference='Stop'
           $prefix=(& python -c "import sys; print(sys.prefix)").Trim()
           robocopy $prefix runtime_transcribe /E /NFL /NDL /NJH /NJS /NP
-          if ($LASTEXITCODE -gt 7) { throw "robocopy failed $LASTEXITCODE" }
+          $rc=$LASTEXITCODE
+          if ($rc -gt 7) { throw "robocopy failed $rc" }
+          $global:LASTEXITCODE=0
       - name: Install Basic Pitch TensorFlow engine
         shell: pwsh
         run: |
@@ -79,6 +84,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $tmp=Join-Path $env:RUNNER_TEMP 'paic-transcribe-relocated'
+          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
           Move-Item runtime_transcribe $tmp
           & "$tmp\python.exe" -c "import tensorflow,basic_pitch; from basic_pitch import ICASSP_2022_MODEL_PATH; assert ICASSP_2022_MODEL_PATH.exists(); print('TRANSCRIBE_RELOCATED_OK')"
           if ($LASTEXITCODE -ne 0) { throw 'transcription relocation failed' }
