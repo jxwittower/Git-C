@@ -1,0 +1,150 @@
+name: PAIC V051 Runtime Repack Chunks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/paic_v051_runtime_repack_chunks.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  repack:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Download validated runtime artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: paic-v051-runtime-win64
+          path: payload
+          repository: jxwittower/Git-C
+          run-id: 31722986453
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify expected payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (!(Test-Path payload\runtime\pythonw.exe)) { throw 'pythonw.exe missing from validated artifact' }
+          if (!(Test-Path payload\runtime\python311.dll)) { throw 'python311.dll missing from validated artifact' }
+          if (!(Get-ChildItem payload\runtime -Recurse -Filter qwindows.dll | Select-Object -First 1)) { throw 'qwindows.dll missing from validated artifact' }
+          Get-Content payload\PORTABLE_RUNTIME_BUILD.txt
+
+      - name: Build deterministic transfer ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path runtime-transfer.zip) { Remove-Item runtime-transfer.zip -Force }
+          Compress-Archive -Path payload\runtime,payload\PORTABLE_RUNTIME_PACKAGES.txt,payload\PORTABLE_RUNTIME_BUILD.txt -DestinationPath runtime-transfer.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash runtime-transfer.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item runtime-transfer.zip).Length
+          "runtime-transfer.zip SHA256=$hash SIZE=$size" | Set-Content transfer-manifest.txt
+          Write-Host "runtime-transfer.zip bytes=$size sha256=$hash"
+
+      - name: Split transfer ZIP into 240 MiB chunks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $input = [System.IO.File]::OpenRead((Resolve-Path runtime-transfer.zip))
+          try {
+            $chunkSize = 240MB
+            $buffer = New-Object byte[] (4MB)
+            $index = 1
+            while ($input.Position -lt $input.Length) {
+              $name = ('runtime-transfer.part{0:d2}' -f $index)
+              $out = [System.IO.File]::Create((Join-Path $PWD $name))
+              try {
+                $remaining = [Math]::Min($chunkSize, $input.Length - $input.Position)
+                while ($remaining -gt 0) {
+                  $want = [Math]::Min($buffer.Length, $remaining)
+                  $read = $input.Read($buffer, 0, [int]$want)
+                  if ($read -le 0) { break }
+                  $out.Write($buffer, 0, $read)
+                  $remaining -= $read
+                }
+              } finally { $out.Dispose() }
+              $partHash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
+              $partSize = (Get-Item $name).Length
+              "$name SHA256=$partHash SIZE=$partSize" | Add-Content transfer-manifest.txt
+              $index++
+            }
+          } finally { $input.Dispose() }
+          Get-Content transfer-manifest.txt
+          if ((Get-ChildItem runtime-transfer.part*).Count -gt 8) { throw 'Unexpectedly many transfer chunks' }
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-transfer-manifest
+          path: transfer-manifest.txt
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload part01
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part01
+          path: runtime-transfer.part01
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part02
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part02
+          path: runtime-transfer.part02
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part03
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part03
+          path: runtime-transfer.part03
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part04
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part04
+          path: runtime-transfer.part04
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part05
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part05
+          path: runtime-transfer.part05
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part06
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part06
+          path: runtime-transfer.part06
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part07
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part07
+          path: runtime-transfer.part07
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
+      - name: Upload part08
+        uses: actions/upload-artifact@v4
+        with:
+          name: paic-v051-runtime-part08
+          path: runtime-transfer.part08
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 3
