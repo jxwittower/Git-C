@@ -19,8 +19,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          certutil -f -decode paic_v061_launcher\icon.b64 paic_v061_launcher\PianoAICoach.ico | Out-Null
-          if (-not (Test-Path paic_v061_launcher\PianoAICoach.ico)) { throw 'icon decode failed' }
+          $b64 = (Get-Content paic_v061_launcher\icon.b64 -Raw).Trim()
+          [IO.File]::WriteAllBytes('paic_v061_launcher\PianoAICoach.ico', [Convert]::FromBase64String($b64))
+          $icon = Get-Item paic_v061_launcher\PianoAICoach.ico
+          if ($icon.Length -lt 10000) { throw "icon decode failed: $($icon.Length) bytes" }
       - name: Generate Windows resources
         shell: pwsh
         run: |
@@ -46,6 +48,7 @@ jobs:
           $mt = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $mt) { throw 'mt.exe not found' }
           & $mt.FullName -nologo "-inputresource:$exe;#1" -out:paic_v061_launcher\embedded.manifest
+          if ($LASTEXITCODE -ne 0) { throw "mt.exe extraction failed: $LASTEXITCODE" }
           $manifest = Get-Content paic_v061_launcher\embedded.manifest -Raw
           foreach ($needle in @('asInvoker','uiAccess="false"','PerMonitorV2','longPathAware','8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a')) {
             if ($manifest -notmatch [regex]::Escape($needle)) { throw "manifest gate missing: $needle" }
