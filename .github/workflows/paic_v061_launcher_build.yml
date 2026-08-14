@@ -15,14 +15,31 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.2'
-      - name: Decode product icon
+      - name: Generate product icon on Windows
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $b64 = (Get-Content paic_v061_launcher\icon.b64 -Raw).Trim()
-          [IO.File]::WriteAllBytes('paic_v061_launcher\PianoAICoach.ico', [Convert]::FromBase64String($b64))
-          $icon = Get-Item paic_v061_launcher\PianoAICoach.ico
-          if ($icon.Length -lt 10000) { throw "icon decode failed: $($icon.Length) bytes" }
+          Add-Type -AssemblyName System.Drawing
+          $bmp = New-Object System.Drawing.Bitmap 256,256
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+          $g.Clear([System.Drawing.Color]::FromArgb(245,247,250))
+          $dark = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(29,35,45))
+          $cyan = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(97,218,251)), 9
+          $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+          $black = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(18,22,28))
+          $g.FillRectangle($dark,28,38,200,180)
+          $left=48; $top=112; $kw=22
+          for($i=0;$i -lt 7;$i++){ $g.FillRectangle($white,$left+$i*$kw,$top,$kw-1,82) }
+          foreach($i in @(0,1,3,4,5)){ $g.FillRectangle($black,$left+($i+1)*$kw-4,$top,8,46) }
+          $pts = [System.Drawing.Point[]]@([Drawing.Point]::new(58,91),[Drawing.Point]::new(78,91),[Drawing.Point]::new(88,68),[Drawing.Point]::new(102,102),[Drawing.Point]::new(116,79),[Drawing.Point]::new(128,91),[Drawing.Point]::new(144,91),[Drawing.Point]::new(155,62),[Drawing.Point]::new(170,104),[Drawing.Point]::new(182,82),[Drawing.Point]::new(198,82))
+          $g.DrawLines($cyan,$pts)
+          $g.Dispose()
+          $hIcon = $bmp.GetHicon()
+          $icon = [System.Drawing.Icon]::FromHandle($hIcon)
+          $fs = [IO.File]::Open('paic_v061_launcher\PianoAICoach.ico',[IO.FileMode]::Create)
+          $icon.Save($fs); $fs.Close(); $bmp.Dispose()
+          if ((Get-Item paic_v061_launcher\PianoAICoach.ico).Length -lt 1000) { throw 'icon generation failed' }
       - name: Generate Windows resources
         shell: pwsh
         run: |
