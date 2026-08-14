@@ -1,0 +1,25 @@
+{
+  "FixedFileInfo": {
+    "FileVersion": {"Major": 0, "Minor": 6, "Patch": 1, "Build": 0},
+    "ProductVersion": {"Major": 0, "Minor": 6, "Patch": 1, "Build": 0},
+    "FileFlagsMask": "3f",
+    "FileFlags": "00",
+    "FileOS": "040004",
+    "FileType": "01",
+    "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "Comments": "Full AI Offline commercial release launcher",
+    "CompanyName": "Piano AI Coach",
+    "FileDescription": "Piano AI Coach Full AI Offline Edition",
+    "FileVersion": "0.6.1.0",
+    "InternalName": "PianoAICoach.exe",
+    "LegalCopyright": "Copyright (c) 2026",
+    "OriginalFilename": "PianoAICoach.exe",
+    "ProductName": "Piano AI Coach",
+    "ProductVersion": "0.6.1"
+  },
+  "VarFileInfo": {"Translation": {"LangID": "0409", "CharsetID": "04B0"}},
+  "IconPath": "PianoAICoach.ico",
+  "ManifestPath": "app.manifest"
+}
