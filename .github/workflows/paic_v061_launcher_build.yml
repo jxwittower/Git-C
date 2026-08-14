@@ -1,0 +1,70 @@
+name: PAIC V061 Windows Launcher
+on:
+  push:
+    paths:
+      - 'paic_v061_launcher/**'
+      - '.github/workflows/paic_v061_launcher_build.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.2'
+      - name: Decode product icon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          certutil -f -decode paic_v061_launcher\icon.b64 paic_v061_launcher\PianoAICoach.ico | Out-Null
+          if (-not (Test-Path paic_v061_launcher\PianoAICoach.ico)) { throw 'icon decode failed' }
+      - name: Generate Windows resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.4.0
+          Push-Location paic_v061_launcher
+          goversioninfo -64
+          if (-not (Test-Path resource.syso)) { throw 'resource.syso missing' }
+          Pop-Location
+      - name: Build native Windows GUI launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location paic_v061_launcher
+          go build -trimpath -ldflags '-s -w -H windowsgui' -o PianoAICoach.exe .
+          Pop-Location
+      - name: Verify PE manifest and release metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Resolve-Path paic_v061_launcher\PianoAICoach.exe
+          if ((Get-Item $exe).Length -lt 1000000) { throw 'unexpectedly small launcher' }
+          $mt = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw 'mt.exe not found' }
+          & $mt.FullName -nologo "-inputresource:$exe;#1" -out:paic_v061_launcher\embedded.manifest
+          $manifest = Get-Content paic_v061_launcher\embedded.manifest -Raw
+          foreach ($needle in @('asInvoker','uiAccess="false"','PerMonitorV2','longPathAware','8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a')) {
+            if ($manifest -notmatch [regex]::Escape($needle)) { throw "manifest gate missing: $needle" }
+          }
+          $ver = (Get-Item $exe).VersionInfo
+          if ($ver.ProductName -ne 'Piano AI Coach') { throw 'ProductName missing' }
+          if ($ver.FileVersion -notlike '0.6.1*') { throw "wrong FileVersion: $($ver.FileVersion)" }
+          $sig = Get-AuthenticodeSignature $exe
+          if ($sig.Status -ne 'NotSigned') { throw "unexpected signature state before commercial signing: $($sig.Status)" }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File paic_v061_launcher\launcher_sha256.txt
+          Add-Content paic_v061_launcher\launcher_sha256.txt "SIGNING_GATE=REQUIRED_BEFORE_GA"
+          Add-Content paic_v061_launcher\launcher_sha256.txt "MANIFEST_GATE=PASS"
+          Add-Content paic_v061_launcher\launcher_sha256.txt "EXECUTION_LEVEL=asInvoker"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paic-v061-launcher-unsigned-signing-ready
+          path: |
+            paic_v061_launcher/PianoAICoach.exe
+            paic_v061_launcher/embedded.manifest
+            paic_v061_launcher/launcher_sha256.txt
+          compression-level: 0
+          retention-days: 7
