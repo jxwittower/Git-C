@@ -1,0 +1,68 @@
+name: c80-algo-only-stage4-publish-v2
+on:
+  workflow_run:
+    workflows: ['c80-algo-only-stage3-release-v2']
+    types: [completed]
+    branches: [c80-algo-only-reset-20260815]
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  publish-v2:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c80-algo-only-reset-20260815
+      - name: Bind authoritative V2 release
+        run: |
+          $ErrorActionPreference='Stop'
+          $root='.c80_release_v2'
+          foreach($f in @('C86_V69_C80_BASELINE_ALGO_ONLY.zip','SigProcDll-64HF.dll','MANIFEST_RELEASE.txt','SHA256SUMS.txt','RELEASE_ZIP_SHA256.txt','STAGE3_V2_PASS.lock')){ if(!(Test-Path (Join-Path $root $f))){ throw "V2_FILE_MISSING $f" } }
+          if(-not (Select-String (Join-Path $root 'STAGE3_V2_PASS.lock') -SimpleMatch 'STAGE3_V2_RELEASE_GATE=PASS' -Quiet)){ throw 'V2_PASS_LOCK_INVALID' }
+          $expected=(Select-String (Join-Path $root 'RELEASE_ZIP_SHA256.txt') -Pattern 'ZIP_SHA256=([0-9a-fA-F]{64})').Matches.Groups[1].Value.ToLowerInvariant()
+          $actual=(Get-FileHash (Join-Path $root 'C86_V69_C80_BASELINE_ALGO_ONLY.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $expected){ throw 'V2_ZIP_SHA_MISMATCH' }
+          $dllsha=(Get-FileHash (Join-Path $root 'SigProcDll-64HF.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if(-not (Select-String (Join-Path $root 'MANIFEST_RELEASE.txt') -SimpleMatch "DLL_SHA256=$dllsha" -Quiet)){ throw 'V2_DLL_MANIFEST_BIND_FAIL' }
+          "V2_ZIP_SHA256=$actual`nV2_DLL_SHA256=$dllsha" | Out-File PUBLISH_V2_IDENTITY.txt
+      - name: Publish authoritative tested V2 assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $tag='c86-v69-c80-algo-only-v2-20260815'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if($LASTEXITCODE -eq 0){ gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag }
+          @'
+          Authoritative C86-V69 C80-BASELINE-ALGO-ONLY V2.
+          Published only after exact C80 reproduction, two-algorithm-file source gate, historical ABI/loader gates, complete native Windows 13-GHF regression, 20,000-loop stability, two-thread stress, 1Hz realtime gate, vital suppression/recovery, and independent Windows 2022/2025 loader compatibility.
+          Field action: replace SigProcDll-64HF.dll only. Do not overwrite license, bed model, signal, bias or parameter files.
+          '@ | Set-Content -Encoding utf8 release_v2_notes.txt
+          gh release create $tag `
+            .c80_release_v2\C86_V69_C80_BASELINE_ALGO_ONLY.zip `
+            .c80_release_v2\SigProcDll-64HF.dll `
+            .c80_release_v2\MANIFEST_RELEASE.txt `
+            .c80_release_v2\SHA256SUMS.txt `
+            .c80_release_v2\RELEASE_ZIP_SHA256.txt `
+            .c80_release_v2\STAGE3_V2_PASS.lock `
+            PUBLISH_V2_IDENTITY.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target c80-algo-only-reset-20260815 `
+            --title 'C86-V69 C80 Baseline Algorithm-Only V2' `
+            --notes-file release_v2_notes.txt
+          if($LASTEXITCODE -ne 0){ throw 'V2_RELEASE_CREATE_FAIL' }
+          'STAGE4_V2_PUBLISH=PASS' | Out-File STAGE4_V2_PUBLISH_PASS.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-stage4-v2-publish-${{ github.run_id }}
+          path: |
+            PUBLISH_V2_IDENTITY.txt
+            STAGE4_V2_PUBLISH_PASS.lock
+          retention-days: 30
