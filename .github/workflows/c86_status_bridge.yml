@@ -1,0 +1,37 @@
+name: c86-status-bridge
+on:
+  push:
+    branches: [c86-final-algo-only-20260815]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Wait and record latest C86 build status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .c86_status; mkdir .c86_status
+          for i in $(seq 1 60); do
+            j=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/actions/workflows/c86_exact_c80_algo_only_build.yml/runs?branch=c86-final-algo-only-20260815&per_page=1")
+            status=$(python -c 'import json,sys; j=json.load(sys.stdin); print(j["workflow_runs"][0]["status"] if j.get("workflow_runs") else "none")' <<<"$j")
+            if [ "$status" = completed ]; then break; fi
+            sleep 10
+          done
+          runid=$(python -c 'import json,sys; j=json.load(sys.stdin); print(j["workflow_runs"][0]["id"])' <<<"$j")
+          conclusion=$(python -c 'import json,sys; j=json.load(sys.stdin); print(j["workflow_runs"][0]["conclusion"])' <<<"$j")
+          printf 'RUN_ID=%s\nSTATUS=%s\nCONCLUSION=%s\n' "$runid" "$status" "$conclusion" > .c86_status/STATUS.txt
+          if [ "$conclusion" = success ]; then touch .c86_status/PASS.lock; else touch .c86_status/FAIL.lock; fi
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/actions/runs/$runid/artifacts" > .c86_status/ARTIFACTS.json
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c86_status
+          git commit -m 'Record C86 native build status [skip ci]'
+          git push origin HEAD:c86-final-algo-only-20260815
