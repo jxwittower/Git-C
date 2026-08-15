@@ -1,0 +1,61 @@
+name: c80-history-sha-scan
+on:
+  push:
+    branches:
+      - c80-algo-only-reset-20260815
+    paths:
+      - '.github/workflows/c80_history_sha_scan.yml'
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan every Git blob by SHA256
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib, pathlib, subprocess
+          targets = {
+              '9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180':'C80_WORKING_DLL',
+              '1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de':'C80_BASELINE_CORE',
+              'c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a':'CANDIDATE_CORE',
+              'f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03':'CANDIDATE_HEADER',
+          }
+          raw=subprocess.check_output(['git','rev-list','--objects','--all'], text=True, errors='replace')
+          paths={}
+          for line in raw.splitlines():
+              p=line.split(' ',1)
+              sha=p[0]
+              paths.setdefault(sha,set())
+              if len(p)>1: paths[sha].add(p[1])
+          matches=[]
+          for i,sha in enumerate(paths):
+              typ=subprocess.check_output(['git','cat-file','-t',sha], text=True).strip()
+              if typ!='blob': continue
+              data=subprocess.check_output(['git','cat-file','blob',sha])
+              h=hashlib.sha256(data).hexdigest()
+              if h in targets:
+                  rec=(targets[h],h,sha,sorted(paths[sha]))
+                  matches.append(rec)
+                  print('MATCH',*rec,sep=' | ')
+          out=[]
+          for name,h,sha,ps in matches:
+              out.append(f'{name}\nSHA256={h}\nGIT_BLOB={sha}\nPATHS={ps}\n')
+          pathlib.Path('history_sha_scan.txt').write_text('\n'.join(out) if out else 'NO_TARGET_HASH_MATCHES\n', encoding='utf-8')
+          print('MATCH_COUNT='+str(len(matches)))
+          print(pathlib.Path('history_sha_scan.txt').read_text(encoding='utf-8'))
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\scan.py
+          python $env:RUNNER_TEMP\scan.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-history-sha-scan-${{ github.run_id }}
+          path: history_sha_scan.txt
+          if-no-files-found: error
+          retention-days: 7
