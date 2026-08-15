@@ -1,0 +1,67 @@
+name: c86-exact-material-scan
+on:
+  push:
+    branches: [c86-final-algo-only-20260815]
+permissions:
+  contents: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan exact SHA256 targets in full Git object history
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/scan.py <<'PY'
+          import hashlib, os, subprocess, pathlib
+          targets={
+          'C80_ALGO_C':'1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de',
+          'C80_ALGO_H':'c98f1de471891311700e7befcaf3878128f6119c9a356700fe920213eabb9207',
+          'WRAPPER_C':'33cfe150a007a5d8d2da54a77fe6e96739534dad0dd649135fe8b2ef7185839f',
+          'WRAPPER_H':'3735405ebfd1d2a02cc9c02f85843c3793e7e4397c722b02e91201bd12f88b9a',
+          'VCXPROJ':'6a205bcec71d8134d2f56b4880e3f9774c89cf89141a5aab0d33eb135c021538',
+          'DEF':'7b90f8bd67987155b01c7afb34f58d7d9a916af89e336ae46402121f0762d39e',
+          'RC':'fc38dee90f116db39a6a3341929d1e8068449d873854cf9be879fddcaf95098b',
+          'FILTER_BRTH':'ab3f170ff90741c614bd8ff2e5942038f1d14489f2c9df0a1dad7f3dd12b7b9a',
+          'FILTER_HRT3':'0ea419a929ac7d765f7c6bcb04fc151927eb6954a65a69819136bf3ae0946805',
+          'LATEST_ALGO_C':'c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a',
+          'LATEST_ALGO_H':'f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03'}
+          wanted={v:k for k,v in targets.items()}; found={}
+          oids=[]
+          for line in subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='ignore').splitlines():
+              if line: oids.append(line.split()[0])
+          for oid in dict.fromkeys(oids):
+              if len(found)==len(targets): break
+              try:
+                  typ=subprocess.check_output(['git','cat-file','-t',oid],text=True,stderr=subprocess.DEVNULL).strip()
+                  if typ!='blob': continue
+                  size=int(subprocess.check_output(['git','cat-file','-s',oid],text=True).strip())
+                  if size>5_000_000: continue
+                  data=subprocess.check_output(['git','cat-file','blob',oid])
+              except Exception: continue
+              h=hashlib.sha256(data).hexdigest()
+              if h in wanted and wanted[h] not in found: found[wanted[h]]=(oid,len(data))
+          out=pathlib.Path('.c86_scan'); out.mkdir(exist_ok=True)
+          for k,h in targets.items():
+              if k in found:
+                  oid,n=found[k]; (out/f'FOUND_{k}.lock').write_text(f'{h} {oid} {n}\n')
+              else:
+                  (out/f'MISSING_{k}.lock').write_text(h+'\n')
+          (out/'SUMMARY.txt').write_text('\n'.join(f'{k}={"FOUND" if k in found else "MISSING"}' for k in targets)+'\n')
+          print((out/'SUMMARY.txt').read_text())
+          PY
+          python /tmp/scan.py
+      - name: Commit scan result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c86_scan
+          if ! git diff --cached --quiet; then
+            git commit -m 'Record C86 exact material scan'
+            git push origin HEAD:c86-final-algo-only-20260815
+          fi
