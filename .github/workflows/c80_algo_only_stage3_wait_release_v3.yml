@@ -1,0 +1,204 @@
+name: c80-algo-only-stage3-wait-release-v3
+on:
+  push:
+    branches: [c80-algo-only-reset-20260815]
+    paths: ['.github/workflows/c80_algo_only_stage3_wait_release_v3.yml']
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  wait-stage2:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    outputs:
+      ready_sha: ${{ steps.wait.outputs.ready_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: wait
+        name: Wait only for a real Stage2 PASS lock
+        run: |
+          $ErrorActionPreference='Stop'
+          $branch='c80-algo-only-reset-20260815'
+          $path='.c80_exact_candidate/stage2/C80_ALGO_ONLY_STAGE2_PASS.lock'
+          $ok=$false
+          for($i=0;$i -lt 140;$i++){
+            git fetch origin $branch --quiet
+            $sha=(git rev-parse "origin/$branch").Trim()
+            git cat-file -e "$sha`:$path" 2>$null
+            if($LASTEXITCODE -eq 0){
+              $txt=(git show "$sha`:$path") -join "`n"
+              if($txt -match 'FULL_NATIVE_REGRESSION=PASS'){
+                "ready_sha=$sha" >> $env:GITHUB_OUTPUT
+                "STAGE2_REMOTE_PASS=YES`nREADY_SHA=$sha" | Out-File wait_stage2_pass.txt
+                $ok=$true
+                break
+              }
+            }
+            Start-Sleep -Seconds 30
+          }
+          if(!$ok){ throw 'STAGE2_PASS_LOCK_NOT_OBSERVED_WITHIN_WAIT_WINDOW' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-v3-stage2-wait-${{ github.run_id }}
+          path: wait_stage2_pass.txt
+          retention-days: 30
+
+  compatibility:
+    needs: wait-stage2
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wait-stage2.outputs.ready_sha }}
+      - name: Configure x86 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Verify exact ABI and native loader
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll='.c80_exact_candidate\SigProcDll-64HF.dll'
+          foreach($f in @($dll,'.c80_exact_candidate\C80_REPRODUCTION_PASS.txt','.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt','.c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock')){ if(!(Test-Path $f)){ throw "GATE_FILE_MISSING $f" } }
+          dumpbin /headers $dll | Out-File headers.txt
+          dumpbin /exports $dll | Out-File exports.txt
+          if(-not (Select-String headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'NOT_X86' }
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){ if(-not (Select-String exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          Copy-Item $dll SigProcDll-64HF.dll
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){HMODULE h=LoadLibraryA("SigProcDll-64HF.dll");if(!h){printf("LOAD_FAIL=%lu\n",GetLastError());return 10;}const char*n[]={"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"};for(int i=0;i<4;i++){if(!GetProcAddress(h,n[i])){printf("PROC_FAIL=%s err=%lu\n",n[i],GetLastError());return 20+i;}}if(!FreeLibrary(h))return 30;puts("COMPAT_LOADER_PASS");return 0;}
+          '@ | Set-Content -Encoding ascii compat.c
+          cl /nologo /O2 /Fe:compat.exe compat.c
+          if($LASTEXITCODE -ne 0){ throw 'COMPAT_COMPILE_FAIL' }
+          .\compat.exe 2>&1 | Tee-Object compat.log
+          if($LASTEXITCODE -ne 0){ throw "COMPAT_RUN_FAIL rc=$LASTEXITCODE" }
+          if(-not (Select-String compat.log -SimpleMatch 'COMPAT_LOADER_PASS' -Quiet)){ throw 'COMPAT_MARKER_MISSING' }
+          $h=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "OS=${{ matrix.os }}`nDLL_SHA256=$h`nX86=PASS`nEXACT_4_HISTORICAL_ABI=PASS`nLOADLIBRARY_GETPROC_FREELIBRARY=PASS" | Out-File compatibility_${{ matrix.os }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-v3-compat-${{ matrix.os }}-${{ github.run_id }}
+          path: compatibility_${{ matrix.os }}.txt
+          retention-days: 30
+
+  package:
+    needs: [wait-stage2, compatibility]
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wait-stage2.outputs.ready_sha }}
+          fetch-depth: 0
+      - name: Verify complete hard-gate chain at fixed Stage2 SHA
+        run: |
+          $ErrorActionPreference='Stop'
+          $req=@(
+            '.c80_exact_candidate\SigProcDll-64HF.dll',
+            '.c80_exact_candidate\C80_REPRODUCTION_PASS.txt',
+            '.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt',
+            '.c80_exact_candidate\ABI_LOADER_SURFACE_PASS.txt',
+            '.c80_exact_candidate\STAGE1_PASS.lock',
+            '.c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock',
+            '.c80_exact_candidate\stage2\loader_contract.log',
+            '.c80_exact_candidate\stage2\full_regression.log'
+          )
+          foreach($f in $req){ if(!(Test-Path $f)){ throw "MISSING_GATE_EVIDENCE $f" } }
+          if(-not (Select-String '.c80_exact_candidate\C80_REPRODUCTION_PASS.txt' -SimpleMatch 'C80_EXACT_REPRODUCTION=PASS' -Quiet)){ throw 'C80_REPRO_NOT_PASS' }
+          if(-not (Select-String '.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt' -SimpleMatch 'ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS' -Quiet)){ throw 'SOURCE_SCOPE_NOT_PASS' }
+          if(-not (Select-String '.c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock' -SimpleMatch 'FULL_NATIVE_REGRESSION=PASS' -Quiet)){ throw 'STAGE2_FULLREG_NOT_PASS' }
+      - name: Build V3 authoritative package and verify every byte
+        run: |
+          $ErrorActionPreference='Stop'
+          $name='C86_V69_C80_BASELINE_ALGO_ONLY'
+          Remove-Item -Recurse -Force $name -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $name\EVIDENCE | Out-Null
+          Copy-Item .c80_exact_candidate\SigProcDll-64HF.dll $name\SigProcDll-64HF.dll
+          Copy-Item .c80_exact_candidate\C80_REPRODUCTION_PASS.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\ABI_LOADER_SURFACE_PASS.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\loader_contract.log $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\full_regression.log $name\EVIDENCE\
+          $dllsha=(Get-FileHash $name\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @"
+          观护智能床垫 SigProc DLL 发布包
+          版本: C86-V69 C80-BASELINE-ALGO-ONLY V3
+          基线: 现场已验证正常运行的 C80 原始 VS2022/v143/Release|Win32 工程。
+          代码边界: 仅 sigproc_rebuild.c 与 sigproc_rebuild.h 两个算法文件变化；wrapper/DEF/RC/工程/资源/授权生命周期不改。
+          现场操作: 只替换 SigProcDll-64HF.dll；不要覆盖或删除 Wittower_ID_License、file_sig、file_bias、file_bed_model_v1、参数文件及其它运行文件。
+          DLL_SHA256=$dllsha
+          "@ | Set-Content -Encoding utf8 $name\README_现场替换.txt
+          @"
+          RELEASE=C86-V69-C80-BASELINE-ALGO-ONLY-V3
+          DLL_SHA256=$dllsha
+          BASELINE_C80_EXPECTED_SHA256=9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+          BASELINE_CORE_SHA256=1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de
+          CANDIDATE_CORE_SHA256=c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a
+          CANDIDATE_HEADER_SHA256=f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03
+          C80_EXACT_REPRODUCTION=PASS
+          ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS
+          ABI_LOADER_SURFACE=PASS
+          CANONICAL_LOADER_CONTRACT=PASS
+          FULL_13_GHF_NATIVE_WINDOWS_REGRESSION=PASS
+          LONG_STABILITY_20000=PASS
+          TWO_THREAD_STRESS_2X2000=PASS
+          REALTIME_1HZ=PASS
+          VITAL_SUPPRESSION_RECOVERY=PASS
+          WINDOWS_2022_COMPAT=PASS
+          WINDOWS_2025_COMPAT=PASS
+          "@ | Set-Content -Encoding ascii $name\MANIFEST_RELEASE.txt
+          $root=(Resolve-Path $name).Path
+          $snapshot=Get-ChildItem $name -Recurse -File | Sort-Object FullName
+          $rows=@(); foreach($f in $snapshot){ $h=(Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); $rows += "$h  $($f.FullName.Substring($root.Length+1))" }
+          $rows | Set-Content -Encoding ascii $name\SHA256SUMS.txt
+          foreach($row in Get-Content $name\SHA256SUMS.txt){ if($row -notmatch '^([0-9a-f]{64})  (.+)$'){ throw "BAD_SHA_ROW $row" }; $actual=(Get-FileHash (Join-Path $name $matches[2]) -Algorithm SHA256).Hash.ToLowerInvariant(); if($actual -ne $matches[1]){ throw "HASH_LIST_VERIFY_FAIL $($matches[2])" } }
+          if(Test-Path "$name.zip"){ Remove-Item "$name.zip" -Force }
+          Compress-Archive -Path $name -DestinationPath "$name.zip" -CompressionLevel Optimal
+          Remove-Item -Recurse -Force zip_verify -ErrorAction SilentlyContinue
+          Expand-Archive "$name.zip" zip_verify -Force
+          $zr=Join-Path zip_verify $name
+          foreach($row in Get-Content $name\SHA256SUMS.txt){ $row -match '^([0-9a-f]{64})  (.+)$' | Out-Null; $actual=(Get-FileHash (Join-Path $zr $matches[2]) -Algorithm SHA256).Hash.ToLowerInvariant(); if($actual -ne $matches[1]){ throw "ZIP_EXTRACT_HASH_FAIL $($matches[2])" } }
+          $zipsha=(Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Remove-Item -Recurse -Force .c80_release_v3 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force .c80_release_v3 | Out-Null
+          Copy-Item "$name.zip" .c80_release_v3\C86_V69_C80_BASELINE_ALGO_ONLY.zip
+          Copy-Item $name\SigProcDll-64HF.dll .c80_release_v3\SigProcDll-64HF.dll
+          Copy-Item $name\MANIFEST_RELEASE.txt .c80_release_v3\MANIFEST_RELEASE.txt
+          Copy-Item $name\SHA256SUMS.txt .c80_release_v3\SHA256SUMS.txt
+          "ZIP_SHA256=$zipsha" | Out-File .c80_release_v3\RELEASE_ZIP_SHA256.txt
+          "STAGE3_V3_RELEASE_GATE=PASS`nREADY_STAGE2_SHA=${{ needs.wait-stage2.outputs.ready_sha }}" | Out-File .c80_release_v3\STAGE3_V3_PASS.lock
+      - name: Commit V3 authoritative package without losing concurrent branch updates
+        run: |
+          $ErrorActionPreference='Stop'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git checkout -B c80-v3-package-work
+          git add .c80_release_v3
+          git commit -m 'Release authoritative C86 V69 V3 gated package'
+          for($i=0;$i -lt 6;$i++){
+            git fetch origin c80-algo-only-reset-20260815
+            git rebase origin/c80-algo-only-reset-20260815
+            if($LASTEXITCODE -ne 0){ git rebase --abort; throw 'V3_REBASE_FAIL' }
+            git push origin HEAD:c80-algo-only-reset-20260815
+            if($LASTEXITCODE -eq 0){ exit 0 }
+            Start-Sleep -Seconds 3
+          }
+          throw 'V3_PUSH_FAIL'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: C86-V69-C80-BASELINE-ALGO-ONLY-V3-${{ github.run_id }}
+          path: .c80_release_v3
+          retention-days: 30
