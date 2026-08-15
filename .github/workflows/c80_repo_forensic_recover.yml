@@ -1,0 +1,184 @@
+name: c80-repo-forensic-recover
+on:
+  push:
+    branches: [c80-algo-only-reset-20260815]
+    paths: ['.github/workflows/c80_repo_forensic_recover.yml']
+permissions:
+  contents: write
+
+jobs:
+  forensic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Forensic recursive payload recovery by content hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64,binascii,bz2,gzip,hashlib,io,json,lzma,os,pathlib,re,shutil,subprocess,tarfile,tempfile,zipfile
+          R=pathlib.Path('.').resolve(); W=R/'_forensic_work'; W.mkdir(exist_ok=True)
+          targets={
+            '1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de':'BASE_CORE',
+            'c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a':'CAND_CORE',
+            'f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03':'CAND_HDR',
+            '9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180':'C80_DLL',
+          }
+          hits=[]; seen_hash=set(); derived=[]
+          def H(data): return hashlib.sha256(data).hexdigest()
+          def note(data,label,origin,outpath=None):
+            h=H(data)
+            if h in targets:
+              rec={'target':targets[h],'sha256':h,'origin':origin,'path':str(outpath) if outpath else None,'bytes':len(data)}
+              if rec not in hits: hits.append(rec); print('TARGET_HIT',rec)
+            return h
+          # Materialize current working-tree files (excluding .git and forensic work).
+          corpus=[]
+          for p in R.rglob('*'):
+            if not p.is_file(): continue
+            rel=p.relative_to(R).as_posix()
+            if rel.startswith('.git/') or rel.startswith('_forensic_work/'): continue
+            try:
+              if p.stat().st_size<=8_000_000: corpus.append((p,rel))
+            except: pass
+          # Materialize all unique historical Git blobs <= 8 MB.
+          blobdir=W/'git_blobs'; blobdir.mkdir()
+          lines=subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='replace').splitlines()
+          blobpaths={}
+          for line in lines:
+            a=line.split(' ',1); blobpaths.setdefault(a[0],set())
+            if len(a)>1: blobpaths[a[0]].add(a[1])
+          for sha,ps in blobpaths.items():
+            try:
+              typ=subprocess.check_output(['git','cat-file','-t',sha],text=True,stderr=subprocess.DEVNULL).strip()
+              if typ!='blob': continue
+              size=int(subprocess.check_output(['git','cat-file','-s',sha],text=True).strip())
+              if size>8_000_000: continue
+              data=subprocess.check_output(['git','cat-file','blob',sha])
+            except: continue
+            p=blobdir/sha; p.write_bytes(data); corpus.append((p,'gitblob:'+sha+' paths='+repr(sorted(ps))))
+          # Add concatenations of chunk-like siblings from current tree and each historical directory represented by paths.
+          groupdir=W/'groups'; groupdir.mkdir()
+          def nkey(s): return [int(x) if x.isdigit() else x for x in re.split(r'(\d+)',s)]
+          groups={}
+          for p,rel in list(corpus):
+            if rel.startswith('gitblob:'): continue
+            name=p.name.lower()
+            if re.search(r'(chunk|part|payload|src)[_.-]?\d',name): groups.setdefault(str(p.parent),[]).append(p)
+          for g,files in groups.items():
+            if len(files)<2: continue
+            files=sorted(files,key=lambda x:nkey(x.name))
+            raw=b''.join(x.read_bytes() for x in files)
+            q=groupdir/('group_'+hashlib.sha1(g.encode()).hexdigest()+'.raw'); q.write_bytes(raw); corpus.append((q,'concat_raw:'+g+':'+','.join(x.name for x in files)))
+            # Concatenated textual base64 decode.
+            try:
+              txt=b''.join(x.read_bytes().strip() for x in files)
+              if len(txt)%4==0 and re.fullmatch(rb'[A-Za-z0-9+/=\r\n]+',txt):
+                dec=base64.b64decode(txt,validate=False); q2=q.with_suffix('.b64dec'); q2.write_bytes(dec); corpus.append((q2,'concat_b64:'+g))
+            except: pass
+          extract_root=W/'extracted'; extract_root.mkdir()
+          extracted_files=[]
+          def safe_name(s): return re.sub(r'[^A-Za-z0-9_.-]+','_',s)[-120:]
+          def extract_bytes(data,origin,depth=0):
+            if depth>3 or len(data)==0 or len(data)>25_000_000: return
+            h=note(data,'derived',origin)
+            if h in seen_hash: return
+            seen_hash.add(h)
+            # single-stream codecs
+            for nm,func in [('xz',lzma.decompress),('gz',gzip.decompress),('bz2',bz2.decompress)]:
+              try:
+                d=func(data)
+                if d and d!=data:
+                  p=extract_root/(h[:16]+'.'+nm+'.out'); p.write_bytes(d); extracted_files.append(p); note(d,nm,origin+'->'+nm,p); extract_bytes(d,origin+'->'+nm,depth+1)
+              except: pass
+            # base64 / hex text
+            try:
+              compact=re.sub(rb'\s+',b'',data)
+              if len(compact)>=32 and len(compact)%4==0 and re.fullmatch(rb'[A-Za-z0-9+/=]+',compact):
+                d=base64.b64decode(compact,validate=True)
+                if d and d!=data:
+                  p=extract_root/(h[:16]+'.b64.out'); p.write_bytes(d); extracted_files.append(p); note(d,'b64',origin+'->b64',p); extract_bytes(d,origin+'->b64',depth+1)
+            except: pass
+            try:
+              compact=re.sub(rb'\s+',b'',data)
+              if len(compact)>=64 and len(compact)%2==0 and re.fullmatch(rb'[0-9a-fA-F]+',compact):
+                d=binascii.unhexlify(compact)
+                if d and d!=data:
+                  p=extract_root/(h[:16]+'.hex.out'); p.write_bytes(d); extracted_files.append(p); note(d,'hex',origin+'->hex',p); extract_bytes(d,origin+'->hex',depth+1)
+            except: pass
+            # zip
+            try:
+              z=zipfile.ZipFile(io.BytesIO(data))
+              zdir=extract_root/(h[:16]+'.zipdir'); zdir.mkdir(exist_ok=True)
+              for n in z.namelist():
+                if n.endswith('/'): continue
+                d=z.read(n)
+                p=zdir/safe_name(n); p.write_bytes(d); extracted_files.append(p); note(d,'zip-member',origin+'->zip:'+n,p); extract_bytes(d,origin+'->zip:'+n,depth+1)
+            except: pass
+            # tar, including uncompressed tar produced after xz decode
+            try:
+              tf=tarfile.open(fileobj=io.BytesIO(data),mode='r:*')
+              tdir=extract_root/(h[:16]+'.tardir'); tdir.mkdir(exist_ok=True)
+              for m in tf.getmembers():
+                if not m.isfile() or m.size>8_000_000: continue
+                f=tf.extractfile(m); d=f.read() if f else b''
+                p=tdir/safe_name(m.name); p.write_bytes(d); extracted_files.append(p); note(d,'tar-member',origin+'->tar:'+m.name,p); extract_bytes(d,origin+'->tar:'+m.name,depth+1)
+            except: pass
+          for p,origin in corpus:
+            try: extract_bytes(p.read_bytes(),origin,0)
+            except Exception as e: pass
+          # Hash direct current files too, preserving their real paths for complete-tree detection.
+          direct_hits=[]
+          for p,rel in corpus:
+            try:
+              data=p.read_bytes(); h=note(data,'corpus',rel,p)
+              if h in targets: direct_hits.append((targets[h],p,rel))
+            except: pass
+          # Search any REAL current-tree or extracted TAR/ZIP tree for a complete C80 source layout.
+          roots=[]
+          search_bases=[R,extract_root]
+          for base in search_bases:
+            for c in base.rglob('sigproc_rebuild.c'):
+              try:
+                if H(c.read_bytes())!=os.environ.get('C80_CORE_SHA','1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de'): continue
+              except: continue
+              for parent in [c.parents[i] for i in range(min(6,len(c.parents)))]:
+                proj=parent/'sigproc_standalone_dll'/'SigProcStandalone'/'SigProcStandalone.vcxproj'
+                hdr=parent/'sigproc_rebuild'/'SigProcRebuild'/'include'/'sigproc_rebuild.h'
+                if proj.exists() and hdr.exists(): roots.append(parent); print('COMPLETE_SOURCE_ROOT',parent); break
+          # Additional: inspect git commits containing a payload archive that yielded BASE_CORE is difficult to map after extraction,
+          # but any complete source tree materialized by archive extraction above is sufficient.
+          out=R/'.c80_forensic'
+          if out.exists(): shutil.rmtree(out)
+          out.mkdir()
+          (out/'FORENSIC_REPORT.json').write_text(json.dumps({'hits':hits,'complete_roots':[str(x) for x in roots]},indent=2),encoding='utf-8')
+          found={x['target']:x for x in hits}
+          if roots:
+            src=roots[0]; shutil.copytree(src,out/'source',dirs_exist_ok=True)
+          # Copy exact candidate target bytes from any hit path.
+          for target,name in [('CAND_CORE','candidate_core.bin'),('CAND_HDR','candidate_header.bin')]:
+            rec=found.get(target)
+            if rec and rec.get('path') and pathlib.Path(rec['path']).exists(): shutil.copy2(rec['path'],out/name)
+          ok=(out/'source').exists() and (out/'candidate_core.bin').exists() and (out/'candidate_header.bin').exists()
+          (out/'FORENSIC_RECOVERY_PASS.lock' if ok else out/'FORENSIC_RECOVERY_INCOMPLETE.lock').write_text(('FORENSIC_RECOVERY=PASS\n' if ok else 'FORENSIC_RECOVERY=INCOMPLETE\n'))
+          print('FORENSIC_OK',ok)
+          PY
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c80_forensic
+          git commit -m 'Commit content-hash forensic C80 recovery result' || true
+          for i in 1 2 3 4 5; do
+            git fetch origin c80-algo-only-reset-20260815
+            git rebase origin/c80-algo-only-reset-20260815 || { git rebase --abort; exit 1; }
+            git push origin HEAD:c80-algo-only-reset-20260815 && exit 0
+            sleep 2
+          done
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-forensic-recovery-${{ github.run_id }}
+          path: .c80_forensic
+          retention-days: 30
