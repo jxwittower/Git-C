@@ -1,0 +1,74 @@
+name: c80-algo-only-stage4-publish
+on:
+  push:
+    branches:
+      - c80-algo-only-reset-20260815
+    paths:
+      - '.c80_release/RELEASE_ZIP_SHA256.txt'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  publish:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Revalidate gated release bytes
+        run: |
+          $ErrorActionPreference='Stop'
+          $zip='.c80_release\C86_V69_C80_BASELINE_ALGO_ONLY.zip'
+          $dll='.c80_release\SigProcDll-64HF.dll'
+          $manifest='.c80_release\MANIFEST_RELEASE.txt'
+          $zhfile='.c80_release\RELEASE_ZIP_SHA256.txt'
+          foreach($f in @($zip,$dll,$manifest,$zhfile)){ if(!(Test-Path $f)){ throw "PUBLISH_FILE_MISSING $f" } }
+          $expected=(Select-String $zhfile -Pattern '^ZIP_SHA256=([0-9a-fA-F]{64})$').Matches.Groups[1].Value.ToLowerInvariant()
+          $actual=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $expected){ throw "ZIP_SHA_MISMATCH expected=$expected actual=$actual" }
+          $dllsha=(Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if(-not (Select-String $manifest -SimpleMatch "DLL_SHA256=$dllsha" -Quiet)){ throw 'DLL_SHA_NOT_BOUND_IN_MANIFEST' }
+          "PUBLISH_ZIP_SHA256=$actual`nPUBLISH_DLL_SHA256=$dllsha" | Out-File PUBLISH_IDENTITY.txt
+      - name: Publish exact tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $tag='c86-v69-c80-algo-only-20260815'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if($LASTEXITCODE -eq 0){ gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag }
+          @'
+          C86-V69 C80-BASELINE-ALGO-ONLY
+
+          Release is created only after:
+          - exact reproduction of the field-working C80 DLL SHA256 9ABC438D...
+          - source-diff gate proving only sigproc_rebuild.c / sigproc_rebuild.h changed
+          - x86 / historical 4-ABI / loader-surface gates
+          - canonical native loader contract
+          - complete 13-GHF Windows native regression including deterministic replay, 20,000-loop stability, 2-thread stress, 1Hz realtime and vital suppression/recovery
+          - second compatibility pass on windows-2022 and windows-2025 runners
+
+          Field replacement: replace SigProcDll-64HF.dll only. Do not delete or overwrite license, bed model, bias, signal or parameter files.
+          '@ | Set-Content -Encoding utf8 release_notes.txt
+          gh release create $tag `
+            .c80_release\C86_V69_C80_BASELINE_ALGO_ONLY.zip `
+            .c80_release\SigProcDll-64HF.dll `
+            .c80_release\MANIFEST_RELEASE.txt `
+            .c80_release\RELEASE_ZIP_SHA256.txt `
+            PUBLISH_IDENTITY.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target c80-algo-only-reset-20260815 `
+            --title 'C86-V69 C80 Baseline Algorithm-Only' `
+            --notes-file release_notes.txt
+          if($LASTEXITCODE -ne 0){ throw 'GH_RELEASE_CREATE_FAIL' }
+          'STAGE4_PUBLISH_PASS' | Out-File STAGE4_PUBLISH_PASS.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-stage4-publish-evidence-${{ github.run_id }}
+          path: |
+            PUBLISH_IDENTITY.txt
+            STAGE4_PUBLISH_PASS.lock
+          retention-days: 30
