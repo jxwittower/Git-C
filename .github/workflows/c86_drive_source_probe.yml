@@ -1,0 +1,25 @@
+name: c86-drive-source-probe
+on:
+  push:
+    branches: [c86-final-algo-only-20260815]
+    paths: ['.github/workflows/c86_drive_source_probe.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch exact source payload from Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1nBcFslhiv4Fxds-JO1dcnanoezFef0Id'
+          curl -L --fail --retry 3 --retry-delay 2 -o payload.tar.xz "$url"
+          bytes=$(wc -c < payload.tar.xz | tr -d '[:space:]')
+          sha=$(sha256sum payload.tar.xz | awk '{print $1}')
+          echo BYTES=$bytes
+          echo SHA256=$sha
+          test "$bytes" = 199104
+          test "$sha" = 926f4328843971df7cbd4b1f6ec5dea3e00d23eaeded260f0cc68d4e3d5270bf
+          tar -tJf payload.tar.xz | head -30
+          echo C86_DRIVE_SOURCE_PROBE_PASS
