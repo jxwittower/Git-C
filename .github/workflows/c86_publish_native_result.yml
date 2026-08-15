@@ -1,0 +1,59 @@
+name: c86-publish-native-result
+on:
+  push:
+    branches: [c86-final-algo-only-20260815]
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Wait for native build status and publish exact result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          for i in $(seq 1 90); do
+            git pull --ff-only origin c86-final-algo-only-20260815 >/dev/null 2>&1 || true
+            [ -s .c86_status/STATUS.txt ] && break
+            sleep 5
+          done
+          [ -s .c86_status/STATUS.txt ] || { echo STATUS_TIMEOUT; exit 71; }
+          source .c86_status/STATUS.txt
+          rm -rf .c86_release; mkdir .c86_release
+          cp .c86_status/STATUS.txt .c86_release/STATUS.txt
+          if [ "$CONCLUSION" = success ]; then
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/artifacts" > /tmp/a.json
+            aid=$(python - <<'PY'
+          import json
+          j=json.load(open('/tmp/a.json'))
+          for a in j.get('artifacts',[]):
+              if a.get('name')=='c86-c80-shell-latest-algo-native-candidate': print(a['id']); break
+          PY
+            )
+            [ -n "$aid" ] || { echo ARTIFACT_NOT_FOUND; exit 72; }
+            curl -fL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/actions/artifacts/$aid/zip" -o /tmp/a.zip
+            mkdir /tmp/a; unzip -q /tmp/a.zip -d /tmp/a
+            dll=$(find /tmp/a -type f -name 'SigProcDll-64HF.dll' | head -1)
+            [ -n "$dll" ] || { echo DLL_NOT_FOUND; exit 73; }
+            cp "$dll" .c86_release/SigProcDll-64HF.dll
+            sha256sum .c86_release/SigProcDll-64HF.dll > .c86_release/SHA256.txt
+            cp /tmp/a/baseline_sha.txt .c86_release/ 2>/dev/null || true
+            cp /tmp/a/candidate_sha.txt .c86_release/ 2>/dev/null || true
+            cp /tmp/a/loader_smoke.txt .c86_release/ 2>/dev/null || true
+            touch .c86_release/READY.lock
+          else
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > .c86_release/JOBS.json
+            touch .c86_release/FAILED.lock
+          fi
+          git add .c86_release
+          git commit -m 'Publish C86 exact C80-shell native result [skip ci]'
+          git push origin HEAD:c86-final-algo-only-20260815
