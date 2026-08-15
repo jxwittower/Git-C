@@ -1,0 +1,274 @@
+name: c80-algo-only-reset-native
+on:
+  push:
+    paths:
+      - '.github/workflows/c80_algo_only_reset_native.yml'
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  native-reset:
+    runs-on: windows-2022
+    timeout-minutes: 100
+    env:
+      PAYLOAD_ID: 1-12ab6f7ICQBUw5pBuWW4q5L7GjAZBfw
+      PAYLOAD_SHA: 1a0bb260f4534cbfb9b41c93bdb56982e174cbf0a13366fcfb096308985bbfd8
+      PERSON_ID: 1ulGywTdopiddKnqqufqG5EUoAwz-ofhh
+      EMPTY_ID: 1_PuflJReLj28V-4fbeZlyjmdUpl05ilj
+      C80_SHA: 9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+      VCTOOLS: 14.44.35207
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download reset payload and real data
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check --quiet gdown
+          gdown $env:PAYLOAD_ID -O reset_payload.tar.xz
+          if($LASTEXITCODE -ne 0){ throw 'PAYLOAD_DOWNLOAD_FAIL' }
+          $h=(Get-FileHash reset_payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:PAYLOAD_SHA){ throw "PAYLOAD_SHA_FAIL $h" }
+          7z x -y reset_payload.tar.xz | Out-Null
+          7z x -y c80_algo_only_reset_payload.tar | Out-Null
+          gdown $env:PERSON_ID -O person.7z
+          if($LASTEXITCODE -ne 0){ throw 'PERSON_DOWNLOAD_FAIL' }
+          gdown $env:EMPTY_ID -O empty.7z
+          if($LASTEXITCODE -ne 0){ throw 'EMPTY_DOWNLOAD_FAIL' }
+          New-Item -ItemType Directory -Force person_data,empty_data | Out-Null
+          7z x -y person.7z -operson_data | Out-Null
+          7z x -y empty.7z -oempty_data | Out-Null
+          $person=(Get-ChildItem person_data -Recurse -Filter 'CanFrame*.csv' | Select-Object -First 1).FullName
+          $empty=(Get-ChildItem empty_data -Recurse -Filter 'CanFrame*.csv' | Select-Object -First 1).FullName
+          if(!$person -or !$empty){ throw 'CANFRAME_NOT_FOUND' }
+          "PERSON=$person`nEMPTY=$empty" | Out-File data_paths.txt
+
+      - name: Prove source reset contract
+        run: |
+          $ErrorActionPreference='Stop'
+          $r='c80_algo_only_reset_payload'
+          $base=Join-Path $r 'baseline'
+          $cand=Join-Path $r 'candidate'
+          $allowed=@(
+            'sigproc_rebuild\SigProcRebuild\src\sigproc_rebuild.c',
+            'sigproc_rebuild\SigProcRebuild\include\sigproc_rebuild.h'
+          )
+          $all=Get-ChildItem $base -Recurse -File
+          $changed=@()
+          foreach($f in $all){
+            $rel=$f.FullName.Substring((Resolve-Path $base).Path.Length+1)
+            $cf=Join-Path $cand $rel
+            if(!(Test-Path $cf)){ throw "CAND_MISSING $rel" }
+            $a=(Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            $b=(Get-FileHash $cf -Algorithm SHA256).Hash
+            if($a -ne $b){ $changed += $rel }
+          }
+          $extra=Get-ChildItem $cand -Recurse -File | ForEach-Object { $_.FullName.Substring((Resolve-Path $cand).Path.Length+1) } | Where-Object { !(Test-Path (Join-Path $base $_)) }
+          if($extra){ throw "CAND_EXTRA_FILES $($extra -join ',')" }
+          $x=@($changed | Sort-Object); $y=@($allowed | Sort-Object)
+          if(($x -join '|') -ne ($y -join '|')){ throw "SOURCE_CONTRACT_FAIL changed=$($x -join ',')" }
+          'ONLY_ALGORITHM_CORE_CHANGED=PASS' | Out-File source_contract.txt
+          $changed | Add-Content source_contract.txt
+
+      - name: Configure exact MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Verify exact historical toolset exists
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Split-Path $env:VCToolsInstallDir.TrimEnd('\') -Parent)
+          $exact=Join-Path $root $env:VCTOOLS
+          "Current=$env:VCToolsInstallDir`nRequired=$exact" | Out-File toolset.txt
+          if(!(Test-Path $exact)){ Get-ChildItem $root | Select-Object Name | Out-String | Add-Content toolset.txt; throw 'EXACT_VCTOOLS_MISSING' }
+
+      - name: Build untouched C80 baseline first
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=(Resolve-Path 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $s=(Resolve-Path 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll').Path + '\'
+          msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$s" /p:VCToolsVersion=$env:VCTOOLS /v:minimal | Tee-Object baseline_build.log
+          if($LASTEXITCODE -ne 0){ throw 'BASELINE_BUILD_FAIL' }
+          $dll=Get-ChildItem 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll' -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'BASELINE_DLL_MISSING' }
+          Copy-Item $dll.FullName baseline_C80.dll
+          $h=(Get-FileHash baseline_C80.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "BASELINE_SHA256=$h" | Tee-Object baseline_identity.txt
+          if($h -ne $env:C80_SHA){ throw "BASELINE_EXACT_REPRO_FAIL expected=$env:C80_SHA got=$h" }
+          'ORIGINAL_C80_EXACT_BINARY_REPRODUCTION=PASS' | Add-Content baseline_identity.txt
+
+      - name: Build algorithm-only candidate with same project
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=(Resolve-Path 'c80_algo_only_reset_payload\candidate\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $s=(Resolve-Path 'c80_algo_only_reset_payload\candidate\sigproc_standalone_dll').Path + '\'
+          msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$s" /p:VCToolsVersion=$env:VCTOOLS /v:minimal | Tee-Object candidate_build.log
+          if($LASTEXITCODE -ne 0){ throw 'CANDIDATE_BUILD_FAIL' }
+          $dll=Get-ChildItem 'c80_algo_only_reset_payload\candidate\sigproc_standalone_dll' -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'CANDIDATE_DLL_MISSING' }
+          Copy-Item $dll.FullName SigProcDll-64HF.dll
+          (Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant() | Out-File candidate_sha256.txt
+
+      - name: ABI and loader-surface parity with exact C80
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers baseline_C80.dll | Out-File baseline_headers.txt
+          dumpbin /headers SigProcDll-64HF.dll | Out-File candidate_headers.txt
+          dumpbin /exports baseline_C80.dll | Out-File baseline_exports.txt
+          dumpbin /exports SigProcDll-64HF.dll | Out-File candidate_exports.txt
+          dumpbin /imports baseline_C80.dll | Out-File baseline_imports.txt
+          dumpbin /imports SigProcDll-64HF.dll | Out-File candidate_imports.txt
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){
+            if(-not (Select-String candidate_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" }
+          }
+          if(-not (Select-String candidate_headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'NOT_X86' }
+          @'
+          import re, pathlib, sys
+          def imports(path):
+              txt=pathlib.Path(path).read_text(errors='ignore')
+              dll=None; out=set()
+              for line in txt.splitlines():
+                  m=re.match(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',line,re.I)
+                  if m: dll=m.group(1).lower(); continue
+                  if dll:
+                      m=re.match(r'^\s*[0-9A-F]+\s+([A-Za-z0-9_?@$.-]+)\s*$',line,re.I)
+                      if m: out.add((dll,m.group(1)))
+              return out
+          b=imports('baseline_imports.txt'); c=imports('candidate_imports.txt')
+          extra=sorted(c-b)
+          if extra:
+              print('NEW_IMPORTS',extra); sys.exit(31)
+          pathlib.Path('loader_surface.txt').write_text(f'C80_IMPORTS={len(b)}\nCAND_IMPORTS={len(c)}\nNEW_IMPORTS=0\nLOADER_SURFACE_PARITY=PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\imports.py
+          python $env:RUNNER_TEMP\imports.py
+
+      - name: Compile native x86 real-data replay host
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          typedef struct { short lane[4]; } S4;
+          typedef int (__stdcall *PINIT)(char*,void*);
+          typedef unsigned long (__stdcall *PPROC)(const uint32_t*,const S4*,int,void*,void*,void*);
+          typedef unsigned char (__stdcall *PSTAT)(void);
+          typedef void (__stdcall *PFINI)(void);
+          static int ints(const char *s, long *v, int cap){ int n=0; while(*s && n<cap){ while(*s && !((*s>='0'&&*s<='9')||*s=='-')) s++; if(!*s)break; char *e; v[n++]=strtol(s,&e,10); if(e==s) s++; else s=e; } return n; }
+          int main(int ac,char**av){
+            if(ac<5){fprintf(stderr,"usage replay dll license csv sleep_ms\n");return 2;}
+            HMODULE h=LoadLibraryA(av[1]); if(!h){fprintf(stderr,"LOAD_FAIL %lu\n",GetLastError());return 3;}
+            PINIT ini=(PINIT)GetProcAddress(h,"_SigProc_Init@8"); PPROC pro=(PPROC)GetProcAddress(h,"_SigProc@24"); PSTAT sta=(PSTAT)GetProcAddress(h,"_SigProc_Stat@0"); PFINI fin=(PFINI)GetProcAddress(h,"_SigProc_Fini@0");
+            if(!ini||!pro||!sta||!fin){fprintf(stderr,"EXPORT_FAIL %lu\n",GetLastError());return 4;}
+            FILE*f=fopen(av[2],"rb"); if(!f)return 5; unsigned char lic[4096]={0}; size_t ln=fread(lic,1,sizeof(lic)-1,f); fclose(f); if(!ln)return 6;
+            char product[512]={0}; if(ini(product,lic)!=1){fprintf(stderr,"INIT_FAIL\n");return 7;} printf("PRODUCT=%s\n",product);
+            FILE*in=fopen(av[3],"rb"); if(!in){fin();return 8;} char *line=(char*)malloc(1<<20); long *iv=(long*)malloc(8192*sizeof(long)); long *sv=(long*)malloc(32768*sizeof(long)); uint32_t *ids=(uint32_t*)malloc(8192*sizeof(uint32_t)); S4 *samples=(S4*)malloc(8192*sizeof(S4)); unsigned char *state=(unsigned char*)calloc(1,0x105c), *result=(unsigned char*)calloc(1,0x786);
+            if(!line||!iv||!sv||!ids||!samples||!state||!result){fin();return 9;}
+            int sleepms=atoi(av[4]); unsigned long calls=0, bad=0; double maxms=0, summs=0; LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            while(fgets(line,1<<20,in)){
+              char*a=strchr(line,'@'); if(!a)continue; char*b=strchr(a+1,'@'); if(!b)continue; *b='\0'; int ni=ints(a+1,iv,8192); int nv=ints(b+1,sv,32768); if(ni<=0||nv<ni*4){fprintf(stderr,"PARSE_BAD ni=%d nv=%d line=%lu\n",ni,nv,calls+1);bad++;continue;}
+              for(int i=0;i<ni;i++){ids[i]=(uint32_t)iv[i]; for(int k=0;k<4;k++)samples[i].lane[k]=(short)sv[i*4+k];}
+              LARGE_INTEGER t0,t1; QueryPerformanceCounter(&t0); unsigned long seq=pro(ids,samples,ni,0,state,result); QueryPerformanceCounter(&t1); double ms=1000.0*(double)(t1.QuadPart-t0.QuadPart)/(double)fq.QuadPart; summs+=ms;if(ms>maxms)maxms=ms;calls++; if(seq==0)bad++; if(sta()!=1)bad++; if(sleepms>0)Sleep((DWORD)sleepms);
+            }
+            fclose(in); fin(); FreeLibrary(h); printf("CALLS=%lu BAD=%lu MAX_MS=%.3f AVG_MS=%.3f\n",calls,bad,maxms,calls?summs/calls:0); if(calls<100||bad)return 20; return 0;
+          }
+          '@ | Set-Content -Encoding ascii replay.c
+          cl /nologo /O2 /W4 /MT /Fe:replay32.exe replay.c
+          if($LASTEXITCODE -ne 0){ throw 'REPLAYER_BUILD_FAIL' }
+
+      - name: Native lifecycle stress using original runtime contract
+        run: |
+          $ErrorActionPreference='Stop'
+          $r='c80_algo_only_reset_payload'
+          New-Item -ItemType Directory -Force stage_life | Out-Null
+          Copy-Item SigProcDll-64HF.dll stage_life\SigProcDll-64HF.dll
+          Copy-Item "$r\runtime_aug14\*" stage_life\
+          Copy-Item "$r\tools\init_fini_zero_reload_probe.exe" stage_life\
+          Push-Location stage_life
+          .\init_fini_zero_reload_probe.exe SigProcDll-64HF.dll Wittower_ID_License 1000 2>&1 | Tee-Object ..\lifecycle.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "LIFECYCLE_FAIL rc=$rc" }
+          'LIFECYCLE_1000_PASS' | Out-File lifecycle_gate.txt
+
+      - name: Real person CanFrame at true 1Hz cadence
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'
+          $r='c80_algo_only_reset_payload'
+          $csv=(Get-ChildItem person_data -Recurse -Filter 'CanFrame*.csv' | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force stage_person | Out-Null
+          Copy-Item SigProcDll-64HF.dll stage_person\SigProcDll-64HF.dll
+          Copy-Item replay32.exe stage_person\
+          Copy-Item "$r\runtime_aug14\*" stage_person\
+          Push-Location stage_person
+          .\replay32.exe SigProcDll-64HF.dll Wittower_ID_License $csv 1000 2>&1 | Tee-Object ..\person_replay.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "PERSON_REPLAY_FAIL rc=$rc" }
+          if(-not (Select-String person_replay.log -Pattern 'BAD=0' -Quiet)){ throw 'PERSON_BAD_NONZERO' }
+          'PERSON_REAL_1HZ_NATIVE_PASS' | Out-File person_gate.txt
+
+      - name: Full 45-minute empty CanFrame accelerated native replay
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          $r='c80_algo_only_reset_payload'
+          $csv=(Get-ChildItem empty_data -Recurse -Filter 'CanFrame*.csv' | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force stage_empty | Out-Null
+          Copy-Item SigProcDll-64HF.dll stage_empty\SigProcDll-64HF.dll
+          Copy-Item replay32.exe stage_empty\
+          Copy-Item "$r\runtime_aug14\*" stage_empty\
+          Push-Location stage_empty
+          .\replay32.exe SigProcDll-64HF.dll Wittower_ID_License $csv 20 2>&1 | Tee-Object ..\empty_replay.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "EMPTY_REPLAY_FAIL rc=$rc" }
+          if(-not (Select-String empty_replay.log -Pattern 'BAD=0' -Quiet)){ throw 'EMPTY_BAD_NONZERO' }
+          'EMPTY45_FULL_NATIVE_PASS' | Out-File empty_gate.txt
+
+      - name: Final release lock
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            'C80_ORIGINAL_EXACT_BINARY_REPRODUCTION=PASS',
+            'ONLY_ALGORITHM_CORE_CHANGED=PASS',
+            'WINDOWS_MSVC_X86_NATIVE_BUILD=PASS',
+            'NEW_LOADER_IMPORTS=0',
+            'LIFECYCLE_1000=PASS',
+            'PERSON_REAL_1HZ_NATIVE=PASS',
+            'EMPTY45_FULL_NATIVE=PASS',
+            "CANDIDATE_SHA256=$h"
+          ) | Set-Content RELEASE_PASS.txt
+
+      - name: Upload exact tested DLL and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: c80-algo-only-reset-native-${{ github.run_id }}
+          path: |
+            SigProcDll-64HF.dll
+            RELEASE_PASS.txt
+            baseline_identity.txt
+            source_contract.txt
+            loader_surface.txt
+            lifecycle.log
+            person_replay.log
+            empty_replay.log
+            candidate_sha256.txt
+            baseline_build.log
+            candidate_build.log
+            toolset.txt
+            baseline_exports.txt
+            candidate_exports.txt
+            baseline_imports.txt
+            candidate_imports.txt
+          if-no-files-found: error
+          retention-days: 30
