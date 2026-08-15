@@ -1,0 +1,160 @@
+name: c80-forensic-v2-exact-windows-build
+on:
+  push:
+    branches: [c80-algo-only-reset-20260815]
+    paths: ['.c80_forensic_v2/FORENSIC_RECOVERY_PASS.lock']
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  exact-build:
+    runs-on: windows-2022
+    timeout-minutes: 70
+    env:
+      C80_DLL_SHA: 9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+      C80_CORE_SHA: 1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de
+      CAND_CORE_SHA: c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a
+      CAND_HDR_SHA: f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Bind forensic recovery bytes
+        run: |
+          $ErrorActionPreference='Stop'
+          if(!(Test-Path '.c80_forensic_v2\FORENSIC_RECOVERY_PASS.lock')){ throw 'FORENSIC_PASS_LOCK_MISSING' }
+          if(-not (Select-String '.c80_forensic_v2\FORENSIC_RECOVERY_PASS.lock' -SimpleMatch 'FORENSIC_RECOVERY=PASS' -Quiet)){ throw 'FORENSIC_NOT_PASS' }
+          foreach($f in @('.c80_forensic_v2\source','.c80_forensic_v2\candidate_core.bin','.c80_forensic_v2\candidate_header.bin')){ if(!(Test-Path $f)){ throw "FORENSIC_FILE_MISSING $f" } }
+          $hc=(Get-FileHash .c80_forensic_v2\candidate_core.bin -Algorithm SHA256).Hash.ToLowerInvariant(); if($hc -ne $env:CAND_CORE_SHA){ throw 'FORENSIC_CAND_CORE_HASH_FAIL' }
+          $hh=(Get-FileHash .c80_forensic_v2\candidate_header.bin -Algorithm SHA256).Hash.ToLowerInvariant(); if($hh -ne $env:CAND_HDR_SHA){ throw 'FORENSIC_CAND_HDR_HASH_FAIL' }
+          $bc=Get-ChildItem .c80_forensic_v2\source -Recurse -Filter sigproc_rebuild.c | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:C80_CORE_SHA } | Select-Object -First 1
+          if(!$bc){ throw 'FORENSIC_BASE_CORE_NOT_EXACT' }
+          "FORENSIC_SOURCE_BIND=PASS`nBASE_CORE=$($bc.FullName)" | Out-File forensic_source_bind.txt
+      - name: Configure x86 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Reproduce field-working C80 exactly
+        run: |
+          $ErrorActionPreference='Stop'
+          Remove-Item -Recurse -Force baseline_build -ErrorAction SilentlyContinue
+          Copy-Item .c80_forensic_v2\source baseline_build -Recurse
+          $proj=Get-ChildItem baseline_build -Recurse -Filter SigProcStandalone.vcxproj | Select-Object -First 1
+          if(!$proj){ throw 'BASE_PROJECT_MISSING' }
+          $sol=(Split-Path (Split-Path $proj.FullName -Parent) -Parent)+'\'
+          $vsroot=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC'
+          $avail=@(); if(Test-Path $vsroot){ $avail += (Get-ChildItem $vsroot -Directory | Select-Object -ExpandProperty Name) }
+          $tries=@('14.44.35207','14.44.35228',$env:VCToolsVersion)+$avail | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique
+          $pass=$false
+          foreach($v in $tries){
+            Get-ChildItem baseline_build -Recurse -Directory | Where-Object { $_.Name -in @('Release','Debug','x64') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            msbuild $proj.FullName /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$sol" /p:VCToolsVersion=$v /v:minimal 2>&1 | Tee-Object -FilePath "baseline_build_$v.log"
+            if($LASTEXITCODE -ne 0){ continue }
+            $dll=Get-ChildItem baseline_build -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if(!$dll){ continue }
+            $h=(Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "VCTOOLS=$v SHA=$h" | Add-Content baseline_reproduction_attempts.txt
+            if($h -eq $env:C80_DLL_SHA){ Copy-Item $dll.FullName C80_EXACT_REPRODUCED.dll; "C80_EXACT_REPRODUCTION=PASS`nVCTOOLS=$v`nSHA256=$h" | Out-File C80_REPRODUCTION_PASS.txt; $pass=$true; break }
+          }
+          if(!$pass){ throw 'FORENSIC_SOURCE_COULD_NOT_REPRODUCE_EXACT_C80_DLL' }
+      - name: Prove exactly two algorithm files differ before candidate build
+        run: |
+          $ErrorActionPreference='Stop'
+          Remove-Item -Recurse -Force candidate_build -ErrorAction SilentlyContinue
+          Copy-Item .c80_forensic_v2\source candidate_build -Recurse
+          $core=Get-ChildItem candidate_build -Recurse -Filter sigproc_rebuild.c | Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:C80_CORE_SHA } | Select-Object -First 1
+          $hdr=Get-ChildItem candidate_build -Recurse -Filter sigproc_rebuild.h | Where-Object { $_.FullName -match 'sigproc_rebuild[\\/]SigProcRebuild[\\/]include' } | Select-Object -First 1
+          if(!$core -or !$hdr){ throw 'CAND_TARGET_PATHS_MISSING' }
+          Copy-Item .c80_forensic_v2\candidate_core.bin $core.FullName -Force
+          Copy-Item .c80_forensic_v2\candidate_header.bin $hdr.FullName -Force
+          @'
+          from pathlib import Path
+          import hashlib,sys
+          b=Path('.c80_forensic_v2/source'); c=Path('candidate_build')
+          def hs(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          bm={p.relative_to(b).as_posix():hs(p) for p in b.rglob('*') if p.is_file()}
+          cm={p.relative_to(c).as_posix():hs(p) for p in c.rglob('*') if p.is_file()}
+          changed=sorted(k for k in set(bm)|set(cm) if bm.get(k)!=cm.get(k))
+          print('CHANGED',changed)
+          exp=['sigproc_rebuild/SigProcRebuild/include/sigproc_rebuild.h','sigproc_rebuild/SigProcRebuild/src/sigproc_rebuild.c']
+          if len(changed)!=2 or sorted(changed)!=sorted(exp): raise SystemExit('SOURCE_SCOPE_FAIL '+repr(changed))
+          Path('ALGORITHM_ONLY_SOURCE_GATE.txt').write_text('ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS\n'+'\n'.join(changed)+'\n')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\scope.py
+          python $env:RUNNER_TEMP\scope.py
+          if($LASTEXITCODE -ne 0){ throw 'ALGORITHM_ONLY_SOURCE_GATE_FAIL' }
+      - name: Build candidate using the exact C80 toolset
+        run: |
+          $ErrorActionPreference='Stop'
+          $tool=(Select-String C80_REPRODUCTION_PASS.txt -Pattern '^VCTOOLS=(.+)$').Matches.Groups[1].Value
+          $proj=Get-ChildItem candidate_build -Recurse -Filter SigProcStandalone.vcxproj | Select-Object -First 1
+          $sol=(Split-Path (Split-Path $proj.FullName -Parent) -Parent)+'\'
+          msbuild $proj.FullName /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$sol" /p:VCToolsVersion=$tool /v:minimal 2>&1 | Tee-Object candidate_build.log
+          if($LASTEXITCODE -ne 0){ throw 'CANDIDATE_BUILD_FAIL' }
+          $dll=Get-ChildItem candidate_build -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'CANDIDATE_DLL_MISSING' }
+          Copy-Item $dll.FullName SigProcDll-64HF.dll
+          "CANDIDATE_SHA256=$((Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File candidate_identity.txt
+      - name: Enforce historical x86 ABI and no-new-import-DLL surface
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers C80_EXACT_REPRODUCED.dll | Out-File base_headers.txt
+          dumpbin /headers SigProcDll-64HF.dll | Out-File cand_headers.txt
+          dumpbin /exports C80_EXACT_REPRODUCED.dll | Out-File base_exports.txt
+          dumpbin /exports SigProcDll-64HF.dll | Out-File cand_exports.txt
+          dumpbin /imports C80_EXACT_REPRODUCED.dll | Out-File base_imports.txt
+          dumpbin /imports SigProcDll-64HF.dll | Out-File cand_imports.txt
+          if(-not (Select-String cand_headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'CAND_NOT_X86' }
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){ if(-not (Select-String cand_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          @'
+          from pathlib import Path
+          import re
+          pat=re.compile(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',re.I|re.M)
+          b={x.lower() for x in pat.findall(Path('base_imports.txt').read_text(errors='ignore'))}; c={x.lower() for x in pat.findall(Path('cand_imports.txt').read_text(errors='ignore'))}
+          if c-b: raise SystemExit('NEW_IMPORT_DLLS '+repr(sorted(c-b)))
+          Path('ABI_LOADER_SURFACE_PASS.txt').write_text('X86=PASS\nHISTORICAL_4_STDCALL_EXPORTS=PASS\nNEW_IMPORT_DLLS=0\n')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\abi.py
+          python $env:RUNNER_TEMP\abi.py
+          if($LASTEXITCODE -ne 0){ throw 'ABI_SURFACE_FAIL' }
+      - name: Native LoadLibrary GetProcAddress FreeLibrary smoke
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){HMODULE h=LoadLibraryA("SigProcDll-64HF.dll");if(!h){printf("LOAD_FAIL=%lu\n",GetLastError());return 10;}const char*n[]={"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"};for(int i=0;i<4;i++){if(!GetProcAddress(h,n[i]))return 20+i;}if(!FreeLibrary(h))return 30;puts("LOADLIBRARY_GETPROC_FREELIBRARY_PASS");return 0;}
+          '@ | Set-Content -Encoding ascii smoke.c
+          cl /nologo /O2 /Fe:smoke.exe smoke.c
+          if($LASTEXITCODE -ne 0){ throw 'SMOKE_COMPILE_FAIL' }
+          .\smoke.exe 2>&1 | Tee-Object loader_smoke.log
+          if($LASTEXITCODE -ne 0){ throw "SMOKE_FAIL rc=$LASTEXITCODE" }
+          if(-not (Select-String loader_smoke.log -SimpleMatch 'LOADLIBRARY_GETPROC_FREELIBRARY_PASS' -Quiet)){ throw 'SMOKE_MARKER_MISSING' }
+          'STAGE1_NATIVE_EXACT_BUILD_AND_LOADER_PASS' | Out-File STAGE1_PASS.lock
+      - name: Commit Stage1 candidate and evidence, preserving concurrent branch commits
+        run: |
+          $ErrorActionPreference='Stop'
+          Remove-Item -Recurse -Force .c80_exact_candidate -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force .c80_exact_candidate | Out-Null
+          foreach($f in @('SigProcDll-64HF.dll','C80_REPRODUCTION_PASS.txt','ALGORITHM_ONLY_SOURCE_GATE.txt','ABI_LOADER_SURFACE_PASS.txt','loader_smoke.log','candidate_identity.txt','STAGE1_PASS.lock','forensic_source_bind.txt')){ Copy-Item $f .c80_exact_candidate\ }
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git checkout -B forensic-stage1-work
+          git add .c80_exact_candidate
+          git commit -m 'Pass exact C80 reproduction from forensic source and build algorithm-only candidate'
+          for($i=0;$i -lt 6;$i++){
+            git fetch origin c80-algo-only-reset-20260815
+            git rebase origin/c80-algo-only-reset-20260815
+            if($LASTEXITCODE -ne 0){ git rebase --abort; throw 'STAGE1_REBASE_FAIL' }
+            git push origin HEAD:c80-algo-only-reset-20260815
+            if($LASTEXITCODE -eq 0){ exit 0 }
+            Start-Sleep -Seconds 3
+          }
+          throw 'STAGE1_PUSH_FAIL'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-forensic-v2-stage1-pass-${{ github.run_id }}
+          path: .c80_exact_candidate
+          retention-days: 30
