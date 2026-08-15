@@ -1,0 +1,285 @@
+name: c86-exact-c80-algo-only-build
+on:
+  push:
+    branches: [c86-final-algo-only-20260815]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install archive tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+      - name: Recover exact C80 and latest algorithm bytes by SHA256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/recover.py <<'PY'
+          import os, re, json, hashlib, pathlib, subprocess, urllib.request, zipfile, tarfile, tempfile, shutil, base64
+          T={
+          'C80_ALGO_C':'1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de',
+          'C80_ALGO_H':'c98f1de471891311700e7befcaf3878128f6119c9a356700fe920213eabb9207',
+          'WRAPPER_C':'33cfe150a007a5d8d2da54a77fe6e96739534dad0dd649135fe8b2ef7185839f',
+          'WRAPPER_H':'3735405ebfd1d2a02cc9c02f85843c3793e7e4397c722b02e91201bd12f88b9a',
+          'VCXPROJ':'6a205bcec71d8134d2f56b4880e3f9774c89cf89141a5aab0d33eb135c021538',
+          'DEF':'7b90f8bd67987155b01c7afb34f58d7d9a916af89e336ae46402121f0762d39e',
+          'RC':'fc38dee90f116db39a6a3341929d1e8068449d873854cf9be879fddcaf95098b',
+          'FILTER_BRTH':'ab3f170ff90741c614bd8ff2e5942038f1d14489f2c9df0a1dad7f3dd12b7b9a',
+          'FILTER_HRT3':'0ea419a929ac7d765f7c6bcb04fc151927eb6954a65a69819136bf3ae0946805',
+          'LATEST_ALGO_C':'c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a',
+          'LATEST_ALGO_H':'f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03'}
+          H={v:k for k,v in T.items()}; found={}; out=pathlib.Path('recovered'); out.mkdir(exist_ok=True)
+          def take(data, origin):
+            h=hashlib.sha256(data).hexdigest(); k=H.get(h)
+            if k and k not in found:
+              (out/k).write_bytes(data); found[k]=origin; print('FOUND',k,origin,len(data),h)
+          # Working tree files
+          for p in pathlib.Path('.').rglob('*'):
+            if p.is_file() and '.git' not in p.parts:
+              try:
+                if p.stat().st_size <= 5_000_000: take(p.read_bytes(), 'worktree:'+str(p))
+              except Exception: pass
+          # Raw git blobs across all history
+          oids=[]
+          for line in subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='ignore').splitlines():
+            if line: oids.append(line.split()[0])
+          for oid in dict.fromkeys(oids):
+            if len(found)==len(T): break
+            try:
+              if subprocess.check_output(['git','cat-file','-t',oid],text=True,stderr=subprocess.DEVNULL).strip()!='blob': continue
+              n=int(subprocess.check_output(['git','cat-file','-s',oid],text=True).strip())
+              if n>5_000_000: continue
+              take(subprocess.check_output(['git','cat-file','blob',oid]), 'git:'+oid)
+            except Exception: pass
+          # Decode likely base64 files already committed, then probe decoded bytes and archives.
+          def probe_file(p, origin, depth=0):
+            if depth>2 or not p.is_file(): return
+            try:
+              data=p.read_bytes()
+            except Exception: return
+            if len(data)<=5_000_000: take(data, origin)
+            # base64 text
+            if len(data)<8_000_000:
+              try:
+                s=b''.join(data.split())
+                if len(s)>100 and len(s)%4==0 and re.fullmatch(rb'[A-Za-z0-9+/=]+',s):
+                  d=base64.b64decode(s,validate=True); take(d,origin+':b64')
+              except Exception: pass
+            suf=p.name.lower()
+            try:
+              if zipfile.is_zipfile(p):
+                d=pathlib.Path(tempfile.mkdtemp())
+                with zipfile.ZipFile(p) as z: z.extractall(d)
+                for q in d.rglob('*'): probe_file(q,origin+':zip:'+q.name,depth+1)
+                shutil.rmtree(d,ignore_errors=True)
+              elif any(suf.endswith(x) for x in ['.tar','.tar.gz','.tgz','.tar.xz','.txz']):
+                d=pathlib.Path(tempfile.mkdtemp())
+                with tarfile.open(p,'r:*') as t: t.extractall(d,filter='data')
+                for q in d.rglob('*'): probe_file(q,origin+':tar:'+q.name,depth+1)
+                shutil.rmtree(d,ignore_errors=True)
+              elif suf.endswith(('.rar','.7z')):
+                d=pathlib.Path(tempfile.mkdtemp())
+                subprocess.run(['7z','x','-y',str(p),'-o'+str(d)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=60)
+                for q in d.rglob('*'): probe_file(q,origin+':7z:'+q.name,depth+1)
+                shutil.rmtree(d,ignore_errors=True)
+            except Exception: pass
+          for p in pathlib.Path('.').rglob('*'):
+            if p.is_file() and '.git' not in p.parts: probe_file(p,'repo:'+str(p))
+          # Scan non-expired relevant Actions artifacts for any remaining exact target bytes.
+          token=os.environ['GH_TOKEN']; repo=os.environ['GH_REPO']; hdr={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          arts=[]
+          for page in range(1,6):
+            u=f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}'
+            req=urllib.request.Request(u,headers=hdr)
+            with urllib.request.urlopen(req,timeout=30) as r: js=json.load(r)
+            arts += js.get('artifacts',[])
+            if len(js.get('artifacts',[]))<100: break
+          rx=re.compile(r'c8[0-6]|c80|baseline|source|delivery|candidate|fullreg|repro|reset|native',re.I)
+          candidates=[a for a in arts if not a.get('expired') and a.get('size_in_bytes',0)<=60_000_000 and rx.search(a.get('name',''))]
+          candidates.sort(key=lambda a:a.get('created_at',''),reverse=True)
+          print('ARTIFACT_CANDIDATES',len(candidates),'MISSING',sorted(set(T)-set(found)))
+          for a in candidates[:120]:
+            if len(found)==len(T): break
+            try:
+              req=urllib.request.Request(a['archive_download_url'],headers=hdr)
+              data=urllib.request.urlopen(req,timeout=60).read()
+              zp=pathlib.Path(tempfile.mktemp(suffix='.zip')); zp.write_bytes(data)
+              d=pathlib.Path(tempfile.mkdtemp())
+              with zipfile.ZipFile(zp) as z: z.extractall(d)
+              for p in d.rglob('*'):
+                if p.is_file(): probe_file(p,'artifact:'+a['name']+':'+p.name)
+              zp.unlink(missing_ok=True); shutil.rmtree(d,ignore_errors=True)
+            except Exception as e:
+              print('ARTIFACT_SKIP',a.get('name'),type(e).__name__)
+          missing=sorted(set(T)-set(found))
+          pathlib.Path('RECOVERY_REPORT.txt').write_text('\n'.join([f'{k}={found.get(k,"MISSING")}' for k in T])+'\n')
+          print(pathlib.Path('RECOVERY_REPORT.txt').read_text())
+          if missing:
+            print('FAIL_MISSING',missing); raise SystemExit(41)
+          PY
+          python /tmp/recover.py
+      - name: Assemble baseline and algorithm-only candidate source trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/assemble.py <<'PY'
+          import pathlib,re,shutil,os,hashlib
+          f=pathlib.Path('recovered'); root=pathlib.Path('bundle'); base=root/'baseline'; cand=root/'candidate'
+          pd=base/'sigproc_standalone_dll'/'SigProcStandalone'; pd.mkdir(parents=True,exist_ok=True)
+          proj=pd/'SigProcStandalone.vcxproj'; proj.write_bytes((f/'VCXPROJ').read_bytes())
+          text=proj.read_text(errors='replace')
+          def safe(rel):
+            rel=rel.replace('\\','/'); p=(pd/pathlib.Path(rel)).resolve(); br=base.resolve()
+            if not str(p).startswith(str(br)): raise RuntimeError('path escapes root:'+rel)
+            p.parent.mkdir(parents=True,exist_ok=True); return p
+          comps=re.findall(r'<ClCompile\s+Include="([^"]+)"',text,re.I)
+          heads=re.findall(r'<ClInclude\s+Include="([^"]+)"',text,re.I)
+          rcs=re.findall(r'<ResourceCompile\s+Include="([^"]+)"',text,re.I)
+          defs=re.findall(r'<ModuleDefinitionFile>([^<]+)</ModuleDefinitionFile>',text,re.I)
+          print('COMPILE_REFS',comps); print('HEADER_REFS',heads); print('RC_REFS',rcs); print('DEF_REFS',defs)
+          for rel in comps:
+            key='C80_ALGO_C' if 'sigproc_rebuild' in rel.lower() else 'WRAPPER_C'; safe(rel).write_bytes((f/key).read_bytes())
+          for rel in heads:
+            key='C80_ALGO_H' if 'sigproc_rebuild' in rel.lower() else 'WRAPPER_H'; safe(rel).write_bytes((f/key).read_bytes())
+          for rel in rcs: safe(rel).write_bytes((f/'RC').read_bytes())
+          for rel in defs: safe(rel).write_bytes((f/'DEF').read_bytes())
+          # Put authoritative filters in every plausible project-relative location; RC resolves one of these exact-byte files.
+          for d in [pd,base,base/'sigproc_standalone_dll']:
+            d.mkdir(parents=True,exist_ok=True); (d/'filter_brth').write_bytes((f/'FILTER_BRTH').read_bytes()); (d/'filter_hrt3').write_bytes((f/'FILTER_HRT3').read_bytes())
+          # If RC itself names a subpath, honor it too.
+          for rel in rcs:
+            rp=safe(rel); rt=rp.read_text(errors='replace')
+            for name,key in [('filter_brth','FILTER_BRTH'),('filter_hrt3','FILTER_HRT3')]:
+              for m in re.finditer(r'"([^"]*'+name+r'[^"]*)"',rt,re.I):
+                q=(rp.parent/pathlib.Path(m.group(1).replace('\\','/'))).resolve()
+                if str(q).startswith(str(base.resolve())): q.parent.mkdir(parents=True,exist_ok=True); q.write_bytes((f/key).read_bytes())
+          shutil.copytree(base,cand,dirs_exist_ok=True)
+          cpd=cand/'sigproc_standalone_dll'/'SigProcStandalone'; ctext=(cpd/'SigProcStandalone.vcxproj').read_text(errors='replace')
+          for rel in re.findall(r'<ClCompile\s+Include="([^"]+)"',ctext,re.I):
+            if 'sigproc_rebuild' in rel.lower(): (cpd/pathlib.Path(rel.replace('\\','/'))).resolve().write_bytes((f/'LATEST_ALGO_C').read_bytes())
+          for rel in re.findall(r'<ClInclude\s+Include="([^"]+)"',ctext,re.I):
+            if 'sigproc_rebuild' in rel.lower(): (cpd/pathlib.Path(rel.replace('\\','/'))).resolve().write_bytes((f/'LATEST_ALGO_H').read_bytes())
+          # Hard source-diff gate: only two algorithm paths may differ.
+          def files(r): return {str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in r.rglob('*') if p.is_file()}
+          A=files(base); B=files(cand); diff=[k for k in sorted(set(A)|set(B)) if A.get(k)!=B.get(k)]
+          print('SOURCE_DIFF',diff)
+          if len(diff)!=2 or not all('sigproc_rebuild' in x.lower() for x in diff): raise SystemExit('NON_ALGO_SOURCE_DIFF')
+          pathlib.Path('SOURCE_DIFF.txt').write_text('\n'.join(diff)+'\n')
+          PY
+          python /tmp/assemble.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c86-recovered-exact-source
+          path: |
+            bundle
+            RECOVERY_REPORT.txt
+            SOURCE_DIFF.txt
+          retention-days: 2
+  build:
+    needs: recover
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: c86-recovered-exact-source
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Verify required toolset and build exact C80 baseline
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          cmd /c 'cl 2>&1' | Out-File compiler_identity.txt
+          $vcroot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC'
+          if (!(Test-Path $vcroot)) { $vcroot = Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC' }
+          Get-ChildItem $vcroot -Directory | Select-Object -ExpandProperty Name | Out-File installed_toolsets.txt
+          $want='14.44.35207'
+          if (!(Test-Path (Join-Path $vcroot $want))) { Write-Host 'REQUIRED_TOOLSET_MISSING'; Get-Content installed_toolsets.txt; exit 51 }
+          $p=(Resolve-Path 'bundle\baseline\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $sd=(Resolve-Path 'bundle\baseline\sigproc_standalone_dll').Path + '\'
+          & msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 "/p:SolutionDir=$sd" "/p:VCToolsVersion=$want" /v:minimal | Tee-Object baseline_build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dll=Get-ChildItem bundle\baseline -Recurse -Filter '*.dll' | Where-Object {$_.Name -like 'SigProcDll*'} | Select-Object -First 1
+          if (!$dll) { throw 'BASELINE_DLL_NOT_FOUND' }
+          $sha=(Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLower()
+          "BASELINE_DLL=$($dll.FullName)" | Tee-Object baseline_sha.txt
+          "BASELINE_SHA256=$sha" | Tee-Object -Append baseline_sha.txt
+          if ($sha -ne '9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180') { Write-Host 'FAIL_EXACT_C80_REPRO'; exit 52 }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out\C80_EXACT_REPRO.dll
+      - name: Build algorithm-only candidate in same project/toolset
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'; $want='14.44.35207'
+          $p=(Resolve-Path 'bundle\candidate\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $sd=(Resolve-Path 'bundle\candidate\sigproc_standalone_dll').Path + '\'
+          & msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 "/p:SolutionDir=$sd" "/p:VCToolsVersion=$want" /v:minimal | Tee-Object candidate_build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dll=Get-ChildItem bundle\candidate -Recurse -Filter '*.dll' | Where-Object {$_.Name -like 'SigProcDll*'} | Select-Object -First 1
+          if (!$dll) { throw 'CANDIDATE_DLL_NOT_FOUND' }
+          Copy-Item $dll.FullName out\SigProcDll-64HF.dll
+          $sha=(Get-FileHash out\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLower()
+          "CANDIDATE_SHA256=$sha" | Tee-Object candidate_sha.txt
+      - name: ABI/import regression gate against exact C80
+        shell: cmd
+        run: |
+          dumpbin /headers out\C80_EXACT_REPRO.dll > baseline_headers.txt
+          dumpbin /headers out\SigProcDll-64HF.dll > candidate_headers.txt
+          dumpbin /exports out\C80_EXACT_REPRO.dll > baseline_exports.txt
+          dumpbin /exports out\SigProcDll-64HF.dll > candidate_exports.txt
+          dumpbin /imports out\C80_EXACT_REPRO.dll > baseline_imports.txt
+          dumpbin /imports out\SigProcDll-64HF.dll > candidate_imports.txt
+          findstr /C:"machine (x86)" candidate_headers.txt >nul || exit /b 61
+          findstr /C:"_SigProc@24" candidate_exports.txt >nul || exit /b 62
+          findstr /C:"_SigProc_Fini@0" candidate_exports.txt >nul || exit /b 63
+          findstr /C:"_SigProc_Init@8" candidate_exports.txt >nul || exit /b 64
+          findstr /C:"_SigProc_Stat@0" candidate_exports.txt >nul || exit /b 65
+      - name: Native Win32 LoadLibrary/GetProcAddress lifecycle shell smoke
+        shell: powershell
+        run: |
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){
+            HMODULE h=LoadLibraryA("SigProcDll-64HF.dll"); if(!h){printf("LOAD_FAIL=%lu\n",GetLastError()); return 10;}
+            const char* n[4]={"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"};
+            for(int i=0;i<4;i++){ if(!GetProcAddress(h,n[i])){printf("PROC_FAIL %s %lu\n",n[i],GetLastError()); return 20+i;} }
+            if(!FreeLibrary(h)){printf("FREE_FAIL=%lu\n",GetLastError()); return 30;}
+            puts("WIN32_LOADER_ABI_PASS"); return 0;
+          }
+          '@ | Set-Content loader.c -Encoding ASCII
+          cmd /c 'cl /nologo /O2 /MT loader.c /Fe:loader.exe'
+          Copy-Item loader.exe out\loader.exe
+          Push-Location out; .\loader.exe | Tee-Object ..\loader_smoke.txt; $rc=$LASTEXITCODE; Pop-Location
+          if ($rc -ne 0) { exit $rc }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c86-c80-shell-latest-algo-native-candidate
+          path: |
+            out/SigProcDll-64HF.dll
+            out/C80_EXACT_REPRO.dll
+            baseline_sha.txt
+            candidate_sha.txt
+            compiler_identity.txt
+            installed_toolsets.txt
+            baseline_build.txt
+            candidate_build.txt
+            baseline_headers.txt
+            candidate_headers.txt
+            baseline_exports.txt
+            candidate_exports.txt
+            baseline_imports.txt
+            candidate_imports.txt
+            loader_smoke.txt
+          retention-days: 3
