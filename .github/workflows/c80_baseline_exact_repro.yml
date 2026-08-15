@@ -1,0 +1,97 @@
+name: c80-baseline-exact-repro
+on:
+  push:
+    paths:
+      - '.github/workflows/c80_baseline_exact_repro.yml'
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: powershell
+jobs:
+  baseline:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      PAYLOAD_ID: 1-12ab6f7ICQBUw5pBuWW4q5L7GjAZBfw
+      PAYLOAD_SHA: 1a0bb260f4534cbfb9b41c93bdb56982e174cbf0a13366fcfb096308985bbfd8
+      C80_SHA: 9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+      VCTOOLS: 14.44.35207
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download only source reset payload
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check --quiet gdown
+          if($LASTEXITCODE -ne 0){ throw 'GDOWN_INSTALL_FAIL' }
+          gdown $env:PAYLOAD_ID -O reset_payload.tar.xz 2>&1 | Tee-Object gdown.log
+          if($LASTEXITCODE -ne 0){ throw 'PAYLOAD_DOWNLOAD_FAIL' }
+          $h=(Get-FileHash reset_payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          "PAYLOAD_SHA=$h" | Add-Content gdown.log
+          if($h -ne $env:PAYLOAD_SHA){ throw "PAYLOAD_SHA_FAIL $h" }
+          7z x -y reset_payload.tar.xz | Tee-Object extract1.log
+          if($LASTEXITCODE -ne 0){ throw 'XZ_EXTRACT_FAIL' }
+          if(!(Test-Path reset_payload.tar)){ throw 'RESET_TAR_MISSING' }
+          7z x -y reset_payload.tar | Tee-Object extract2.log
+          if($LASTEXITCODE -ne 0){ throw 'TAR_EXTRACT_FAIL' }
+          if(!(Test-Path c80_algo_only_reset_payload\baseline)){ throw 'BASELINE_TREE_MISSING' }
+      - name: Prove only algorithm files differ
+        run: |
+          $ErrorActionPreference='Stop'
+          $base='c80_algo_only_reset_payload\baseline'; $cand='c80_algo_only_reset_payload\candidate'
+          $allowed=@('sigproc_rebuild\SigProcRebuild\include\sigproc_rebuild.h','sigproc_rebuild\SigProcRebuild\src\sigproc_rebuild.c') | Sort-Object
+          $changed=@()
+          foreach($f in Get-ChildItem $base -Recurse -File){
+            $rel=$f.FullName.Substring((Resolve-Path $base).Path.Length+1); $cf=Join-Path $cand $rel
+            if(!(Test-Path $cf)){ throw "MISSING $rel" }
+            if((Get-FileHash $f.FullName).Hash -ne (Get-FileHash $cf).Hash){$changed+=$rel}
+          }
+          $changed=$changed|Sort-Object
+          if(($changed -join '|') -ne ($allowed -join '|')){throw "NON_ALGO_DIFF $($changed -join ',')"}
+          "ONLY_ALGORITHM_FILES_DIFFER=PASS`n$($changed -join "`n")" | Out-File source_contract.txt
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Confirm historical v143 toolset
+        run: |
+          $root=(Split-Path $env:VCToolsInstallDir.TrimEnd('\') -Parent); $exact=Join-Path $root $env:VCTOOLS
+          "CURRENT=$env:VCToolsInstallDir`nEXACT=$exact" | Out-File toolset.txt
+          Get-ChildItem $root | Select-Object Name | Out-String | Add-Content toolset.txt
+          if(!(Test-Path $exact)){throw 'EXACT_TOOLSET_MISSING'}
+      - name: Rebuild untouched original C80
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=(Resolve-Path 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $s=(Resolve-Path 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll').Path+'\'
+          msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$s" /p:VCToolsVersion=$env:VCTOOLS /v:normal 2>&1 | Tee-Object build.log
+          if($LASTEXITCODE -ne 0){throw 'BASELINE_BUILD_FAIL'}
+          $dll=Get-ChildItem 'c80_algo_only_reset_payload\baseline\sigproc_standalone_dll' -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){throw 'BASELINE_DLL_MISSING'}
+          Copy-Item $dll.FullName C80_REBUILT.dll
+          $h=(Get-FileHash C80_REBUILT.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "REBUILT_SHA=$h`nEXPECTED_SHA=$env:C80_SHA" | Out-File baseline_identity.txt
+          dumpbin /headers C80_REBUILT.dll | Out-File baseline_headers.txt
+          dumpbin /exports C80_REBUILT.dll | Out-File baseline_exports.txt
+          dumpbin /imports C80_REBUILT.dll | Out-File baseline_imports.txt
+          if($h -ne $env:C80_SHA){throw "BASELINE_EXACT_REPRO_FAIL got=$h"}
+          'ORIGINAL_C80_EXACT_REPRO=PASS' | Add-Content baseline_identity.txt
+      - name: Upload baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c80-baseline-repro-${{ github.run_id }}
+          path: |
+            gdown.log
+            extract1.log
+            extract2.log
+            source_contract.txt
+            toolset.txt
+            build.log
+            baseline_identity.txt
+            baseline_headers.txt
+            baseline_exports.txt
+            baseline_imports.txt
+            C80_REBUILT.dll
+          if-no-files-found: warn
+          retention-days: 30
