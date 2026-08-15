@@ -1,0 +1,258 @@
+name: c80-history-recover-exact-build
+on:
+  push:
+    branches:
+      - c80-algo-only-reset-20260815
+    paths:
+      - '.github/workflows/c80_history_recover_exact_build.yml'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  recover-build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      C80_DLL_SHA: 9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+      C80_CORE_SHA: 1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de
+      CAND_CORE_SHA: c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a
+      CAND_HDR_SHA: f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure x86 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Locate exact blobs and recover a source tree that reproduces C80
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import hashlib, os, pathlib, shutil, subprocess, sys
+          targets={
+            os.environ['C80_CORE_SHA']:'BASE_CORE',
+            os.environ['CAND_CORE_SHA']:'CAND_CORE',
+            os.environ['CAND_HDR_SHA']:'CAND_HDR',
+            os.environ['C80_DLL_SHA']:'C80_DLL',
+          }
+          objlines=subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='replace').splitlines()
+          objpaths={}
+          for line in objlines:
+            p=line.split(' ',1); objpaths.setdefault(p[0],set())
+            if len(p)>1: objpaths[p[0]].add(p[1])
+          found={}
+          for sha in objpaths:
+            try:
+              if subprocess.check_output(['git','cat-file','-t',sha],text=True).strip()!='blob': continue
+              data=subprocess.check_output(['git','cat-file','blob',sha])
+            except subprocess.CalledProcessError: continue
+            h=hashlib.sha256(data).hexdigest()
+            if h in targets:
+              found[targets[h]]=(sha,data,sorted(objpaths[sha]))
+              print('FOUND',targets[h],h,sha,sorted(objpaths[sha]))
+          pathlib.Path('blob_scan.txt').write_text('\n'.join(f'{k}={v[0]} paths={v[2]}' for k,v in found.items()),encoding='utf-8')
+          for req in ('BASE_CORE','CAND_CORE','CAND_HDR'):
+            if req not in found:
+              print('MISSING_REQUIRED_GIT_BLOB',req); sys.exit(41)
+          base_blob=found['BASE_CORE'][0]
+          commits=subprocess.check_output(['git','log','--all','--format=%H','--find-object='+base_blob],text=True).split()
+          print('COMMITS_WITH_BASE_CORE',commits)
+          candidates=[]
+          for commit in commits:
+            tree=subprocess.check_output(['git','ls-tree','-r',commit],text=True,errors='replace').splitlines()
+            for line in tree:
+              parts=line.split(None,3)
+              if len(parts)<4: continue
+              mode,typ,blob,path=parts
+              if typ=='blob' and blob==base_blob and path.replace('\\','/').endswith('/sigproc_rebuild/SigProcRebuild/src/sigproc_rebuild.c'):
+                root=path[:path.rfind('/sigproc_rebuild/SigProcRebuild/src/sigproc_rebuild.c')]
+                proj=(root+'/' if root else '')+'sigproc_standalone_dll/SigProcStandalone/SigProcStandalone.vcxproj'
+                hdr=(root+'/' if root else '')+'sigproc_rebuild/SigProcRebuild/include/sigproc_rebuild.h'
+                paths={x.split(None,3)[3] for x in tree if len(x.split(None,3))>=4}
+                if proj in paths and hdr in paths:
+                  candidates.append((commit,root,proj,hdr))
+          pathlib.Path('source_candidates.txt').write_text('\n'.join(map(str,candidates)),encoding='utf-8')
+          if not candidates:
+            print('NO_HISTORICAL_SOURCE_TREE_WITH_PROJECT'); sys.exit(42)
+          # Save exact candidate algorithm blobs for later replacement.
+          pathlib.Path('candidate_core.bin').write_bytes(found['CAND_CORE'][1])
+          pathlib.Path('candidate_header.bin').write_bytes(found['CAND_HDR'][1])
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\recover.py
+          python $env:RUNNER_TEMP\recover.py
+          if($LASTEXITCODE -ne 0){ throw "HISTORY_RECOVERY_SCAN_FAIL rc=$LASTEXITCODE" }
+
+          $lines=Get-Content source_candidates.txt
+          $success=$false
+          foreach($line in $lines){
+            if($success){ break }
+            if($line -notmatch "\('([0-9a-f]{40})', '([^']*)', '([^']+)', '([^']+)'\)"){ continue }
+            $commit=$matches[1]; $root=$matches[2]; $projRel=$matches[3]
+            Remove-Item -Recurse -Force recovered_try -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory recovered_try | Out-Null
+            if([string]::IsNullOrEmpty($root)){
+              git archive --format=zip -o recovered.zip $commit sigproc_standalone_dll sigproc_rebuild
+            } else {
+              git archive --format=zip -o recovered.zip $commit $root
+            }
+            if($LASTEXITCODE -ne 0){ continue }
+            Expand-Archive recovered.zip recovered_try -Force
+            Remove-Item recovered.zip
+            $proj=Join-Path recovered_try $projRel
+            if(!(Test-Path $proj)){ continue }
+            $sol=Split-Path (Split-Path $proj -Parent) -Parent
+            $sol=(Resolve-Path $sol).Path+'\'
+            $versions=@('14.44.35207','14.44.35228',$env:VCToolsVersion) | Select-Object -Unique
+            foreach($v in $versions){
+              if([string]::IsNullOrWhiteSpace($v)){ continue }
+              msbuild $proj /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$sol" /p:VCToolsVersion=$v /v:minimal 2>&1 | Tee-Object -FilePath "build_$($commit.Substring(0,8))_$($v).log"
+              if($LASTEXITCODE -ne 0){ continue }
+              $dll=Get-ChildItem recovered_try -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if(!$dll){ continue }
+              $h=(Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "TRY commit=$commit root=$root toolset=$v sha=$h" | Add-Content reproduction_attempts.txt
+              if($h -eq $env:C80_DLL_SHA){
+                Copy-Item recovered_try recovered_c80 -Recurse
+                Copy-Item $dll.FullName C80_EXACT_REPRODUCED.dll
+                "C80_EXACT_REPRODUCTION=PASS`nCOMMIT=$commit`nROOT=$root`nVCTOOLS=$v`nSHA256=$h" | Out-File C80_REPRODUCTION_PASS.txt
+                $success=$true
+                break
+              }
+            }
+          }
+          if(!$success){ throw 'NO_HISTORICAL_SOURCE_TREE_REPRODUCED_EXACT_C80_DLL' }
+
+      - name: Replace only two algorithm files and build candidate
+        run: |
+          $ErrorActionPreference='Stop'
+          # Identify source root inside recovered copy.
+          $baseCore=Get-ChildItem recovered_c80 -Recurse -Filter sigproc_rebuild.c | Where-Object { $_.FullName -match 'sigproc_rebuild[\\/]SigProcRebuild[\\/]src' } | Select-Object -First 1
+          $baseHdr=Get-ChildItem recovered_c80 -Recurse -Filter sigproc_rebuild.h | Where-Object { $_.FullName -match 'sigproc_rebuild[\\/]SigProcRebuild[\\/]include' } | Select-Object -First 1
+          $proj=Get-ChildItem recovered_c80 -Recurse -Filter SigProcStandalone.vcxproj | Select-Object -First 1
+          if(!$baseCore -or !$baseHdr -or !$proj){ throw 'RECOVERED_SOURCE_LAYOUT_INCOMPLETE' }
+          # Hash complete recovered source before change.
+          Get-ChildItem recovered_c80 -Recurse -File | ForEach-Object {
+            $rel=$_.FullName.Substring((Resolve-Path recovered_c80).Path.Length+1)
+            $sha=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$rel|$sha" | Add-Content before_source_hashes.txt
+          }
+          Copy-Item candidate_core.bin $baseCore.FullName -Force
+          Copy-Item candidate_header.bin $baseHdr.FullName -Force
+          $hc=(Get-FileHash $baseCore.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hh=(Get-FileHash $baseHdr.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hc -ne $env:CAND_CORE_SHA){ throw 'CAND_CORE_REPLACEMENT_HASH_FAIL' }
+          if($hh -ne $env:CAND_HDR_SHA){ throw 'CAND_HEADER_REPLACEMENT_HASH_FAIL' }
+          Get-ChildItem recovered_c80 -Recurse -File | ForEach-Object {
+            $rel=$_.FullName.Substring((Resolve-Path recovered_c80).Path.Length+1)
+            $sha=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$rel|$sha" | Add-Content after_source_hashes.txt
+          }
+          @'
+          from pathlib import Path
+          b=dict(x.split('|',1) for x in Path('before_source_hashes.txt').read_text().splitlines())
+          a=dict(x.split('|',1) for x in Path('after_source_hashes.txt').read_text().splitlines())
+          changed=sorted(k for k in set(a)|set(b) if a.get(k)!=b.get(k))
+          print('CHANGED_FILES',changed)
+          # Ignore build outputs that existed in recovered tree; source change paths must be exactly these suffixes.
+          src=[x.replace('\\','/') for x in changed if '/Release/' not in x.replace('\\','/') and not x.lower().endswith(('.dll','.lib','.exp','.obj','.pdb','.ilk','.tlog','.res'))]
+          expected=['sigproc_rebuild/SigProcRebuild/include/sigproc_rebuild.h','sigproc_rebuild/SigProcRebuild/src/sigproc_rebuild.c']
+          if len(src)!=2 or not all(any(s.endswith(e) for s in src) for e in expected):
+              raise SystemExit('NON_ALGORITHM_SOURCE_CHANGED '+repr(src))
+          Path('ALGORITHM_ONLY_SOURCE_GATE.txt').write_text('ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS\n'+'\n'.join(src)+'\n')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\diff.py
+          python $env:RUNNER_TEMP\diff.py
+          if($LASTEXITCODE -ne 0){ throw 'ALGORITHM_ONLY_SOURCE_GATE_FAIL' }
+          $tool=(Select-String C80_REPRODUCTION_PASS.txt -Pattern '^VCTOOLS=(.+)$').Matches.Groups[1].Value
+          $sol=(Split-Path (Split-Path $proj.FullName -Parent) -Parent)+'\'
+          msbuild $proj.FullName /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$sol" /p:VCToolsVersion=$tool /v:minimal 2>&1 | Tee-Object candidate_build.log
+          if($LASTEXITCODE -ne 0){ throw 'CANDIDATE_BUILD_FAIL' }
+          $dll=Get-ChildItem recovered_c80 -Recurse -Filter 'SigProcDll-64HF(2).dll' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'CANDIDATE_DLL_MISSING' }
+          Copy-Item $dll.FullName SigProcDll-64HF.dll
+          $h=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "CANDIDATE_SHA256=$h" | Out-File candidate_identity.txt
+
+      - name: ABI and loader-surface gates
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers C80_EXACT_REPRODUCED.dll | Out-File base_headers.txt
+          dumpbin /headers SigProcDll-64HF.dll | Out-File cand_headers.txt
+          dumpbin /exports C80_EXACT_REPRODUCED.dll | Out-File base_exports.txt
+          dumpbin /exports SigProcDll-64HF.dll | Out-File cand_exports.txt
+          dumpbin /imports C80_EXACT_REPRODUCED.dll | Out-File base_imports.txt
+          dumpbin /imports SigProcDll-64HF.dll | Out-File cand_imports.txt
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){ if(-not (Select-String cand_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          if(-not (Select-String cand_headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'CAND_NOT_X86' }
+          @'
+          import pathlib,re,sys
+          pat=re.compile(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',re.I|re.M)
+          b={x.lower() for x in pat.findall(pathlib.Path('base_imports.txt').read_text(errors='ignore'))}
+          c={x.lower() for x in pat.findall(pathlib.Path('cand_imports.txt').read_text(errors='ignore'))}
+          print('BASE_IMPORT_DLLS',sorted(b)); print('CAND_IMPORT_DLLS',sorted(c))
+          if c-b: raise SystemExit('NEW_IMPORT_DLLS '+repr(sorted(c-b)))
+          pathlib.Path('ABI_LOADER_SURFACE_PASS.txt').write_text('X86=PASS\nEXACT_4_EXPORTS=PASS\nNEW_IMPORT_DLLS=0\n')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\abi.py
+          python $env:RUNNER_TEMP\abi.py
+
+      - name: Native LoadLibrary GetProcAddress smoke
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){
+            HMODULE h=LoadLibraryA("SigProcDll-64HF.dll");
+            if(!h){ printf("LOAD_FAIL=%lu\n",GetLastError()); return 10; }
+            const char *n[]={"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"};
+            for(int i=0;i<4;i++){ if(!GetProcAddress(h,n[i])){ printf("GETPROC_FAIL %s %lu\n",n[i],GetLastError()); return 11+i; } }
+            if(!FreeLibrary(h)){ return 20; }
+            puts("LOADLIBRARY_GETPROC_FREELIBRARY_PASS"); return 0;
+          }
+          '@ | Set-Content -Encoding ascii loader_smoke.c
+          cl /nologo /O2 /Fe:loader_smoke.exe loader_smoke.c
+          if($LASTEXITCODE -ne 0){ throw 'SMOKE_COMPILE_FAIL' }
+          .\loader_smoke.exe 2>&1 | Tee-Object loader_smoke.log
+          if($LASTEXITCODE -ne 0){ throw "LOADER_SMOKE_FAIL rc=$LASTEXITCODE" }
+          if(-not (Select-String loader_smoke.log -SimpleMatch 'LOADLIBRARY_GETPROC_FREELIBRARY_PASS' -Quiet)){ throw 'LOADER_MARKER_MISSING' }
+          'STAGE1_NATIVE_EXACT_BUILD_AND_LOADER_PASS' | Out-File STAGE1_PASS.lock
+
+      - name: Commit gated candidate to isolated branch
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force .c80_exact_candidate | Out-Null
+          Copy-Item SigProcDll-64HF.dll .c80_exact_candidate\SigProcDll-64HF.dll
+          Copy-Item C80_REPRODUCTION_PASS.txt .c80_exact_candidate\
+          Copy-Item ALGORITHM_ONLY_SOURCE_GATE.txt .c80_exact_candidate\
+          Copy-Item ABI_LOADER_SURFACE_PASS.txt .c80_exact_candidate\
+          Copy-Item loader_smoke.log .c80_exact_candidate\
+          Copy-Item candidate_identity.txt .c80_exact_candidate\
+          Copy-Item STAGE1_PASS.lock .c80_exact_candidate\
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c80_exact_candidate
+          git commit -m 'Gate exact C80 reproduction and algorithm-only candidate'
+          git push origin HEAD:c80-algo-only-reset-20260815
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-history-recovered-stage1-${{ github.run_id }}
+          path: |
+            SigProcDll-64HF.dll
+            C80_EXACT_REPRODUCED.dll
+            C80_REPRODUCTION_PASS.txt
+            ALGORITHM_ONLY_SOURCE_GATE.txt
+            ABI_LOADER_SURFACE_PASS.txt
+            loader_smoke.log
+            candidate_identity.txt
+            blob_scan.txt
+            source_candidates.txt
+            reproduction_attempts.txt
+            STAGE1_PASS.lock
+          if-no-files-found: error
+          retention-days: 30
