@@ -1,0 +1,214 @@
+name: c86-real-final-build
+on:
+  push:
+    branches: [c86-real-final-20260815]
+    paths: ['.github/workflows/c86_real_final_build.yml']
+permissions:
+  contents: write
+defaults:
+  run:
+    shell: powershell
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      SOURCE_ARCHIVE_SHA: 926f4328843971df7cbd4b1f6ec5dea3e00d23eaeded260f0cc68d4e3d5270bf
+      C80_DLL_SHA: 9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+      VCTOOLS: 14.44.35207
+      C80_ALG_C_SHA: 1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de
+      C80_ALG_H_SHA: c98f1de471891311700e7befcaf3878128f6119c9a356700fe920213eabb9207
+      LATEST_ALG_C_SHA: c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a
+      LATEST_ALG_H_SHA: f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore exact source archive from immutable Git blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $shas=@(
+            '4f450b0809d03eb90bb275a963f8870babc432f8','cd9e9fcf65f3abb97e279f47eabcc40a6a5841e9','5fa8c8fd1117d71ab84f589229ed8add6694b928','d5b858730ecdb96c96f111fa0bd986e273b1a5b7','75233a68e2aae8145fecc7a3b7e2583eddf12712','d5cf63ab7e150a59301dbd6dcf8fa5ac49bf855f','00e6cd777f396acea4be222630ebf604e581999a','15a69639ba441822096259cedee2bbe081e6320e','19afe08b59761d26f8d05a1bb472bb1b66e1e282','193c66e1d3f1d7efba44869e079b72be96a58b59','0b16e1dc066e7ff440bf5ec1fd67ba0ac7705606','b8bc69fbe2bfd1b997fbfaf3d2b0daa7080d8c94','74ba5819566d3b4c779174f510297ff4f376a9b4','a98dd12b4edd020e913b8e8f6b5e06d5400d899a','c03a67300035cf1cad91457e0f5b578229c064f9','529a64a2a088c792437dba6d35778e88b4846c32','0b86f6656f3b347fceb668102a70c13942d1001a','36f20c98344c0e81f67ab8c491fbe465fc1c8b68','67680ba95d77e9c12b7e9cf2ff0fd76d5e1d603b','c82f1dce7c0c0943091e28c4badab1ae2529d7c8','7c9caefc30b54b3639c4bae54f5c8dcb0cdb5690','abcf669d64378cf579dfdb5e78c679e4a1507bbc','9835e477a4a528e70e39c6f5b90f40e3b8ad2340'
+          )
+          $headers=@{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28'; 'User-Agent'='c86-real-final' }
+          $sb=New-Object System.Text.StringBuilder
+          foreach($sha in $shas){
+            $u="https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/blobs/$sha"
+            $o=Invoke-RestMethod -Headers $headers -Uri $u -Method Get
+            if($o.sha -ne $sha){ throw "BLOB_SHA_MISMATCH $sha got=$($o.sha)" }
+            $raw=[Convert]::FromBase64String(($o.content -replace '\s',''))
+            $txt=[Text.Encoding]::UTF8.GetString($raw)
+            [void]$sb.Append($txt)
+          }
+          $archiveBytes=[Convert]::FromBase64String(($sb.ToString() -replace '\s',''))
+          [IO.File]::WriteAllBytes('c86_source.tar.xz',$archiveBytes)
+          $h=(Get-FileHash c86_source.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          "SOURCE_ARCHIVE_SHA256=$h" | Out-File source_transport.txt
+          if($h -ne $env:SOURCE_ARCHIVE_SHA){ throw "SOURCE_ARCHIVE_SHA_FAIL $h" }
+          7z x -y c86_source.tar.xz | Out-Null
+          $tar=Get-ChildItem -File -Filter '*.tar' | Select-Object -First 1
+          if(!$tar){ throw 'SOURCE_TAR_MISSING' }
+          New-Item -ItemType Directory -Force source_extract | Out-Null
+          7z x -y $tar.FullName -osource_extract | Out-Null
+          if(!(Test-Path 'source_extract\payload\baseline_source')){ throw 'BASELINE_SOURCE_MISSING' }
+          if(!(Test-Path 'source_extract\payload\latest_algo\sigproc_rebuild.c')){ throw 'LATEST_ALG_C_MISSING' }
+
+      - name: Verify exact C80 source and latest algorithm identities
+        run: |
+          $ErrorActionPreference='Stop'
+          function NeedHash([string]$p,[string]$e){ if(!(Test-Path $p)){throw "MISSING $p"}; $h=(Get-FileHash $p -Algorithm SHA256).Hash.ToLowerInvariant(); "$p=$h" | Add-Content source_identity.txt; if($h -ne $e){throw "HASH_FAIL $p got=$h expected=$e"} }
+          $b='source_extract\payload\baseline_source'
+          NeedHash "$b\sigproc_rebuild\SigProcRebuild\src\sigproc_rebuild.c" $env:C80_ALG_C_SHA
+          NeedHash "$b\sigproc_rebuild\SigProcRebuild\include\sigproc_rebuild.h" $env:C80_ALG_H_SHA
+          NeedHash "$b\sigproc_standalone_dll\SigProcStandalone\src\sigproc_dll.c" '33cfe150a007a5d8d2da54a77fe6e96739534dad0dd649135fe8b2ef7185839f'
+          NeedHash "$b\sigproc_standalone_dll\SigProcStandalone\include\sigproc_dll.h" '3735405ebfd1d2a02cc9c02f85843c3793e7e4397c722b02e91201bd12f88b9a'
+          NeedHash "$b\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj" '6a205bcec71d8134d2f56b4880e3f9774c89cf89141a5aab0d33eb135c021538'
+          NeedHash "$b\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.def" '7b90f8bd67987155b01c7afb34f58d7d9a916af89e336ae46402121f0762d39e'
+          NeedHash "$b\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.rc" 'fc38dee90f116db39a6a3341929d1e8068449d873854cf9be879fddcaf95098b'
+          NeedHash "$b\prod287\filter_brth" 'ab3f170ff90741c614bd8ff2e5942038f1d14489f2c9df0a1dad7f3dd12b7b9a'
+          NeedHash "$b\prod287\filter_hrt3" '0ea419a929ac7d765f7c6bcb04fc151927eb6954a65a69819136bf3ae0946805'
+          NeedHash 'source_extract\payload\latest_algo\sigproc_rebuild.c' $env:LATEST_ALG_C_SHA
+          NeedHash 'source_extract\payload\latest_algo\sigproc_rebuild.h' $env:LATEST_ALG_H_SHA
+          'SOURCE_IDENTITY_PASS' | Add-Content source_identity.txt
+
+      - name: Create baseline and candidate trees; prove only two algorithm files differ
+        run: |
+          $ErrorActionPreference='Stop'
+          Copy-Item 'source_extract\payload\baseline_source' baseline -Recurse
+          Copy-Item 'source_extract\payload\baseline_source' candidate -Recurse
+          Copy-Item 'source_extract\payload\latest_algo\sigproc_rebuild.c' 'candidate\sigproc_rebuild\SigProcRebuild\src\sigproc_rebuild.c' -Force
+          Copy-Item 'source_extract\payload\latest_algo\sigproc_rebuild.h' 'candidate\sigproc_rebuild\SigProcRebuild\include\sigproc_rebuild.h' -Force
+          $allowed=@('sigproc_rebuild\SigProcRebuild\include\sigproc_rebuild.h','sigproc_rebuild\SigProcRebuild\src\sigproc_rebuild.c') | Sort-Object
+          $changed=@()
+          foreach($f in Get-ChildItem baseline -Recurse -File){
+            $rel=$f.FullName.Substring((Resolve-Path baseline).Path.Length+1)
+            $cf=Join-Path candidate $rel
+            if(!(Test-Path $cf)){ throw "CANDIDATE_MISSING $rel" }
+            if((Get-FileHash $f.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $cf -Algorithm SHA256).Hash){ $changed += $rel }
+          }
+          $extra=Get-ChildItem candidate -Recurse -File | ForEach-Object {$_.FullName.Substring((Resolve-Path candidate).Path.Length+1)} | Where-Object {!(Test-Path (Join-Path baseline $_))}
+          if($extra){ throw "EXTRA_CANDIDATE_FILES $($extra -join ',')" }
+          $changed=$changed|Sort-Object
+          "CHANGED_FILES=$($changed -join ',')" | Out-File source_contract.txt
+          if(($changed -join '|') -ne ($allowed -join '|')){ throw "SOURCE_CONTRACT_FAIL" }
+          'ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS' | Add-Content source_contract.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Verify exact historical MSVC toolset
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Split-Path $env:VCToolsInstallDir.TrimEnd('\') -Parent)
+          $exact=Join-Path $root $env:VCTOOLS
+          "CURRENT_VCTOOLS=$env:VCToolsInstallDir`nREQUIRED_VCTOOLS=$exact" | Out-File toolset.txt
+          if(!(Test-Path $exact)){ Get-ChildItem $root | Select-Object Name | Out-String | Add-Content toolset.txt; throw 'EXACT_VCTOOLS_MISSING' }
+
+      - name: Rebuild untouched C80 and require exact binary identity
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=(Resolve-Path 'baseline\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $s=(Resolve-Path 'baseline\sigproc_standalone_dll').Path+'\'
+          msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$s" /p:VCToolsVersion=$env:VCTOOLS /v:minimal 2>&1 | Tee-Object baseline_build.log
+          if($LASTEXITCODE -ne 0){ throw 'BASELINE_BUILD_FAIL' }
+          $dll=Get-ChildItem baseline -Recurse -Filter 'SigProcDll-64HF(2).dll' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'BASELINE_DLL_MISSING' }
+          Copy-Item $dll.FullName C80_REBUILT.dll
+          $h=(Get-FileHash C80_REBUILT.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "C80_REBUILT_SHA256=$h`nC80_EXPECTED_SHA256=$env:C80_DLL_SHA" | Out-File baseline_identity.txt
+          if($h -ne $env:C80_DLL_SHA){ throw "C80_EXACT_REPRO_FAIL got=$h" }
+          'C80_EXACT_BINARY_REPRODUCTION=PASS' | Add-Content baseline_identity.txt
+
+      - name: Build latest algorithm using unchanged C80 project
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=(Resolve-Path 'candidate\sigproc_standalone_dll\SigProcStandalone\SigProcStandalone.vcxproj').Path
+          $s=(Resolve-Path 'candidate\sigproc_standalone_dll').Path+'\'
+          msbuild $p /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir="$s" /p:VCToolsVersion=$env:VCTOOLS /v:minimal 2>&1 | Tee-Object candidate_build.log
+          if($LASTEXITCODE -ne 0){ throw 'CANDIDATE_BUILD_FAIL' }
+          $dll=Get-ChildItem candidate -Recurse -Filter 'SigProcDll-64HF(2).dll' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if(!$dll){ throw 'CANDIDATE_DLL_MISSING' }
+          Copy-Item $dll.FullName SigProcDll-64HF.dll
+          $h=(Get-FileHash SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $n=(Get-Item SigProcDll-64HF.dll).Length
+          "CANDIDATE_SHA256=$h`nCANDIDATE_BYTES=$n" | Out-File candidate_identity.txt
+
+      - name: Verify PE x86 ABI imports and native LoadLibrary loop
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers C80_REBUILT.dll | Out-File baseline_headers.txt
+          dumpbin /headers SigProcDll-64HF.dll | Out-File candidate_headers.txt
+          dumpbin /exports C80_REBUILT.dll | Out-File baseline_exports.txt
+          dumpbin /exports SigProcDll-64HF.dll | Out-File candidate_exports.txt
+          dumpbin /imports C80_REBUILT.dll | Out-File baseline_imports.txt
+          dumpbin /imports SigProcDll-64HF.dll | Out-File candidate_imports.txt
+          if(-not (Select-String candidate_headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'CANDIDATE_NOT_X86' }
+          $req=@('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')
+          foreach($e in $req){ if(-not (Select-String candidate_exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          $sig=@(Select-String candidate_exports.txt -Pattern '_SigProc')
+          if($sig.Count -ne 4){ throw "EXPORT_COUNT_FAIL $($sig.Count)" }
+          @'
+          import pathlib,re,sys
+          def ds(p):
+              t=pathlib.Path(p).read_text(errors='ignore')
+              return {x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',t,re.M|re.I)}
+          b=ds('baseline_imports.txt'); c=ds('candidate_imports.txt')
+          extra=sorted(c-b)
+          pathlib.Path('import_contract.txt').write_text('BASE='+','.join(sorted(b))+'\nCAND='+','.join(sorted(c))+'\nNEW='+','.join(extra)+'\n')
+          if extra: sys.exit(23)
+          '@ | Set-Content -Encoding ascii import_gate.py
+          python import_gate.py
+          if($LASTEXITCODE -ne 0){ throw 'NEW_IMPORT_DLL_FAIL' }
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){
+            const char* n[] = {"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"};
+            for(int i=0;i<500;i++){
+              HMODULE h=LoadLibraryA("SigProcDll-64HF.dll"); if(!h){printf("LOAD_FAIL %lu\n",GetLastError()); return 31;}
+              for(int j=0;j<4;j++){if(!GetProcAddress(h,n[j])){printf("PROC_FAIL %s %lu\n",n[j],GetLastError()); return 32;}}
+              if(!FreeLibrary(h)){printf("FREE_FAIL %lu\n",GetLastError()); return 33;}
+            }
+            puts("LOADLIBRARY_500_LOOP_PASS"); return 0;
+          }
+          '@ | Set-Content -Encoding ascii loader_smoke.c
+          cl /nologo /O2 loader_smoke.c /Fe:loader_smoke.exe
+          if($LASTEXITCODE -ne 0){ throw 'LOADER_SMOKE_BUILD_FAIL' }
+          .\loader_smoke.exe | Tee-Object loader_smoke.txt
+          if($LASTEXITCODE -ne 0){ throw 'LOADER_SMOKE_FAIL' }
+
+      - name: Package release evidence
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force release\C86_REAL_FINAL | Out-Null
+          Copy-Item SigProcDll-64HF.dll release\C86_REAL_FINAL\SigProcDll-64HF.dll
+          Copy-Item source_transport.txt,source_identity.txt,source_contract.txt,toolset.txt,baseline_identity.txt,candidate_identity.txt,baseline_headers.txt,candidate_headers.txt,baseline_exports.txt,candidate_exports.txt,baseline_imports.txt,candidate_imports.txt,import_contract.txt,loader_smoke.txt release\C86_REAL_FINAL\
+          $h=(Get-FileHash release\C86_REAL_FINAL\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @("RELEASE=C86_REAL_FINAL_C80_SHELL_LATEST_ALGO","DLL_SHA256=$h","C80_BASELINE_EXACT_REPRO=PASS","ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS","WINDOWS_2022_NATIVE_LOADLIBRARY_500_LOOP=PASS") | Set-Content release\C86_REAL_FINAL\RELEASE_MANIFEST.txt
+          Compress-Archive -Path release\C86_REAL_FINAL\* -DestinationPath release\C86_REAL_FINAL.zip -Force
+          (Get-FileHash release\C86_REAL_FINAL.zip -Algorithm SHA256).Hash.ToLowerInvariant() | Out-File release\C86_REAL_FINAL_ZIP_SHA256.txt
+
+      - name: Commit real release artifact back to isolated branch
+        run: |
+          $ErrorActionPreference='Stop'
+          git config user.name 'c86-windows-build-bot'
+          git config user.email 'c86-windows-build-bot@users.noreply.github.com'
+          git add release/C86_REAL_FINAL release/C86_REAL_FINAL.zip release/C86_REAL_FINAL_ZIP_SHA256.txt
+          git commit -m 'C86 real final: exact C80 shell plus latest algorithm' 
+          git push origin HEAD:c86-real-final-20260815
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: C86-REAL-FINAL-${{ github.run_id }}
+          path: |
+            release/C86_REAL_FINAL
+            release/C86_REAL_FINAL.zip
+            release/C86_REAL_FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
