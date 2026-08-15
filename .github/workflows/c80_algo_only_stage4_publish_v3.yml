@@ -1,0 +1,68 @@
+name: c80-algo-only-stage4-publish-v3
+on:
+  workflow_run:
+    workflows: ['c80-algo-only-stage3-wait-release-v3']
+    types: [completed]
+    branches: [c80-algo-only-reset-20260815]
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  publish-v3:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c80-algo-only-reset-20260815
+      - name: Revalidate authoritative V3 release bytes
+        run: |
+          $ErrorActionPreference='Stop'
+          $root='.c80_release_v3'
+          foreach($f in @('C86_V69_C80_BASELINE_ALGO_ONLY.zip','SigProcDll-64HF.dll','MANIFEST_RELEASE.txt','SHA256SUMS.txt','RELEASE_ZIP_SHA256.txt','STAGE3_V3_PASS.lock')){ if(!(Test-Path (Join-Path $root $f))){ throw "V3_FILE_MISSING $f" } }
+          if(-not (Select-String (Join-Path $root 'STAGE3_V3_PASS.lock') -SimpleMatch 'STAGE3_V3_RELEASE_GATE=PASS' -Quiet)){ throw 'V3_PASS_LOCK_INVALID' }
+          $expected=(Select-String (Join-Path $root 'RELEASE_ZIP_SHA256.txt') -Pattern 'ZIP_SHA256=([0-9a-fA-F]{64})').Matches.Groups[1].Value.ToLowerInvariant()
+          $actual=(Get-FileHash (Join-Path $root 'C86_V69_C80_BASELINE_ALGO_ONLY.zip') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $expected){ throw 'V3_ZIP_SHA_MISMATCH' }
+          $dllsha=(Get-FileHash (Join-Path $root 'SigProcDll-64HF.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if(-not (Select-String (Join-Path $root 'MANIFEST_RELEASE.txt') -SimpleMatch "DLL_SHA256=$dllsha" -Quiet)){ throw 'V3_DLL_MANIFEST_BIND_FAIL' }
+          "V3_ZIP_SHA256=$actual`nV3_DLL_SHA256=$dllsha" | Out-File PUBLISH_V3_IDENTITY.txt
+      - name: Publish exact V3 tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $tag='c86-v69-c80-algo-only-v3-20260815'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if($LASTEXITCODE -eq 0){ gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag }
+          @'
+          Authoritative C86-V69 C80-BASELINE-ALGO-ONLY V3.
+          Created only after exact reproduction of the field-working C80 binary, proof that only two algorithm files changed, historical x86/4-ABI/loader gates, canonical loader contract, complete native Windows 13-GHF regression, 20,000-loop stability, two-thread stress, 1Hz realtime and vital suppression/recovery gates, plus independent Windows-2022 and Windows-2025 loader compatibility.
+          Field action: replace SigProcDll-64HF.dll only. Do not overwrite/delete license, bed model, signal, bias or parameter files.
+          '@ | Set-Content -Encoding utf8 release_v3_notes.txt
+          gh release create $tag `
+            .c80_release_v3\C86_V69_C80_BASELINE_ALGO_ONLY.zip `
+            .c80_release_v3\SigProcDll-64HF.dll `
+            .c80_release_v3\MANIFEST_RELEASE.txt `
+            .c80_release_v3\SHA256SUMS.txt `
+            .c80_release_v3\RELEASE_ZIP_SHA256.txt `
+            .c80_release_v3\STAGE3_V3_PASS.lock `
+            PUBLISH_V3_IDENTITY.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target c80-algo-only-reset-20260815 `
+            --title 'C86-V69 C80 Baseline Algorithm-Only V3' `
+            --notes-file release_v3_notes.txt
+          if($LASTEXITCODE -ne 0){ throw 'V3_RELEASE_CREATE_FAIL' }
+          'STAGE4_V3_PUBLISH=PASS' | Out-File STAGE4_V3_PUBLISH_PASS.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-stage4-v3-publish-${{ github.run_id }}
+          path: |
+            PUBLISH_V3_IDENTITY.txt
+            STAGE4_V3_PUBLISH_PASS.lock
+          retention-days: 30
