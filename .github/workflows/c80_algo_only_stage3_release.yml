@@ -1,0 +1,151 @@
+name: c80-algo-only-stage3-release
+on:
+  push:
+    branches:
+      - c80-algo-only-reset-20260815
+    paths:
+      - '.c80_exact_candidate/stage2/C80_ALGO_ONLY_STAGE2_PASS.lock'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  compatibility:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure x86 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Native loader and ABI compatibility
+        run: |
+          $ErrorActionPreference='Stop'
+          $dll='.c80_exact_candidate\SigProcDll-64HF.dll'
+          if(!(Test-Path $dll)){ throw 'CANDIDATE_MISSING' }
+          dumpbin /headers $dll | Out-File headers.txt
+          dumpbin /exports $dll | Out-File exports.txt
+          if(-not (Select-String headers.txt -SimpleMatch '14C machine (x86)' -Quiet)){ throw 'NOT_X86' }
+          foreach($e in @('_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0')){ if(-not (Select-String exports.txt -SimpleMatch $e -Quiet)){ throw "MISSING_EXPORT $e" } }
+          Copy-Item $dll SigProcDll-64HF.dll
+          @'
+          #include <windows.h>
+          #include <stdio.h>
+          int main(void){ HMODULE h=LoadLibraryA("SigProcDll-64HF.dll"); if(!h){printf("LOAD_FAIL=%lu\n",GetLastError()); return 10;} const char*n[]={"_SigProc@24","_SigProc_Fini@0","_SigProc_Init@8","_SigProc_Stat@0"}; for(int i=0;i<4;i++){if(!GetProcAddress(h,n[i])){printf("PROC_FAIL=%s err=%lu\n",n[i],GetLastError());return 20+i;}} if(!FreeLibrary(h))return 30; puts("COMPAT_LOADER_PASS"); return 0; }
+          '@ | Set-Content -Encoding ascii compat.c
+          cl /nologo /O2 /Fe:compat.exe compat.c
+          if($LASTEXITCODE -ne 0){ throw 'COMPAT_COMPILE_FAIL' }
+          .\compat.exe 2>&1 | Tee-Object compat.log
+          if($LASTEXITCODE -ne 0){ throw "COMPAT_RUN_FAIL rc=$LASTEXITCODE" }
+          if(-not (Select-String compat.log -SimpleMatch 'COMPAT_LOADER_PASS' -Quiet)){ throw 'COMPAT_PASS_MARKER_MISSING' }
+          "OS=${{ matrix.os }}`nX86=PASS`nEXACT_4_ABI=PASS`nLOADLIBRARY=PASS" | Out-File compatibility_${{ matrix.os }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-compat-${{ matrix.os }}-${{ github.run_id }}
+          path: compatibility_${{ matrix.os }}.txt
+          retention-days: 30
+
+  package:
+    needs: compatibility
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all prior hard gates
+        run: |
+          $ErrorActionPreference='Stop'
+          $req=@(
+            '.c80_exact_candidate\SigProcDll-64HF.dll',
+            '.c80_exact_candidate\C80_REPRODUCTION_PASS.txt',
+            '.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt',
+            '.c80_exact_candidate\ABI_LOADER_SURFACE_PASS.txt',
+            '.c80_exact_candidate\STAGE1_PASS.lock',
+            '.c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock',
+            '.c80_exact_candidate\stage2\loader_contract.log',
+            '.c80_exact_candidate\stage2\full_regression.log'
+          )
+          foreach($f in $req){ if(!(Test-Path $f)){ throw "RELEASE_EVIDENCE_MISSING $f" } }
+          if(-not (Select-String '.c80_exact_candidate\C80_REPRODUCTION_PASS.txt' -SimpleMatch 'C80_EXACT_REPRODUCTION=PASS' -Quiet)){ throw 'C80_REPRO_GATE_NOT_PASS' }
+          if(-not (Select-String '.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt' -SimpleMatch 'ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS' -Quiet)){ throw 'ALGO_ONLY_GATE_NOT_PASS' }
+          if(-not (Select-String '.c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock' -SimpleMatch 'FULL_NATIVE_REGRESSION=PASS' -Quiet)){ throw 'FULLREG_GATE_NOT_PASS' }
+      - name: Build deterministic delivery folder and ZIP
+        run: |
+          $ErrorActionPreference='Stop'
+          $name='C86_V69_C80_BASELINE_ALGO_ONLY'
+          New-Item -ItemType Directory -Force $name\EVIDENCE | Out-Null
+          Copy-Item .c80_exact_candidate\SigProcDll-64HF.dll $name\SigProcDll-64HF.dll
+          Copy-Item .c80_exact_candidate\C80_REPRODUCTION_PASS.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\ABI_LOADER_SURFACE_PASS.txt $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\C80_ALGO_ONLY_STAGE2_PASS.lock $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\loader_contract.log $name\EVIDENCE\
+          Copy-Item .c80_exact_candidate\stage2\full_regression.log $name\EVIDENCE\
+          $dllsha=(Get-FileHash $name\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          @"
+          观护智能床垫 SigProc DLL 发布包
+          版本: C86-V69 C80-BASELINE-ALGO-ONLY
+          发布原则: 以现场已验证可运行的 C80 原始 VS2022/v143/Release|Win32 工程为唯一基线，仅替换 sigproc_rebuild.c 与 sigproc_rebuild.h 两个算法文件。
+
+          现场替换:
+          1. 完全停止 SigProc 服务/进程。
+          2. 只备份并替换 SigProcDll-64HF.dll。
+          3. 不删除、不覆盖 Wittower_ID_License、file_sig、file_bias、file_bed_model_v1、参数文件及其它运行文件。
+          4. 启动服务后观察日志和实时数据。
+
+          禁止事项:
+          - 不使用 C82-C85 的发布 wrapper/跨平台重链接路径。
+          - 不更改 4 个历史 stdcall ABI。
+          - 不扩大 DLL 对现场运行文件的所有权。
+
+          DLL_SHA256=$dllsha
+          "@ | Set-Content -Encoding utf8 $name\README_现场替换.txt
+          @"
+          RELEASE=C86-V69-C80-BASELINE-ALGO-ONLY
+          DLL_SHA256=$dllsha
+          BASELINE_C80_EXPECTED_SHA256=9abc438d7b42ee9e2aaf4fafa12a3a30094647658b9eba756f16b52068b45180
+          BASELINE_CORE_SHA256=1ad602b0fec836e551a72882864b3a47b3e5d3a44e7c22145491cc8fb7aac8de
+          CANDIDATE_CORE_SHA256=c4b0b006295091a276c118000ccac0a5e698cea9100d39702224a65ab2c7f83a
+          CANDIDATE_HEADER_SHA256=f3eee4b0ffd39f6f29e5ac38b656b84eb4dff079d1bb5caed7338e1456099b03
+          C80_EXACT_REPRODUCTION=PASS
+          ONLY_TWO_ALGORITHM_FILES_CHANGED=PASS
+          ABI_LOADER_SURFACE=PASS
+          STAGE2_FULL_NATIVE_WINDOWS_REGRESSION=PASS
+          WINDOWS_2022_LOADER_COMPAT=PASS
+          WINDOWS_2025_LOADER_COMPAT=PASS
+          "@ | Set-Content -Encoding ascii $name\MANIFEST_RELEASE.txt
+          Get-ChildItem $name -Recurse -File | Sort-Object FullName | ForEach-Object { $h=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); "$h  $($_.FullName.Substring((Resolve-Path $name).Path.Length+1))" } | Set-Content -Encoding ascii $name\SHA256SUMS.txt
+          if(Test-Path "$name.zip"){ Remove-Item "$name.zip" -Force }
+          Compress-Archive -Path $name -DestinationPath "$name.zip" -CompressionLevel Optimal
+          $zipsha=(Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "ZIP_SHA256=$zipsha" | Out-File RELEASE_ZIP_SHA256.txt
+          New-Item -ItemType Directory -Force .c80_release | Out-Null
+          Copy-Item "$name.zip" .c80_release\C86_V69_C80_BASELINE_ALGO_ONLY.zip
+          Copy-Item $name\SigProcDll-64HF.dll .c80_release\SigProcDll-64HF.dll
+          Copy-Item $name\MANIFEST_RELEASE.txt .c80_release\MANIFEST_RELEASE.txt
+          Copy-Item RELEASE_ZIP_SHA256.txt .c80_release\RELEASE_ZIP_SHA256.txt
+      - name: Commit exact gated delivery to isolated branch
+        run: |
+          $ErrorActionPreference='Stop'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c80_release
+          git commit -m 'Release C86 V69 exact C80-baseline algorithm-only DLL'
+          git push origin HEAD:c80-algo-only-reset-20260815
+      - uses: actions/upload-artifact@v4
+        with:
+          name: C86-V69-C80-BASELINE-ALGO-ONLY-${{ github.run_id }}
+          path: |
+            .c80_release/C86_V69_C80_BASELINE_ALGO_ONLY.zip
+            .c80_release/SigProcDll-64HF.dll
+            .c80_release/MANIFEST_RELEASE.txt
+            .c80_release/RELEASE_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
