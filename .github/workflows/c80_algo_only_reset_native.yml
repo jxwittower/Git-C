@@ -33,7 +33,7 @@ jobs:
           $h=(Get-FileHash reset_payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
           if($h -ne $env:PAYLOAD_SHA){ throw "PAYLOAD_SHA_FAIL $h" }
           7z x -y reset_payload.tar.xz | Out-Null
-          7z x -y c80_algo_only_reset_payload.tar | Out-Null
+          7z x -y reset_payload.tar | Out-Null
           gdown $env:PERSON_ID -O person.7z
           if($LASTEXITCODE -ne 0){ throw 'PERSON_DOWNLOAD_FAIL' }
           gdown $env:EMPTY_ID -O empty.7z
