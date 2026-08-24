@@ -1,0 +1,154 @@
+name: c93-native-inner7-mail-replay
+
+on:
+  push:
+    branches: [c93-v76-replay-20260824]
+    paths:
+      - '.github/workflows/c93_native_mail_replay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  native-inner7:
+    runs-on: windows-2022
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c93-v76-replay-20260824
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create one-time mailbox and RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, secrets, string, urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'; ds=req('GET',base+'/domains'); members=ds if isinstance(ds,list) else ds.get('hydra:member',[])
+          if not members:raise SystemExit('MAILTM_NO_DOMAIN')
+          alpha=string.ascii_lowercase+string.digits; user='c93'+''.join(secrets.choice(alpha) for _ in range(16)); pwd=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32)); addr=user+'@'+members[0]['domain']
+          req('POST',base+'/accounts',{'address':addr,'password':pwd}); tok=req('POST',base+'/token',{'address':addr,'password':pwd})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'password':pwd,'token':tok}))
+          Path('mailbox.txt').write_text(addr+'\n'); Path('subject.txt').write_text('C93-NATIVE-INNER7-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('MAILBOX='+addr); print('SUBJECT='+Path('subject.txt').read_text().strip())
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\make_mail.py
+          python $env:RUNNER_TEMP\make_mail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          New-Item -ItemType Directory -Force .c93_mail_handoff | Out-Null
+          Copy-Item public.pem,mailbox.txt,subject.txt .c93_mail_handoff\ -Force
+          git add .c93_mail_handoff
+          git commit -m 'Publish C93 native mail handoff'
+          git push origin HEAD:c93-v76-replay-20260824
+
+      - name: Receive encrypted payload and wrapped key
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text()); tok=cfg['token']; base='https://api.mail.tm'; subject=Path('subject.txt').read_text().strip(); out=Path('transport');out.mkdir(exist_ok=True)
+          def gj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(url):
+              r=urllib.request.Request(url);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=90) as x:return x.read()
+          got=set();seen=set();deadline=time.time()+270
+          while time.time()<deadline and len(got)<2:
+              z=gj(base+'/messages');msgs=z if isinstance(z,list) else z.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject')!=subject or m['id'] in seen:continue
+                  seen.add(m['id']);d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if n not in ('c93_inner7_payload.enc','c93_inner7_key.bin') or not u:continue
+                      (out/n).write_bytes(gb(urllib.parse.urljoin(base,u)));got.add(n)
+              if len(got)<2:time.sleep(2)
+          if len(got)!=2:raise SystemExit('MAIL_PAYLOAD_INCOMPLETE '+repr(got))
+          print('MAIL_PAYLOAD_COMPLETE')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py
+          if((Get-Item transport\c93_inner7_key.bin).Length -ne 384){ throw 'WRAPPED_KEY_SIZE_FAIL' }
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\c93_inner7_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in transport\c93_inner7_payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          $sha=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant(); if($sha -ne '283e68bec9e87976c717f8609d4f874a1020c51f889747abe135640c497d36c9'){ throw "PAYLOAD_SHA_FAIL $sha" }
+          New-Item -ItemType Directory -Force payload | Out-Null
+          tar -xJf $env:RUNNER_TEMP\payload.tar.xz -C payload --strip-components=1
+          $dsha=(Get-FileHash payload\bin\C93.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($dsha -ne 'e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae'){throw "DLL_SHA_FAIL $dsha"}
+          xz -dc payload\data\inner_slow7.ghr.xz > payload\input.ghr
+          Remove-Item -Force $env:RUNNER_TEMP\pass.txt,$env:RUNNER_TEMP\private.pem -ErrorAction SilentlyContinue
+          'NATIVE_PAYLOAD_BINDING_PASS' | Out-File payload_binding.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build and run real-cadence replay
+        shell: powershell
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef uint32_t (__stdcall *PF)(const uint32_t*,const void*,int,void*,void*,void*);typedef int (__stdcall *IF)(char*,void*);typedef void (__stdcall *FF)(void);typedef uint8_t (__stdcall *SF)(void);
+          static uint32_t ids[2048];static uint16_t w[8192];static unsigned char st[0x105c],rs[0x786];static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
+          int main(void){FILE*f=fopen("input.ghr","rb"),*o;char m4[4],prod[160]={0};uint32_t n,i,rel,c,k,seq=0;unsigned char lic[4]={1,0,0,0};HMODULE m;PF p;IF init;FF fini;SF stat;if(!f)return 10;if(!rd(f,m4,4)||memcmp(m4,"GHR1",4)||!rd(f,&n,4))return 11;m=LoadLibraryA("SigProcDll-64HF.dll");if(!m){printf("LOAD_FAIL %lu\n",GetLastError());return 12;}p=(PF)GetProcAddress(m,"_SigProc@24");init=(IF)GetProcAddress(m,"_SigProc_Init@8");fini=(FF)GetProcAddress(m,"_SigProc_Fini@0");stat=(SF)GetProcAddress(m,"_SigProc_Stat@0");if(!p||!init||!fini||!stat)return 13;if(!init(prod,lic))return 14;printf("INIT_PASS STAT=%u PRODUCT=%s RECORDS=%u\n",(unsigned)stat(),prod,n);o=fopen("state.csv","w");fprintf(o,"rel_ms,u16_0,u16_2,u16_4176\n");for(i=0;i<n;i++){if(!rd(f,&rel,4)||!rd(f,&c,4)||c>2048)return 20;if(c&&(!rd(f,ids,c*4)||!rd(f,w,c*8)))return 21;if(c){for(k=0;k<c;k+=32){uint32_t z=c-k;if(z>32)z=32;seq=p(ids+k,w+k*4,(int)z,0,st,rs);Sleep(50);}}else{seq=p(0,0,0,0,st,rs);Sleep(1000);} {uint16_t a,b,d;memcpy(&a,st,2);memcpy(&b,st+2,2);memcpy(&d,st+4176,2);fprintf(o,"%u,%u,%u,%u\n",rel,a,b,d);fflush(o);}if(i%25==0){printf("REC %u/%u rel=%u seq=%u stat=%u\n",i,n,rel,seq,(unsigned)stat());fflush(stdout);}}fclose(o);fclose(f);fini();printf("DONE STAT=%u\n",(unsigned)stat());FreeLibrary(m);return 0;}
+          '@ | Set-Content -Encoding ascii payload\native_replay.c
+          Push-Location payload
+          try { cl /nologo /O2 /W4 /MT native_replay.c /Fe:NativeReplay.exe *>&1 | Tee-Object -FilePath ..\native_build.txt; if($LASTEXITCODE -ne 0){throw "BUILD_RC=$LASTEXITCODE"} } finally { Pop-Location }
+          $run=Join-Path (Get-Location) 'payload\run';New-Item -ItemType Directory -Force $run|Out-Null;Copy-Item payload\NativeReplay.exe,payload\input.ghr $run\;Copy-Item payload\bin\C93.dll $run\SigProcDll-64HF.dll;Copy-Item payload\sidecars\* $run\
+          Push-Location $run
+          try {$env:SIGPROC_REBUILD_DEBUG_CSV='rebuild.csv';$env:SIGPROC_RR_SHADOW_DEBUG_CSV='rrshadow.csv';$env:SIGPROC_BED_CAL_DEBUG_CSV='bedcal.csv';$env:SIGPROC_ENERGY_DEBUG_CSV='energy.csv';$env:SIGPROC_PHYSICS_DEBUG_CSV='physics.csv';.\NativeReplay.exe *>&1 | Tee-Object native_replay.log;if($LASTEXITCODE -ne 0){throw "REPLAY_RC=$LASTEXITCODE"}} finally {Pop-Location}
+
+      - name: Analyze and commit result
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          @'
+          import csv,pathlib,statistics,collections,hashlib
+          p=pathlib.Path('payload/run');out=['C93_NATIVE_WINDOWS_INNER7_REPLAY']
+          if (p/'SigProcDll-64HF.dll').exists():out.append('DLL_SHA256='+hashlib.sha256((p/'SigProcDll-64HF.dll').read_bytes()).hexdigest())
+          if (p/'rebuild.csv').exists():
+            r=list(csv.DictReader((p/'rebuild.csv').open(newline='')));num=lambda x,k,d=0:float(x.get(k,d) or d)
+            maxreal=max((num(x,'real_channel_count') for x in r),default=0);maxactive=max((num(x,'active_count') for x in r),default=0);minbad=min((num(x,'bad_channels',64) for x in r),default=64);maxclock=max((num(x,'sample_clock_windows') for x in r),default=0)
+            rates=[int(float(x['rr_rate'])) for x in r if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]; f0=(329000-147000)/(480000-147000);f1=(416000-147000)/(480000-147000);a=round(f0*len(r));b=round(f1*len(r));ev=r[a:b];evr=[int(float(x['rr_rate'])) for x in ev if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]
+            out.append(f'REBUILD_ROWS={len(r)} MAX_REAL_CHANNELS={maxreal:g} MAX_ACTIVE_CHANNELS={maxactive:g} MIN_BAD_CHANNELS={minbad:g} MAX_SAMPLE_CLOCK_WINDOWS={maxclock:g}')
+            out.append(f'ALL_RR_VALID={len(rates)}/{len(r)}')
+            out.append(f'SLOW7_APPROX_VALID_RR={len(evr)}/{len(ev)} MEDIAN={(statistics.median(evr) if evr else "NA")} COUNTS={dict(collections.Counter(evr).most_common(12))}')
+          else:out.append('REBUILD_CSV_MISSING')
+          if (p/'state.csv').exists():
+            s=list(csv.DictReader((p/'state.csv').open(newline='')));e=[x for x in s if 329000<=int(x['rel_ms'])<=416000];v=[int(x['u16_0']) for x in e if int(x['u16_0'])!=65535];out.append(f'SLOW7_EXACT_SECONDS={len(e)} OFFSET0_VALID={len(v)}/{len(e)} MEDIAN={(statistics.median(v) if v else "NA")} COUNTS={dict(collections.Counter(v).most_common(12))}')
+          verdict='C93_NATIVE_REAL_CHANNEL_GATE_FAIL' if any(x.startswith('REBUILD_ROWS=') and 'MAX_REAL_CHANNELS=0 ' in x for x in out) else 'C93_NATIVE_COMPLETED_REVIEW_METRICS'
+          out.append('VERDICT='+verdict);pathlib.Path('C93_NATIVE_INNER7_RESULT.txt').write_text('\n'.join(out)+'\n');print('\n'.join(out))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\an.py
+          python $env:RUNNER_TEMP\an.py | Tee-Object analysis_console.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;New-Item -ItemType Directory -Force evidence_summary|Out-Null;if(Test-Path C93_NATIVE_INNER7_RESULT.txt){Copy-Item C93_NATIVE_INNER7_RESULT.txt evidence_summary\C93_NATIVE_INNER7_RESULT.txt -Force};git add evidence_summary;git commit -m 'Record C93 native inner7 mail replay result' 2>$null;if($LASTEXITCODE -eq 0){git push origin HEAD:c93-v76-replay-20260824}
+
+      - name: Cleanup handoff
+        if: always()
+        shell: bash
+        run: |
+          set +e;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;rm -rf .c93_mail_handoff;git add -A .c93_mail_handoff;if ! git diff --cached --quiet;then git commit -m 'Remove C93 native mail handoff';git push origin HEAD:c93-v76-replay-20260824||true;fi
