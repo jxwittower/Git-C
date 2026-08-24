@@ -1,0 +1,53 @@
+name: c93-grabmail-transport-probe
+
+on:
+  push:
+    branches: [c93-v76-replay-20260824]
+    paths:
+      - '.github/workflows/c93_grabmail_probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c93-v76-replay-20260824
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Poll GrabMail public REST inbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          addr='c93v76native32724k9m2x7@grabmail.io'
+          subj='C93-GRABMAIL-PROBE-20260824'
+          id=''
+          for i in $(seq 1 120); do
+            json=$(curl -fsSG https://grabmail.io/api/v1/mailbox --data-urlencode "address=$addr")
+            id=$(printf '%s' "$json" | jq -r --arg s "$subj" '.messages[]? | select(.subject==$s) | .id' | head -1)
+            [ -n "$id" ] && break
+            sleep 1
+          done
+          [ -n "$id" ] || { echo GRABMAIL_PROBE_TIMEOUT; exit 20; }
+          msg=$(curl -fsSG "https://grabmail.io/api/v1/message/$id" --data-urlencode "mailbox=$addr")
+          printf '%s' "$msg" | jq -e '.text | contains("C93_GRABMAIL_TRANSPORT_PROBE_PASS_TOKEN_20260824")' >/dev/null
+          printf 'GRABMAIL_TRANSPORT_PASS\nADDRESS=%s\nSUBJECT=%s\nMESSAGE_ID=%s\n' "$addr" "$subj" "$id" | tee C93_GRABMAIL_PROBE_PASS.txt
+      - name: Commit probe result
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git config user.name c93-native-test-bot
+          git config user.email c93-native-test-bot@users.noreply.github.com
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          mkdir -p evidence_summary
+          if [ -f C93_GRABMAIL_PROBE_PASS.txt ]; then cp C93_GRABMAIL_PROBE_PASS.txt evidence_summary/; fi
+          git add evidence_summary
+          git commit -m 'Record C93 GrabMail transport probe result' >/dev/null 2>&1 || true
+          git push origin HEAD:c93-v76-replay-20260824 || true
