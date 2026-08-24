@@ -1,0 +1,221 @@
+name: c93-native-inner7-replay
+
+on:
+  push:
+    branches: [c93-v76-replay-20260824]
+    paths:
+      - '.github/workflows/c93_native_replay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-inner7:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c93-v76-replay-20260824
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish one-time RSA transport key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          rm -rf .c93_native_handoff
+          mkdir -p .c93_native_handoff
+          cp "$RUNNER_TEMP/public.pem" .c93_native_handoff/public.pem
+          git add .c93_native_handoff/public.pem
+          git commit -m 'Publish C93 native replay one-time RSA key'
+          git push origin HEAD:c93-v76-replay-20260824
+          echo C93_NATIVE_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for encrypted replay payload
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 210); do
+            git fetch -q origin c93-v76-replay-20260824 || true
+            if git cat-file -e origin/c93-v76-replay-20260824:.c93_native_handoff/payload.done 2>/dev/null && git cat-file -e origin/c93-v76-replay-20260824:.c93_native_handoff/key.enc.b64 2>/dev/null; then
+              ok=1; break
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo C93_NATIVE_PAYLOAD_TIMEOUT; exit 20; }
+          mkdir -p "$RUNNER_TEMP/transport"
+          git show origin/c93-v76-replay-20260824:.c93_native_handoff/key.enc.b64 > "$RUNNER_TEMP/transport/key.enc.b64"
+          git ls-tree -r --name-only origin/c93-v76-replay-20260824 .c93_native_handoff | grep '^.c93_native_handoff/payload_[0-9][0-9]\.b64$' | sort > "$RUNNER_TEMP/transport/chunks.txt"
+          [ -s "$RUNNER_TEMP/transport/chunks.txt" ] || { echo NO_PAYLOAD_CHUNKS; exit 21; }
+          : > "$RUNNER_TEMP/transport/payload.b64"
+          while read -r f; do git show "origin/c93-v76-replay-20260824:$f" >> "$RUNNER_TEMP/transport/payload.b64"; done < "$RUNNER_TEMP/transport/chunks.txt"
+          tr -d '[:space:]' < "$RUNNER_TEMP/transport/key.enc.b64" | base64 -d > "$RUNNER_TEMP/transport/key.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/transport/key.enc" -out "$RUNNER_TEMP/transport/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          tr -d '[:space:]' < "$RUNNER_TEMP/transport/payload.b64" | base64 -d > "$RUNNER_TEMP/transport/payload.enc"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/transport/payload.enc" -out "$RUNNER_TEMP/payload.tar.xz" -pass file:"$RUNNER_TEMP/transport/pass.txt"
+          got=$(sha256sum "$RUNNER_TEMP/payload.tar.xz" | awk '{print $1}')
+          echo PAYLOAD_SHA256=$got
+          [ "$got" = '283e68bec9e87976c717f8609d4f874a1020c51f889747abe135640c497d36c9' ] || { echo PAYLOAD_SHA_MISMATCH; exit 22; }
+          rm -rf payload
+          mkdir payload
+          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C payload --strip-components=1
+          dll=$(sha256sum payload/bin/C93.dll | awk '{print $1}')
+          [ "$dll" = 'e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae' ] || { echo C93_DLL_SHA_MISMATCH; exit 23; }
+          xz -dc payload/data/inner_slow7.ghr.xz > payload/input.ghr
+          echo C93_NATIVE_PAYLOAD_BINDING_PASS
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build native real-cadence replay host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > payload/native_replay.c <<'EOF'
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          typedef uint32_t (__stdcall *ProcFn)(const uint32_t*,const void*,int,void*,void*,void*);
+          typedef int (__stdcall *InitFn)(char*,void*);
+          typedef void (__stdcall *FiniFn)(void);
+          typedef uint8_t (__stdcall *StatFn)(void);
+          static uint32_t ids[2048];
+          static uint16_t words[2048*4];
+          static uint8_t st[0x105c];
+          static uint8_t rs[0x786];
+          static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
+          int main(void){
+            FILE *f=fopen("input.ghr","rb"),*o; char magic[4],product[160]={0}; uint32_t n=0,i,rel,c,k,seq=0; unsigned char lic[4]={1,0,0,0};
+            HMODULE m; ProcFn proc; InitFn init; FiniFn fini; StatFn stat;
+            if(!f){puts("INPUT_OPEN_FAIL");return 10;} if(!rd(f,magic,4)||memcmp(magic,"GHR1",4)||!rd(f,&n,4)){puts("INPUT_HEADER_FAIL");return 11;}
+            m=LoadLibraryA("SigProcDll-64HF.dll"); if(!m){printf("LOAD_FAIL %lu\n",GetLastError());return 12;}
+            proc=(ProcFn)GetProcAddress(m,"_SigProc@24"); init=(InitFn)GetProcAddress(m,"_SigProc_Init@8"); fini=(FiniFn)GetProcAddress(m,"_SigProc_Fini@0"); stat=(StatFn)GetProcAddress(m,"_SigProc_Stat@0");
+            if(!proc||!init||!fini||!stat){puts("EXPORT_FAIL");return 13;} if(!init(product,lic)){puts("INIT_FAIL");return 14;}
+            printf("INIT_PASS STAT=%u PRODUCT=%s RECORDS=%u\n",(unsigned)stat(),product,n);
+            o=fopen("native_state_offsets.csv","w"); if(o)fprintf(o,"rel_ms,seq,stat,u16_0,u16_2,u16_4176,u16_6110,u16_6112\n");
+            for(i=0;i<n;i++){
+              if(!rd(f,&rel,4)||!rd(f,&c,4)||c>2048){printf("READ_REC_FAIL %u\n",i);return 20;}
+              if(c && (!rd(f,ids,c*4)||!rd(f,words,c*8))){printf("READ_PAYLOAD_FAIL %u\n",i);return 21;}
+              if(c){for(k=0;k<c;k+=32){uint32_t nc=c-k; if(nc>32)nc=32; seq=proc(ids+k,words+k*4,(int)nc,0,st,rs); Sleep(50);}}
+              else {seq=proc(0,0,0,0,st,rs); Sleep(1000);}
+              if(o){uint16_t a,b,c1,d,e; memcpy(&a,st+0,2);memcpy(&b,st+2,2);memcpy(&c1,st+4176,2);memcpy(&d,rs+(6110-0x105c),2);memcpy(&e,rs+(6112-0x105c),2);fprintf(o,"%u,%u,%u,%u,%u,%u,%u,%u\n",rel,seq,(unsigned)stat(),a,b,c1,d,e);fflush(o);}
+              if((i%25)==0){printf("REC %u/%u rel=%u seq=%u stat=%u\n",i,n,rel,seq,(unsigned)stat());fflush(stdout);}
+            }
+            if(o)fclose(o);fclose(f);fini();printf("DONE STAT=%u\n",(unsigned)stat());FreeLibrary(m);return 0;
+          }
+          EOF
+          cd payload
+          cl /nologo /O2 /W4 /MT native_replay.c /Fe:NativeReplay.exe > ../native_build.txt 2>&1
+          cat ../native_build.txt
+          test -s NativeReplay.exe
+
+      - name: Run C93 natively at real CAN cadence
+        shell: powershell
+        timeout-minutes: 9
+        run: |
+          $ErrorActionPreference='Stop'
+          $run=Join-Path (Get-Location) 'payload\run'
+          New-Item -ItemType Directory -Force $run | Out-Null
+          Copy-Item payload\NativeReplay.exe $run\NativeReplay.exe
+          Copy-Item payload\input.ghr $run\input.ghr
+          Copy-Item payload\bin\C93.dll $run\SigProcDll-64HF.dll
+          Copy-Item payload\sidecars\* $run\
+          Push-Location $run
+          try {
+            $env:SIGPROC_REBUILD_DEBUG_CSV='rebuild.csv'
+            $env:SIGPROC_RR_SHADOW_DEBUG_CSV='rrshadow.csv'
+            $env:SIGPROC_BED_CAL_DEBUG_CSV='bedcal.csv'
+            $env:SIGPROC_ENERGY_DEBUG_CSV='energy.csv'
+            $env:SIGPROC_PHYSICS_DEBUG_CSV='physics.csv'
+            .\NativeReplay.exe *>&1 | Tee-Object -FilePath native_replay.log
+            if($LASTEXITCODE -ne 0){ throw "NATIVE_REPLAY_RC=$LASTEXITCODE" }
+          } finally { Pop-Location }
+
+      - name: Analyze native evidence
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import csv, pathlib, statistics, collections, hashlib
+          p=pathlib.Path('payload/run')
+          rows=list(csv.DictReader((p/'rebuild.csv').open(newline='')))
+          if not rows: raise SystemExit('NO_REBUILD_ROWS')
+          def num(x,k,d=0.0):
+              try:return float(x.get(k,d))
+              except:return d
+          max_real=max(num(x,'real_channel_count') for x in rows)
+          max_active=max(num(x,'active_count') for x in rows)
+          min_bad=min(num(x,'bad_channels',64) for x in rows)
+          max_clock=max(num(x,'sample_clock_windows') for x in rows)
+          rates=[int(float(x['rr_rate'])) for x in rows if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]
+          hrs=[int(float(x['hr_rate'])) for x in rows if x.get('hr_rate') and int(float(x['hr_rate']))!=65535]
+          # Input covers rel 147000..480000. Historical slow-RR event is rel 329000..416000.
+          f0=(329000-147000)/(480000-147000); f1=(416000-147000)/(480000-147000)
+          a=max(0,min(len(rows)-1,round(f0*len(rows)))); b=max(a+1,min(len(rows),round(f1*len(rows))))
+          ev=rows[a:b]
+          evrates=[int(float(x['rr_rate'])) for x in ev if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]
+          evstatus=collections.Counter(x.get('rr_status','') for x in ev)
+          evcounts=collections.Counter(evrates)
+          state=list(csv.DictReader((p/'native_state_offsets.csv').open(newline='')))
+          exact=[x for x in state if 329000<=int(x['rel_ms'])<=416000]
+          off0=[int(x['u16_0']) for x in exact]
+          valid0=[x for x in off0 if x!=65535]
+          out=[]
+          out.append('C93_NATIVE_WINDOWS_INNER7_REPLAY')
+          out.append('DLL_SHA256='+hashlib.sha256((p/'SigProcDll-64HF.dll').read_bytes()).hexdigest())
+          out.append(f'REBUILD_ROWS={len(rows)} MAX_REAL_CHANNELS={max_real:g} MAX_ACTIVE_CHANNELS={max_active:g} MIN_BAD_CHANNELS={min_bad:g} MAX_SAMPLE_CLOCK_WINDOWS={max_clock:g}')
+          out.append(f'ALL_RR_VALID_ROWS={len(rates)}/{len(rows)} ALL_HR_VALID_ROWS={len(hrs)}/{len(rows)}')
+          out.append(f'SLOW7_APPROX_REBUILD_ROWS={a}:{b} VALID_RR={len(evrates)}/{len(ev)} RR_MEDIAN={(statistics.median(evrates) if evrates else "NA")} RR_COUNTS={dict(evcounts.most_common(12))} RR_STATUS={dict(evstatus)}')
+          out.append(f'SLOW7_EXACT_STATE_SECONDS={len(exact)} OFFSET0_VALID={len(valid0)}/{len(off0)} OFFSET0_MEDIAN={(statistics.median(valid0) if valid0 else "NA")} OFFSET0_COUNTS={dict(collections.Counter(valid0).most_common(12))}')
+          if max_real<=0: verdict='C93_NATIVE_REAL_CHANNEL_GATE_FAIL'
+          elif not evrates and not valid0: verdict='C93_NATIVE_SLOW7_RR_NO_RECOVERY'
+          else: verdict='C93_NATIVE_CHANNEL_GATE_PASS_REVIEW_RR'
+          out.append('VERDICT='+verdict)
+          pathlib.Path('C93_NATIVE_INNER7_RESULT.txt').write_text('\n'.join(out)+'\n',encoding='utf-8')
+          print('\n'.join(out))
+          '@ | Set-Content -Encoding UTF8 $env:RUNNER_TEMP\analyze.py
+          python $env:RUNNER_TEMP\analyze.py | Tee-Object native_analysis_console.txt
+
+      - name: Commit compact native result
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          mkdir -p evidence_summary
+          if [ -s C93_NATIVE_INNER7_RESULT.txt ]; then cp C93_NATIVE_INNER7_RESULT.txt evidence_summary/C93_NATIVE_INNER7_RESULT.txt; fi
+          if [ -s native_build.txt ]; then cp native_build.txt evidence_summary/C93_NATIVE_BUILD.txt; fi
+          git add evidence_summary
+          if ! git diff --cached --quiet; then git commit -m 'Record C93 native inner7 replay result'; git push origin HEAD:c93-v76-replay-20260824 || true; fi
+
+      - name: Cleanup encrypted handoff
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          rm -rf .c93_native_handoff
+          git add -A .c93_native_handoff
+          if ! git diff --cached --quiet; then git commit -m 'Remove C93 native replay handoff'; git push origin HEAD:c93-v76-replay-20260824 || true; fi
