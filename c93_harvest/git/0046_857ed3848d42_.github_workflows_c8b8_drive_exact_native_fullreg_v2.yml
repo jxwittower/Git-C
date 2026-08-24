@@ -1,0 +1,312 @@
+name: c8b8-drive-exact-native-fullreg-v2
+on:
+  push:
+    branches: [c8b8-drive-fullreg-20260809]
+    paths:
+      - '.github/workflows/c8b8_drive_exact_native_fullreg_v2.yml'
+permissions:
+  contents: write
+jobs:
+  exact-native-fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      EXPECTED_CANDIDATE_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      EXPECTED_HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      EXPECTED_C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      EXPECTED_SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      EXPECTED_ENC_SHA: 106072c2e04d6062ae19b9c33db99f844d5080aec6a0d55ef562eda6af98895a
+      EXPECTED_XZ_SHA: c1bde82d07768249d1a55aaa8e48bc8a3f26629f7eabddc214611106cb39173f
+      EXPECTED_GHF_COUNT: '13'
+      EXPECTED_GHF_BYTES: '82484656'
+      HANDOFF_BRANCH: c8b8-drive-fullreg-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create one-time mailbox and RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, secrets, string, urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None: r.add_header('Content-Type','application/json')
+              if token: r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x: return json.load(x)
+          base='https://api.mail.tm'
+          domains=req('GET',base+'/domains')
+          members=domains if isinstance(domains,list) else domains.get('hydra:member',[])
+          if not members: raise SystemExit('MAILTM_NO_DOMAIN')
+          domain=members[0]['domain']
+          alphabet=string.ascii_lowercase+string.digits
+          user='ghc8b8'+''.join(secrets.choice(alphabet) for _ in range(14))
+          password=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32))
+          address=user+'@'+domain
+          req('POST',base+'/accounts',{'address':address,'password':password})
+          tok=req('POST',base+'/token',{'address':address,'password':password})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':address,'password':password,'token':tok}))
+          Path('mailbox.txt').write_text(address+'\n')
+          Path('subject_prefix.txt').write_text('GuanHu-C8B8-FullregV2-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('ONE_TIME_MAILBOX_READY',address)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\make_mailbox.py
+          python $env:RUNNER_TEMP\make_mailbox.py
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_drive_fullreg_v2_handoff | Out-Null
+          Copy-Item public.pem .c8b8_drive_fullreg_v2_handoff\public.pem -Force
+          Copy-Item mailbox.txt .c8b8_drive_fullreg_v2_handoff\mailbox.txt -Force
+          Copy-Item subject_prefix.txt .c8b8_drive_fullreg_v2_handoff\subject_prefix.txt -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","EXPECTED_ENC_SHA=$env:EXPECTED_ENC_SHA","EXPECTED_CANDIDATE_SHA=$env:EXPECTED_CANDIDATE_SHA") | Set-Content .c8b8_drive_fullreg_v2_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c8b8_drive_fullreg_v2_handoff
+          git commit -m "Publish c8b8 v2 fullreg one-time handoff"
+          if($LASTEXITCODE -ne 0){ throw 'HANDOFF_COMMIT_FAIL' }
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+          if($LASTEXITCODE -ne 0){ throw 'HANDOFF_PUSH_FAIL' }
+
+      - name: Receive four ciphertext chunks and wrapped key
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json, os, time, urllib.request, urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())
+          token=cfg['token']; base='https://api.mail.tm'
+          prefix=Path('subject_prefix.txt').read_text().strip()
+          out=Path('transport'); out.mkdir(exist_ok=True)
+          wanted={f'{prefix}-P{i}':i for i in range(1,5)}
+          got=set(); key_ok=False
+          def get_json(url):
+              r=urllib.request.Request(url); r.add_header('Accept','application/json'); r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x: return json.load(x)
+          def get_bytes(url):
+              r=urllib.request.Request(url); r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=120) as x: return x.read()
+          deadline=time.time()+1500; seen=set()
+          while time.time()<deadline and (len(got)<4 or not key_ok):
+              listing=get_json(base+'/messages')
+              msgs=listing if isinstance(listing,list) else listing.get('hydra:member',[])
+              for m in msgs:
+                  subj=m.get('subject','')
+                  if subj not in wanted or m['id'] in seen: continue
+                  seen.add(m['id']); detail=get_json(base+'/messages/'+m['id']); idx=wanted[subj]
+                  for a in detail.get('attachments',[]):
+                      name=a.get('filename',''); u=a.get('downloadUrl')
+                      if not u: continue
+                      data=get_bytes(urllib.parse.urljoin(base,u))
+                      if name==f'c8b8_payload_part{idx}.bin': (out/name).write_bytes(data); got.add(idx)
+                      elif name=='c8b8_wrapped_key.bin': (out/name).write_bytes(data); key_ok=True
+              if len(got)<4 or not key_ok: time.sleep(3)
+          if len(got)!=4 or not key_ok: raise SystemExit(f'MAIL_TRANSPORT_INCOMPLETE parts={sorted(got)} key={key_ok}')
+          print('MAIL_TRANSPORT_COMPLETE parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\receive_mail.py
+          python $env:RUNNER_TEMP\receive_mail.py | Tee-Object mail_transport.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Reassemble decrypt extract and bind exact assets
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import hashlib, os
+          out=Path(os.environ['RUNNER_TEMP'])/'payload.enc'
+          with out.open('wb') as w:
+              for i in range(1,5): w.write(Path(f'transport/c8b8_payload_part{i}.bin').read_bytes())
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          print('ENC_SHA256='+h)
+          if h.lower()!=os.environ['EXPECTED_ENC_SHA'].lower(): raise SystemExit('ENC_SHA_MISMATCH')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\join_verify.py
+          python $env:RUNNER_TEMP\join_verify.py
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+          if((Get-Item transport\c8b8_wrapped_key.bin).Length -ne 384){ throw 'WRAPPED_KEY_SIZE_FAIL' }
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\c8b8_wrapped_key.bin -out $env:RUNNER_TEMP\aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){ throw 'RSA_DECRYPT_FAIL' }
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $env:RUNNER_TEMP\payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
+          if($LASTEXITCODE -ne 0){ throw 'AES_DECRYPT_FAIL' }
+          $xz=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($xz -ne $env:EXPECTED_XZ_SHA){ throw "XZ_SHA_MISMATCH $xz" }
+          New-Item -ItemType Directory -Force $env:RUNNER_TEMP\xzstage | Out-Null
+          7z x -y $env:RUNNER_TEMP\payload.tar.xz "-o$env:RUNNER_TEMP\xzstage" | Out-File sevenzip_xz.txt
+          if($LASTEXITCODE -ne 0){ throw 'XZ_EXTRACT_FAIL' }
+          $tar=Get-ChildItem $env:RUNNER_TEMP\xzstage -Filter '*.tar' | Select-Object -First 1
+          if(-not $tar){ throw 'TAR_NOT_FOUND' }
+          New-Item -ItemType Directory -Force payload | Out-Null
+          7z x -y $tar.FullName "-o$pwd\payload" | Out-File sevenzip_tar.txt
+          if($LASTEXITCODE -ne 0){ throw 'TAR_EXTRACT_FAIL' }
+          foreach($f in @('payload\SigProcDll-64HF.dll','payload\HostCompat.dll','payload\C63.dll','payload\SigProcLoaderContractSmoke.exe','payload\fullreg.c')){ if(!(Test-Path $f)){ throw "MISSING_ASSET $f" } }
+          @'
+          from pathlib import Path
+          import hashlib, os
+          checks={
+          'payload/SigProcDll-64HF.dll':os.environ['EXPECTED_CANDIDATE_SHA'],
+          'payload/HostCompat.dll':os.environ['EXPECTED_HOST_SHA'],
+          'payload/C63.dll':os.environ['EXPECTED_C63_SHA'],
+          'payload/SigProcLoaderContractSmoke.exe':os.environ['EXPECTED_SMOKE_SHA'],
+          'payload/testdata/inner-bed/01_initial_empty.ghf':'bdee0b60e66601d036925c6753f763020f517ff22504dc1080d6fd7fef16c798',
+          'payload/testdata/inner-bed/02_supine.ghf':'f9601b4f91b61bf15f554639f244ecb3617204b1102affdae5b3d7f6bfad0a7f',
+          'payload/testdata/inner-bed/03_left.ghf':'011426b2fd07ba2741a0fe890cbacb3f16766f1f7310160f6177fbbd1e557fbe',
+          'payload/testdata/inner-bed/04_right.ghf':'b5729623ddc5fed1b9a993658db1b84a699fe4a7e9a4183ef1433b7f392b4dfe',
+          'payload/testdata/inner-bed/05_free.ghf':'c4c4665fd9aff891b66aed223b67bfdb5af0a437d18385057acc7f675ad6b9cc',
+          'payload/testdata/inner-bed/06_final_empty.ghf':'6ee2b15321b1164b6f2de4b031b393a7227355d9e6b6b39dddddef57434da7e7',
+          'payload/testdata/outer-medical-bed/01_initial_empty.ghf':'226efcb270599df569b628118db8afa4e678296750afa651c5da376da79d3737',
+          'payload/testdata/outer-medical-bed/02_supine.ghf':'69f64f78d5a2e0d22f75086096117eda2d276ef734b763002d5cace97d17c7c0',
+          'payload/testdata/outer-medical-bed/03_left.ghf':'55558b1c850a5438f2815863e2102f958b4c9b137350622e36d5434a8c5da77c',
+          'payload/testdata/outer-medical-bed/04_right.ghf':'d54ae503fd68a9463fc48cbfa33af05d3b985aad8eb286d46359bf286ccc3afb',
+          'payload/testdata/outer-medical-bed/05_leave.ghf':'f2f2caa0e5e35dcc41f9d37c2bc0e70c11cc5b39062ec8025edd18394884866c',
+          'payload/testdata/outer-medical-bed/06_return_free.ghf':'99f93d049a6a84bc24bb6617f02de19b95dc17062ade0593ec33cec336dce948',
+          'payload/testdata/outer-medical-bed/07_final_empty.ghf':'4f7f9ba9a49ec39093c5883a3234bf468f2fee57c9a6392206d606ed1b9462c8'}
+          lines=[]
+          for f,e in checks.items():
+              p=Path(f); h=hashlib.sha256(p.read_bytes()).hexdigest(); lines.append(f'{h}  {f}')
+              if h.lower()!=e.lower(): raise SystemExit('SHA_FAIL '+f+' '+h)
+          ghfs=list(Path('payload/testdata').rglob('*.ghf')); total=sum(p.stat().st_size for p in ghfs)
+          if len(ghfs)!=int(os.environ['EXPECTED_GHF_COUNT']): raise SystemExit('GHF_COUNT_FAIL')
+          if total!=int(os.environ['EXPECTED_GHF_BYTES']): raise SystemExit('GHF_BYTES_FAIL')
+          Path('exact_asset_binding.txt').write_text('\n'.join(lines)+f'\nGHF_COUNT={len(ghfs)}\nGHF_BYTES={total}\nEXACT_ASSET_BINDING_PASS\n')
+          print('EXACT_ASSET_BINDING_PASS',len(ghfs),total)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\bind_assets.py
+          python $env:RUNNER_TEMP\bind_assets.py | Tee-Object ghf_hash_gate.txt
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Native PE ABI export import and stack safety gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /headers payload\SigProcDll-64HF.dll | Out-File candidate_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll | Out-File candidate_exports.txt
+          dumpbin /dependents payload\SigProcDll-64HF.dll | Out-File candidate_dependents.txt
+          dumpbin /dependents payload\HostCompat.dll | Out-File hostcompat_dependents.txt
+          @'
+          from pathlib import Path
+          import re, struct, sys
+          hdr=Path('candidate_headers.txt').read_text(errors='ignore')
+          exp=Path('candidate_exports.txt').read_text(errors='ignore')
+          if '14C machine (x86)' not in hdr and '14C machine' not in hdr: raise SystemExit('NOT_X86')
+          for e in ['_SigProc@24','_SigProc_Fini@0','_SigProc_Init@8','_SigProc_Stat@0']:
+              if e not in exp: raise SystemExit('MISSING_EXPORT '+e)
+          if '.stkfix' not in hdr: raise SystemExit('STKFIX_SECTION_MISSING')
+          pat=re.compile(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',re.I|re.M)
+          c={x.lower() for x in pat.findall(Path('candidate_dependents.txt').read_text(errors='ignore'))}
+          h={x.lower() for x in pat.findall(Path('hostcompat_dependents.txt').read_text(errors='ignore'))}
+          if 'ucrtbase.dll' in c: raise SystemExit('DIRECT_UCRTBASE_FORBIDDEN')
+          if c-h: raise SystemExit('IMPORT_NOT_HOSTCOMPAT_SUBSET '+','.join(sorted(c-h)))
+          b=Path('payload/SigProcDll-64HF.dll').read_bytes(); u16=lambda o:struct.unpack_from('<H',b,o)[0]; u32=lambda o:struct.unpack_from('<I',b,o)[0]
+          pe=u32(0x3c); n=u16(pe+6); osz=u16(pe+20); s0=pe+24+osz; bad=[]
+          for i in range(n):
+              o=s0+40*i; rs=u32(o+16); rp=u32(o+20); ch=u32(o+36)
+              if ch & 0x20000000:
+                  for off in range(rp,max(rp,rp+rs-6)):
+                      if b[off:off+2]==b'\x81\xec':
+                          imm=u32(off+2)
+                          if 0x1000 <= imm < 0x100000: bad.append((off,imm))
+          if bad: raise SystemExit('UNSAFE_LARGE_DIRECT_STACK_RESERVATIONS '+repr(bad))
+          Path('native_pe_gate.txt').write_text('PE32_X86_PASS\nEXPORTS_PASS\nIMPORT_SUBSET_PASS\nSTKFIX_PRESENT\nLARGE_DIRECT_STACK_RESERVATIONS=0\nNATIVE_PE_ABI_EXPORT_IMPORT_STACK_PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\pe_gate.py
+          python $env:RUNNER_TEMP\pe_gate.py
+          if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }
+
+      - name: Loader contract smoke in two isolated runtime directories
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($d in @('runtime_inner','runtime_outer')){
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item payload\SigProcDll-64HF.dll $d\SigProcDll-64HF.dll -Force
+            Copy-Item payload\SigProcLoaderContractSmoke.exe $d\SigProcLoaderContractSmoke.exe -Force
+            Push-Location $d
+            .\SigProcLoaderContractSmoke.exe 2>&1 | Tee-Object "..\$($d)_smoke.txt"
+            $rc=$LASTEXITCODE
+            Pop-Location
+            if($rc -ne 0){ throw "LOADER_SMOKE_FAIL $d rc=$rc" }
+            if(-not (Select-String "$($d)_smoke.txt" -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){ throw "LOADER_MARKER_FAIL $d" }
+          }
+          'INNER_OUTER_ISOLATED_LOADER_CONTRACT_PASS' | Out-File loader_contract_gate.txt
+
+      - name: Compile complete native x86 regression harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location payload
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg.exe fullreg.c 2>&1 | Tee-Object ..\fullreg_compile.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "FULLREG_COMPILE_FAIL rc=$rc" }
+
+      - name: Execute complete 13 GHF native Windows regression
+        shell: powershell
+        timeout-minutes: 95
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location payload
+          .\fullreg.exe .\SigProcDll-64HF.dll .\HostCompat.dll .\C63.dll .\testdata 2>&1 | Tee-Object ..\full_regression_c8b8.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          "REGRESSION_RUNNER_EXIT=$rc" | Out-File regression_runner_exit.txt
+          if($rc -ne 0){ throw "FULL_REGRESSION_FAIL rc=$rc" }
+          foreach($m in @('DETERMINISTIC_REPLAY_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){
+            if(-not (Select-String full_regression_c8b8.log -SimpleMatch $m -Quiet)){ throw "FULLREG_MARKER_MISSING $m" }
+          }
+          'FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_PASS' | Out-File fullreg_gate.txt
+
+      - name: Exact post-test SHA release lock
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "POST_TEST_SHA256=$h" | Out-File post_regression_sha256.txt
+          if($h -ne $env:EXPECTED_CANDIDATE_SHA){ throw "POST_TEST_SHA_CHANGED $h" }
+          @("RELEASE_GATE_PASS","SHA256=$h","NATIVE_WINDOWS_DYNAMIC_PASS=1","COMPLETE_13_GHF_REGRESSION_PASS=1","STACKPROBE_FIX_PASS=1") | Out-File C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock evidence_summary\ -Force
+          Copy-Item post_regression_sha256.txt evidence_summary\ -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock evidence_summary/post_regression_sha256.txt
+          git commit -m "Lock exact c8b8 native Windows complete full regression PASS"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+
+      - name: Upload exact tested DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-exact-native-fullreg-v2-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+            exact_asset_binding.txt
+            ghf_hash_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            native_pe_gate.txt
+            runtime_inner_smoke.txt
+            runtime_outer_smoke.txt
+            loader_contract_gate.txt
+            fullreg_compile.txt
+            full_regression_c8b8.log
+            regression_runner_exit.txt
+            fullreg_gate.txt
+            post_regression_sha256.txt
+            mail_transport.txt
+            sevenzip_xz.txt
+            sevenzip_tar.txt
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,189 @@
+name: v5-fixed-bounds-full-native-regression
+on:
+  push:
+    paths:
+      - '.github/workflows/v5_fixed_bounds_full_native_regression.yml'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native-full-regression:
+    runs-on: windows-2022
+    timeout-minutes: 110
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download fixed V5 encrypted regression payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check -q gdown
+          gdown 1svsKtH1yigBHhQwaE9nnDBcOHQ8F2KU7 -O $env:RUNNER_TEMP\v5_payload.enc
+          if(!(Test-Path $env:RUNNER_TEMP\v5_payload.enc)){ throw 'PAYLOAD_DOWNLOAD_MISSING' }
+          $n=(Get-Item $env:RUNNER_TEMP\v5_payload.enc).Length
+          if($n -lt 1024){ throw "PAYLOAD_TOO_SMALL_$n" }
+          $head=[System.IO.File]::ReadAllBytes($env:RUNNER_TEMP+'\v5_payload.enc')[0..15]
+          $ascii=[Text.Encoding]::ASCII.GetString($head)
+          if($ascii -match '<html|<!DOCTYP'){ throw 'DRIVE_RETURNED_HTML' }
+          "V5_ENCRYPTED_PAYLOAD_BYTES=$n" | Out-File v5_download_gate.txt
+
+      - name: Decrypt and extract exact V5 payload
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$RUNNER_TEMP/v5_payload.enc" \
+            -out "$RUNNER_TEMP/v5_payload.tar.xz" \
+            -pass 'pass:GuanHu-V5-CI-Only-20260808-8e92cbb1a69f4f36'
+          mkdir -p v5_extract
+          xz -dc "$RUNNER_TEMP/v5_payload.tar.xz" | tar -xf - -C v5_extract
+          test -f v5_extract/GuanHu_candidate_v5_fullreg_payload/V5_PAYLOAD_META.txt
+          cat v5_extract/GuanHu_candidate_v5_fullreg_payload/V5_PAYLOAD_META.txt | tee v5_payload_meta.txt
+          V5SHA=$(sed -n 's/^V5_SHA256=//p' v5_payload_meta.txt | tr -d '\r\n')
+          test "${#V5SHA}" = 64
+          echo "$V5SHA" > expected_v5_sha.txt
+          echo V5_PAYLOAD_DECRYPT_EXTRACT_PASS
+
+      - name: Bind exact V5 candidate and corpus binaries
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=(Resolve-Path 'v5_extract\GuanHu_candidate_v5_fullreg_payload').Path
+          $v5=(Get-Content expected_v5_sha.txt -Raw).Trim().ToLowerInvariant()
+          $base='081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+          $orig='56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+          $smoke='a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+          $files=Get-ChildItem -Path $root -Recurse -File
+          $dlls=$files | Where-Object {$_.Extension -ieq '.dll'}
+          $exes=$files | Where-Object {$_.Extension -ieq '.exe'}
+          $cand=$dlls | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $v5} | Select-Object -First 1
+          $b=$dlls | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $base} | Select-Object -First 1
+          $o=$dlls | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $orig} | Select-Object -First 1
+          $s=$exes | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $smoke} | Select-Object -First 1
+          if(!$cand){throw 'EXACT_V5_CANDIDATE_MISSING'}
+          if(!$b){throw 'HOSTCOMPAT_BASELINE_MISSING'}
+          if(!$o){throw 'C63_ORIGINAL_MISSING'}
+          if(!$s){throw 'LOADER_SMOKE_MISSING'}
+          $ghf=@($files | Where-Object {$_.Extension -ieq '.ghf'})
+          if($ghf.Count -lt 2){throw 'GHF_CORPUS_INCOMPLETE'}
+          "V5_SHA256=$v5`nV5_PATH=$($cand.FullName)`nBASELINE=$($b.FullName)`nORIGINAL=$($o.FullName)`nSMOKE=$($s.FullName)`nGHF_COUNT=$($ghf.Count)" | Out-File exact_v5_binding.txt
+          Write-Host EXACT_V5_BINARY_CORPUS_BINDING_PASS
+
+      - name: Rebuild regression tree at native Windows path
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=(Resolve-Path 'v5_extract\GuanHu_candidate_v5_fullreg_payload').Path
+          $dst=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          if(Test-Path $dst){Remove-Item -Recurse -Force $dst}
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $src '*') $dst
+          $unix='/mnt/data'
+          $win=($dst -replace '\\','/')
+          Get-ChildItem -Path $dst -Recurse -File | Where-Object { $_.Extension -in '.py','.txt','.json','.ps1','.cmd','.bat' -and $_.Length -lt 20MB } | ForEach-Object {
+            try{$t=Get-Content $_.FullName -Raw -ErrorAction Stop}catch{return}
+            if($null -ne $t){$u=$t.Replace($unix,$win); if($u -ne $t){Set-Content -Path $_.FullName -Value $u -Encoding utf8}}
+          }
+          $runner=Get-ChildItem -Path $dst -Recurse -Filter 'run_final_regression_windows.py' | Select-Object -First 1
+          if(!$runner){throw 'REGRESSION_RUNNER_MISSING'}
+          if($runner.Directory.FullName -ne $dst){Copy-Item -Force $runner.FullName (Join-Path $dst 'run_final_regression_windows.py')}
+          "WINDOWS_DATA_ROOT=$dst" | Out-File windows_tree.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Verify exact PE32 HostCompat ABI before execution
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $v5=(Get-Content expected_v5_sha.txt -Raw).Trim().ToLowerInvariant()
+          $cand=Get-ChildItem $root -Recurse -Filter '*.dll' | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $v5} | Select-Object -First 1
+          if(!$cand){throw 'V5_NOT_FOUND_BEFORE_NATIVE_EXEC'}
+          dumpbin /headers $cand.FullName | Out-File v5_headers.txt
+          dumpbin /exports $cand.FullName | Out-File v5_exports.txt
+          dumpbin /imports $cand.FullName | Out-File v5_imports.txt
+          $hdr=Get-Content v5_headers.txt -Raw
+          $exp=Get-Content v5_exports.txt -Raw
+          $imp=Get-Content v5_imports.txt -Raw
+          if($hdr -notmatch 'machine \(x86\)'){throw 'NOT_PE32_X86'}
+          foreach($x in @('_SigProc@24','_SigProc_Init@8','_SigProc_Fini@0','_SigProc_Stat@0')){if($exp -notmatch [regex]::Escape($x)){throw "EXPORT_MISSING_$x"}}
+          if($imp -match '(?i)ucrtbase\.dll'){throw 'DIRECT_UCRTBASE_IMPORT_FORBIDDEN'}
+          "V5_PE32_HOSTCOMPAT_ABI_PASS SHA256=$v5" | Out-File v5_pe_abi_pass.txt
+
+      - name: Execute complete native Windows regression on exact V5
+        shell: powershell
+        timeout-minutes: 95
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $script=Join-Path $root 'run_final_regression_windows.py'
+          if(!(Test-Path $script)){throw 'REGRESSION_SCRIPT_MISSING_AT_ROOT'}
+          $env:PYTHONUNBUFFERED='1'
+          python $script 2>&1 | Tee-Object v5_full_regression.log
+          $rc=$LASTEXITCODE
+          if($rc -ne 0){exit $rc}
+          'V5_NATIVE_COMPLETE_REGRESSION_RUNNER_EXIT_ZERO' | Out-File v5_runner_exit_zero.txt
+
+      - name: Enforce dynamic-execution and regression sentinels
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $v5=(Get-Content expected_v5_sha.txt -Raw).Trim().ToLowerInvariant()
+          $log=Get-Content v5_full_regression.log -Raw
+          if($log -notmatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS'){throw 'SEQ_TARGET_SENTINEL_MISSING'}
+          $runner=Get-Content (Join-Path $root 'run_final_regression_windows.py') -Raw
+          foreach($x in @('2000','20000','determin','performance','inner','outer','C63','HostCompat')){if($runner -notmatch [regex]::Escape($x)){throw "SUITE_COMPONENT_NOT_BOUND_$x"}}
+          $cand=Get-ChildItem $root -Recurse -Filter '*.dll' | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $v5} | Select-Object -First 1
+          if(!$cand){throw 'V5_MISSING_AFTER_REGRESSION'}
+          $after=(Get-FileHash $cand.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($after -ne $v5){throw 'V5_SHA_CHANGED_DURING_REGRESSION'}
+          "NATIVE_WINDOWS_DYNAMIC_EXECUTION_PASS SHA256=$v5`nCOMPLETE_FULL_REGRESSION_PASS SHA256=$v5`nSEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS" | Out-File V5_EXACT_FULL_PASS.lock
+          Copy-Item $cand.FullName .\SigProcDll-64HF.dll
+          Write-Host V5_EXACT_NATIVE_AND_FULL_REGRESSION_PASS
+
+      - name: Commit exact V5 pass lock
+        run: |
+          set -euo pipefail
+          V5SHA=$(tr -d '\r\n ' < expected_v5_sha.txt)
+          mkdir -p evidence_summary
+          cp V5_EXACT_FULL_PASS.lock evidence_summary/V5_EXACT_FULL_PASS.lock
+          printf '%s\n' "$V5SHA  SigProcDll-64HF.dll" > evidence_summary/V5_EXACT_SHA256SUMS.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git pull --rebase origin main
+          git add evidence_summary/V5_EXACT_FULL_PASS.lock evidence_summary/V5_EXACT_SHA256SUMS.txt
+          git commit -m 'Record exact V5 native and full regression pass' || true
+          git push origin HEAD:main
+
+      - name: Upload exact V5 DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5-fixed-bounds-native-full-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            SigProcDll-64HF.dll
+            V5_EXACT_FULL_PASS.lock
+            expected_v5_sha.txt
+            exact_v5_binding.txt
+            v5_download_gate.txt
+            v5_payload_meta.txt
+            windows_tree.txt
+            v5_headers.txt
+            v5_exports.txt
+            v5_imports.txt
+            v5_pe_abi_pass.txt
+            v5_full_regression.log
+            v5_runner_exit_zero.txt

@@ -1,0 +1,66 @@
+name: collect-full-regression-v6-status
+
+on:
+  workflow_run:
+    workflows: ["guanhu-full-regression-v6"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Write regression status
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence_summary
+          {
+            echo "RUN_ID=$RUN_ID"
+            echo "CONCLUSION=$CONCLUSION"
+            echo "HEAD_SHA=$HEAD_SHA"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" --jq '.jobs[] | "JOB=" + .name + " STATUS=" + .status + " CONCLUSION=" + (.conclusion // "")'
+          } > evidence_summary/full_regression_v6_status.txt
+          rm -f evidence_summary/FULL_REGRESSION_V6_PASS.lock evidence_summary/FULL_REGRESSION_V6_FAIL.lock
+          if [ "$CONCLUSION" = success ]; then
+            printf 'FULL_NATIVE_WINDOWS_AND_COMPLETE_REGRESSION_PASS\n' > evidence_summary/FULL_REGRESSION_V6_PASS.lock
+          else
+            printf 'FULL_REGRESSION_NOT_PASSED\n' > evidence_summary/FULL_REGRESSION_V6_FAIL.lock
+          fi
+      - name: Publish regression result lock
+        run: |
+          set -euo pipefail
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            cp -f evidence_summary/full_regression_v6_status.txt "$RUNNER_TEMP/status.txt"
+            cp -f evidence_summary/FULL_REGRESSION_V6_PASS.lock "$RUNNER_TEMP/PASS.lock" 2>/dev/null || true
+            cp -f evidence_summary/FULL_REGRESSION_V6_FAIL.lock "$RUNNER_TEMP/FAIL.lock" 2>/dev/null || true
+            git fetch origin main
+            git checkout -B main origin/main
+            mkdir -p evidence_summary
+            cp "$RUNNER_TEMP/status.txt" evidence_summary/full_regression_v6_status.txt
+            rm -f evidence_summary/FULL_REGRESSION_V6_PASS.lock evidence_summary/FULL_REGRESSION_V6_FAIL.lock
+            if [ -s "$RUNNER_TEMP/PASS.lock" ]; then cp "$RUNNER_TEMP/PASS.lock" evidence_summary/FULL_REGRESSION_V6_PASS.lock; fi
+            if [ -s "$RUNNER_TEMP/FAIL.lock" ]; then cp "$RUNNER_TEMP/FAIL.lock" evidence_summary/FULL_REGRESSION_V6_FAIL.lock; fi
+            git add -A evidence_summary/full_regression_v6_status.txt evidence_summary/FULL_REGRESSION_V6_PASS.lock evidence_summary/FULL_REGRESSION_V6_FAIL.lock
+            git commit -m "Record full regression v6 status" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ]

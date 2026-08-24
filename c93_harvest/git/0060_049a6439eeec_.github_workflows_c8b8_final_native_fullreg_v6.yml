@@ -1,0 +1,238 @@
+name: c8b8-final-native-fullreg-v6
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/c8b8_final_native_fullreg_v6.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      HOST_FIXED_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: f068bfa856ad791e0e8663cd4d76f54dc64f1b5e61fffb7a7fc02b4ff7b21582
+      RUNNER_SHA: fdfb1c36b27791dbbfbd8402596ed76802932259ebbff47d93971df3001e4484
+      ENC_SHA: e0bbcd4883362daf8cfc5c067a8a8f72e03760f6ab9d425bb3f426b97ad5fd59
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      SOURCE_RUN: '31308233779'
+      SOURCE_ARTIFACT: c8b8-v2-ciphertext-checkpoint-31308233779
+      HANDOFF_BRANCH: c8b8-fullreg-v2-resume-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore immutable ciphertext checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          if(!(Test-Path recovered\payload.enc)){throw 'RESTORED_PAYLOAD_MISSING'}
+          $h=(Get-FileHash recovered\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "RESTORED_ENC_SHA_FAIL $h"}
+          Copy-Item recovered\payload.enc payload.enc -Force
+          "CIPHERTEXT_RESTORE_PASS SHA256=$h SOURCE_RUN=$env:SOURCE_RUN" | Set-Content ciphertext_restore_gate.txt
+
+      - name: Publish one-time RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def q(method,u,obj=None,t=None):
+              d=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(u,data=d,method=method);r.add_header('Accept','application/json')
+              if d is not None:r.add_header('Content-Type','application/json')
+              if t:r.add_header('Authorization','Bearer '+t)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          b='https://api.mail.tm';d=q('GET',b+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',d.get('member',[]))
+          if not m:raise SystemExit('NO_DOMAIN')
+          a=string.ascii_lowercase+string.digits;addr='ghv6'+''.join(secrets.choice(a) for _ in range(16))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(36))
+          q('POST',b+'/accounts',{'address':addr,'password':pw});tok=q('POST',b+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-C8B8-V6-'+os.environ['GITHUB_RUN_ID']+'\n');print('KEY_ONLY_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          if($LASTEXITCODE -ne 0){throw 'MAILBOX_CREATE_FAIL'}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_v6_handoff | Out-Null
+          Copy-Item mailbox.txt,subject_prefix.txt,public.pem .c8b8_v6_handoff\ -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","XZ_SHA=$env:XZ_SHA","CAND_SHA=$env:CAND_SHA","HOST_FIXED_SHA=$env:HOST_FIXED_SHA") | Set-Content .c8b8_v6_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c8b8_v6_handoff
+          git commit -m "Publish c8b8 v6 key handoff"
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+
+      - name: Receive wrapped AES key
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          token=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';subj=Path('subject_prefix.txt').read_text().strip()+'-KEY';out=Path('wrapped_key.bin')
+          def gj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          end=time.time()+1100
+          while time.time()<end and not out.exists():
+              z=gj(base+'/messages');msgs=z if isinstance(z,list) else z.get('hydra:member',z.get('member',[]))
+              for m in msgs:
+                  if m.get('subject')!=subj:continue
+                  d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      if a.get('filename')!='c8b8_v2_wrapped_key.bin':continue
+                      u=urllib.parse.urljoin(base,a.get('downloadUrl',''));r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+token)
+                      with urllib.request.urlopen(r,timeout=60) as x:out.write_bytes(x.read())
+              if not out.exists():time.sleep(2)
+          if not out.exists():raise SystemExit('KEY_ONLY_HANDOFF_TIMEOUT')
+          print('KEY_ONLY_HANDOFF_PASS bytes='+str(out.stat().st_size))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recvkey.py
+          python $env:RUNNER_TEMP\recvkey.py | Tee-Object key_handoff.log
+          if((Get-Item wrapped_key.bin).Length -ne 384){throw 'WRAPPED_KEY_SIZE_FAIL'}
+
+      - name: Decrypt extract prepare fixed HostCompat harness and v6 runner
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in wrapped_key.bin -out $env:RUNNER_TEMP\aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_DECRYPT_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in payload.enc -out payload.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $xh=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($xh -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $xh"}
+          New-Item -ItemType Directory -Force extract_xz,extract_tar | Out-Null
+          & 7z x -y payload.tar.xz '-oextract_xz' | Out-File 7z_xz.log
+          if($LASTEXITCODE -ne 0){throw '7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem extract_xz -File | Select-Object -First 1).FullName;if(-not $tar){throw 'PAYLOAD_TAR_MISSING'}
+          & 7z x -y $tar '-oextract_tar' | Out-File 7z_tar.log
+          if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
+          Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
+          python .c8b8_resume_support\prepare_gate_v5.py | Tee-Object prepare_gate_v5.log
+          if($LASTEXITCODE -ne 0){throw 'PREPARE_GATE_V5_FAIL'}
+          @'
+          from pathlib import Path
+          s=Path('.c8b8_resume_support/run_windows_gate_v6.ps1').read_text().replace('\r\n','\n').replace('\r','\n')
+          Path('payload/run_windows_gate.ps1').write_bytes(s.replace('\n','\r\n').encode('utf-8'))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\install_v6.py
+          python $env:RUNNER_TEMP\install_v6.py
+          $hf=(Get-FileHash payload\HostCompat-stackprobe-fixed.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($hf -ne $env:HOST_FIXED_SHA){throw "HOSTFIX_SHA_FAIL $hf"}
+          $hs=(Get-FileHash payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant();if($hs -ne $env:HARNESS_SHA){throw "HARNESS_SHA_FAIL $hs"}
+          $rs=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant();if($rs -ne $env:RUNNER_SHA){throw "RUNNER_SHA_FAIL $rs"}
+          "V6_ASSET_PREP_PASS XZ_SHA=$xh HOSTFIX_SHA=$hf HARNESS_SHA=$hs RUNNER_SHA=$rs" | Set-Content v6_asset_prep_gate.txt
+
+      - name: Persist v6 prepared metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v6-prepared-assets-${{ github.run_id }}
+          path: |
+            v6_asset_prep_gate.txt
+            prepare_gate_v5.txt
+            prepare_gate_v5.log
+            payload/MANIFEST.txt
+            payload/run_windows_gate.ps1
+            payload/fullreg_c8b8.c
+            payload/HostCompat-stackprobe-fixed.dll
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Validate static stack and import invariants
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          dumpbin /dependents payload\HostCompat.dll | Out-File hostcompat_original_dependents.txt
+          dumpbin /dependents payload\HostCompat-stackprobe-fixed.dll | Out-File hostcompat_fixed_dependents.txt
+          @'
+          from pathlib import Path
+          import re,struct
+          dep=lambda p:{x.lower() for x in re.findall(r'^\s*([A-Za-z0-9_.-]+\.dll)\s*$',Path(p).read_text(errors='ignore'),re.M|re.I)}
+          a=dep('hostcompat_original_dependents.txt');b=dep('hostcompat_fixed_dependents.txt')
+          if a!=b:raise SystemExit('HOSTFIX_IMPORT_DRIFT '+repr((a,b)))
+          def sites(p):
+              q=Path(p).read_bytes();u16=lambda o:struct.unpack_from('<H',q,o)[0];u32=lambda o:struct.unpack_from('<I',q,o)[0];pe=u32(0x3c);n=u16(pe+6);s0=pe+24+u16(pe+20);z=[]
+              for i in range(n):
+                  o=s0+40*i;rs=u32(o+16);rp=u32(o+20);ch=u32(o+36)
+                  if ch&0x20000000:
+                      for x in range(rp,max(rp,rp+rs-6)):
+                          if q[x:x+2]==b'\x81\xec' and 0x1000<=u32(x+2)<0x100000:z.append((x,u32(x+2)))
+              return z
+          x=sites('payload/HostCompat.dll');y=sites('payload/HostCompat-stackprobe-fixed.dll');c=sites('payload/SigProcDll-64HF.dll')
+          if len(x)!=12 or y or c:raise SystemExit('STACK_GATE '+repr((len(x),y,c)))
+          Path('stack_invariants.txt').write_text('HOST_ORIGINAL_LARGE_DIRECT_STACK=12\nHOSTFIX_LARGE_DIRECT_STACK=0\nCANDIDATE_LARGE_DIRECT_STACK=0\nHOSTFIX_IMPORT_MATCH=PASS\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\stack_gate.py
+          python $env:RUNNER_TEMP\stack_gate.py
+          if($LASTEXITCODE -ne 0){throw 'STATIC_STACK_GATE_FAIL'}
+
+      - name: Run c8b8 exact native Windows complete regression
+        shell: powershell
+        timeout-minutes: 115
+        run: |
+          $ErrorActionPreference='Stop'
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload\run_windows_gate.ps1
+          if($LASTEXITCODE -ne 0){throw "WINDOWS_GATE_FAIL $LASTEXITCODE"}
+          if(!(Test-Path C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock)){throw 'PASS_LOCK_MISSING'}
+          Get-Content C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+
+      - name: Upload v6 exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v6-native-fullreg-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/HostCompat-stackprobe-fixed.dll
+            payload/MANIFEST.txt
+            ciphertext_restore_gate.txt
+            key_handoff.log
+            v6_asset_prep_gate.txt
+            stack_invariants.txt
+            hostcompat_original_dependents.txt
+            hostcompat_fixed_dependents.txt
+            exact_asset_hashes.txt
+            exact_asset_binding.txt
+            ghf_sha_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_pe_gate.txt
+            static_gate_python.log
+            fullreg_compile.txt
+            loader_inner.log
+            loader_outer.log
+            hostcompat_original_runtime_defect.txt
+            hostfix_loader_inner.log
+            hostfix_loader_outer.log
+            candidate_nonzero.log
+            c63_nonzero.log
+            hostcompat_fixed_nonzero.log
+            native_loader_baseline_gate.txt
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            post_test_sha.txt
+            complete_regression_gate.txt
+            C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+            run_windows_gate_pass.txt
+          if-no-files-found: ignore
+          retention-days: 30

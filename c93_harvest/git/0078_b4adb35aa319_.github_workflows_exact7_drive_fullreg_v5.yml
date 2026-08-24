@@ -1,0 +1,195 @@
+name: exact7-drive-native-fullreg-v5
+on:
+  push:
+    branches: [exact7-fullreg-20260809]
+    paths: ['.github/workflows/exact7_drive_fullreg_v5.yml']
+permissions:
+  contents: write
+jobs:
+  exact7-gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      ENC_SHA: bb8a51f1c349de672d55e3ae3299bda1fc2d2dcdd8e16280c9c99a07c6df112a
+      XZ_SHA: 0e29addb45f5535151311cbcd8c944804be2963c337fe958caea740c1129a7cd
+      EXACT_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      HANDOFF_BRANCH: exact7-fullreg-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish one-time mailbox and RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'
+          d=req('GET',base+'/domains'); m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('NO_MAIL_DOMAIN')
+          alpha=string.ascii_lowercase+string.digits
+          addr='ghexact7'+''.join(secrets.choice(alpha) for _ in range(14))+'@'+m[0]['domain']
+          pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          req('POST',base+'/accounts',{'address':addr,'password':pw})
+          tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}))
+          Path('mailbox.txt').write_text(addr+'\n')
+          Path('subject_prefix.txt').write_text('GuanHu-EXACT7-FullregV5-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('EXACT7_V5_MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .exact7_v5_handoff | Out-Null
+          Copy-Item public.pem,mailbox.txt,subject_prefix.txt .exact7_v5_handoff\
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","XZ_SHA=$env:XZ_SHA","EXACT_SHA=$env:EXACT_SHA") | Set-Content .exact7_v5_handoff\binding.txt
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .exact7_v5_handoff
+          git commit -m 'Publish exact7 V5 one-time handoff'
+          if($LASTEXITCODE -ne 0){throw 'HANDOFF_COMMIT_FAIL'}
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+          if($LASTEXITCODE -ne 0){throw 'HANDOFF_PUSH_FAIL'}
+
+      - name: Receive encrypted payload
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.parse,urllib.request
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token']
+          base='https://api.mail.tm'; prefix=Path('subject_prefix.txt').read_text().strip()
+          out=Path('transport');out.mkdir(exist_ok=True)
+          wanted={f'{prefix}-P{i}':i for i in range(1,5)};got=set();key=False;seen=set()
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          deadline=time.time()+1500
+          while time.time()<deadline and (len(got)<4 or not key):
+              q=gj(base+'/messages');msgs=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in msgs:
+                  subj=m.get('subject','')
+                  if subj not in wanted or m['id'] in seen:continue
+                  seen.add(m['id']);idx=wanted[subj];d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl')
+                      if not u:continue
+                      data=gb(urllib.parse.urljoin(base,u))
+                      if n==f'exact7_part{idx}.bin':(out/n).write_bytes(data);got.add(idx)
+                      elif n=='exact7_wrapped_key.bin':(out/n).write_bytes(data);key=True
+              if len(got)<4 or not key:time.sleep(3)
+          if len(got)!=4 or not key:raise SystemExit(f'TRANSPORT_FAIL parts={sorted(got)} key={key}')
+          print('EXACT7_V5_MAIL_TRANSPORT_PASS parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object mail_transport.txt
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Decrypt extract and bind exact payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $o=[IO.File]::Create("$env:RUNNER_TEMP\payload.enc")
+          try{1..4|ForEach-Object{$b=[IO.File]::ReadAllBytes("transport\exact7_part$_.bin");$o.Write($b,0,$b.Length)}}finally{$o.Dispose()}
+          $h=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          if((Get-Item transport\exact7_wrapped_key.bin).Length -ne 384){throw 'WRAPPED_KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\exact7_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_DECRYPT_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in $env:RUNNER_TEMP\payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $x=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"}
+          New-Item -ItemType Directory -Force xzstage,payload_root | Out-Null
+          7z x -y $env:RUNNER_TEMP\payload.tar.xz "-o$pwd\xzstage" | Out-File -Encoding ascii sevenzip_xz.txt
+          if($LASTEXITCODE -ne 0){throw 'XZ_EXTRACT_FAIL'}
+          $t=Get-ChildItem xzstage -Filter '*.tar' | Select-Object -First 1
+          if(!$t){throw 'TAR_MISSING'}
+          7z x -y $t.FullName "-o$pwd\payload_root" | Out-File -Encoding ascii sevenzip_tar.txt
+          if($LASTEXITCODE -ne 0){throw 'TAR_EXTRACT_FAIL'}
+          if(!(Test-Path payload_root\payload\windows_gate.ps1)){throw 'GATE_MISSING'}
+          $dll=(Get-FileHash payload_root\payload\dlls\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($dll -ne $env:EXACT_SHA){throw "EXACT_DLL_BIND_FAIL $dll"}
+          "ENC_SHA=$h`nXZ_SHA=$x`nDLL_SHA=$dll`nEXACT7_V5_TRANSPORT_BIND_PASS" | Out-File -Encoding ascii transport_binding.txt
+          Remove-Item $env:RUNNER_TEMP\pass.txt -Force
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x86'
+
+      - name: Execute manifest-fixed exact7 complete release gate
+        shell: powershell
+        timeout-minutes: 105
+        run: |
+          $ErrorActionPreference='Stop'
+          & .\payload_root\payload\windows_gate.ps1
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - name: Commit exact PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          if(!(Test-Path EXACT7_FINAL_RELEASE_PASS.lock)){throw 'PASS_LOCK_MISSING'}
+          $txt=Get-Content EXACT7_FINAL_RELEASE_PASS.lock -Raw
+          if($txt -notmatch $env:EXACT_SHA){throw 'PASS_LOCK_SHA_MISMATCH'}
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          Copy-Item EXACT7_FINAL_RELEASE_PASS.lock evidence_summary\EXACT7_FINAL_RELEASE_PASS.lock -Force
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add evidence_summary/EXACT7_FINAL_RELEASE_PASS.lock
+          git commit -m 'Lock exact 7c305 manifest-fixed native complete regression PASS'
+          git push origin "HEAD:$env:HANDOFF_BRANCH"
+
+      - name: Upload exact DLL and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact7-final-native-fullreg-v5-${{ github.run_id }}
+          path: |
+            payload_root/payload/dlls/SigProcDll-64HF.dll
+            payload_root/payload/MANIFEST.json
+            payload_root/payload/FULLREG_SUMMARY.json
+            EXACT7_FINAL_RELEASE_PASS.lock
+            transport_binding.txt
+            exact_payload_binding.txt
+            static_pe_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_headers.txt
+            hostcompat_exports.txt
+            hostcompat_dependents.txt
+            hostcompat_safe_headers.txt
+            loader_inner.log
+            loader_outer.log
+            loader_contract_gate.txt
+            hostcompat_raw_gate.txt
+            full_regression_exact7.log
+            regression_exit.txt
+            complete_suite_gate.txt
+            mail_transport.txt
+            sevenzip_xz.txt
+            sevenzip_tar.txt
+          if-no-files-found: ignore
+          retention-days: 30

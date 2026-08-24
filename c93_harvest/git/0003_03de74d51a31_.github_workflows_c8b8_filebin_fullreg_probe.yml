@@ -1,0 +1,48 @@
+name: c8b8-filebin-fullreg-probe
+on:
+  push:
+    paths:
+      - '.github/workflows/c8b8_filebin_fullreg_probe.yml'
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe historical Filebin full-regression transport
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          $items=@(
+            @{n='payload';u='https://filebin.net/ghstackfix7c305-fullreg-20260808-f2a6410c/fullreg_stackfix.tar.gz.enc'},
+            @{n='key';u='https://filebin.net/ghstackfix7c305-fullreg-handshake-20260808-62de41af/key.enc'},
+            @{n='public';u='https://filebin.net/ghstackfix7c305-fullreg-handshake-20260808-62de41af/public.pem'},
+            @{n='evidence';u='https://filebin.net/ghstackfix7c305-fullreg-evidence-20260808-62de41af/fullreg_evidence.zip'}
+          )
+          New-Item -ItemType Directory -Force probe | Out-Null
+          foreach($x in $items){
+            $out="probe\$($x.n).bin"
+            $hdr="probe\$($x.n).headers.txt"
+            $code=& curl.exe -L -sS --max-time 180 --retry 2 --retry-delay 1 -D $hdr -o $out -w '%{http_code}' $x.u
+            $rc=$LASTEXITCODE
+            $size=0; $sha='MISSING'
+            if(Test-Path $out){
+              $size=(Get-Item $out).Length
+              if($size -gt 0){ $sha=(Get-FileHash $out -Algorithm SHA256).Hash.ToLowerInvariant() }
+            }
+            "NAME=$($x.n) HTTP=$code CURL_RC=$rc BYTES=$size SHA256=$sha URL=$($x.u)" | Tee-Object -Append filebin_probe.txt
+            if(Test-Path $hdr){ Get-Content $hdr | Select-Object -Last 12 | Add-Content filebin_probe.txt }
+          }
+          Get-Content filebin_probe.txt
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-filebin-fullreg-probe-${{ github.run_id }}
+          path: |
+            filebin_probe.txt
+            probe/*.headers.txt
+          if-no-files-found: ignore
+          retention-days: 7

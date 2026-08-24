@@ -1,0 +1,303 @@
+name: guanhu-seq-v3-full-regression-v8
+
+on:
+  push:
+    paths:
+      - 'evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock'
+      - '.github/workflows/full_regression_seq_v3_v8.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  regression:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Require hash-bound v3 native pass
+        run: |
+          set -euo pipefail
+          test -s evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock
+          grep -Eq '^NATIVE_WINDOWS_SEQ_CANDIDATE_V3_PASS SHA256=[0-9a-f]{64}$' evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock
+          echo V3_NATIVE_LOCK_PRESENT
+
+      - name: Fetch encrypted v3 full regression payload
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1GXl1ymTiPGqiI87aQrREL5TIzz6mahuf'
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/regression.enc" "$url"
+          test -s "$RUNNER_TEMP/regression.enc"
+          echo "REGRESSION_CIPHERTEXT_BYTES=$(wc -c < "$RUNNER_TEMP/regression.enc" | tr -d '[:space:]')"
+          echo "REGRESSION_CIPHERTEXT_SHA=$(sha256sum "$RUNNER_TEMP/regression.enc" | awk '{print $1}')"
+
+      - name: Create and publish one-time v8 RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private.pem"
+          openssl pkey -in "$RUNNER_TEMP/private.pem" -pubout -out "$RUNNER_TEMP/public.pem"
+          git config user.name "windows-dll-test-bot"
+          git config user.email "windows-dll-test-bot@users.noreply.github.com"
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch origin main
+            git checkout -B main origin/main
+            rm -rf .seq_v3_full_reg_v8_handoff
+            mkdir -p .seq_v3_full_reg_v8_handoff
+            cp "$RUNNER_TEMP/public.pem" .seq_v3_full_reg_v8_handoff/public.pem
+            git add .seq_v3_full_reg_v8_handoff/public.pem
+            git commit -m "Publish one-time RSA key for seq v3 full regression v8" || true
+            if git push origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=PUBLIC_KEY_PUSH; exit 19; }
+          echo V8_PUBLIC_KEY_PUBLISHED
+
+      - name: Wait for matching wrapped v8 AES key
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1qodNWgYhbzggtOx_cOZjDo17jxrSXXj0'
+          ok=0
+          for i in $(seq 1 1200); do
+            rm -f "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/pass.try"
+            if curl -L -sS --fail --max-time 15 -o "$RUNNER_TEMP/key.try" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/key.try" | tr -d '[:space:]')
+              if [ "$size" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private.pem" -in "$RUNNER_TEMP/key.try" -out "$RUNNER_TEMP/pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/key.try" "$RUNNER_TEMP/key.enc"
+                  mv "$RUNNER_TEMP/pass.try" "$RUNNER_TEMP/pass.txt"
+                  ok=1
+                  break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=V8_RSA_TIMEOUT; exit 20; }
+          echo V8_RSA_KEY_ACCEPTED
+
+      - name: Decrypt verify and bind v3 SHA to native pass
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/regression.enc" -out "$RUNNER_TEMP/regression.tar.xz" -pass file:"$RUNNER_TEMP/pass.txt" || { echo FAIL_STAGE=V8_AES; exit 24; }
+          rm -rf payload; mkdir payload
+          tar -xJf "$RUNNER_TEMP/regression.tar.xz" -C payload || { echo FAIL_STAGE=V8_EXTRACT; exit 25; }
+          cd payload
+          sha256sum -c KEY_SHA256SUMS.txt
+          sha256sum -c RUNTIME_INNER_SHA256SUMS.txt
+          sha256sum -c RUNTIME_OUTER_SHA256SUMS.txt
+          sha256sum -c CORPUS_SHA256SUMS.txt
+          cand_sha=$(sha256sum SigProcDll-64HF.dll | awk '{print $1}')
+          echo "$cand_sha" > ../candidate_v3_sha.txt
+          grep -qx "NATIVE_WINDOWS_SEQ_CANDIDATE_V3_PASS SHA256=$cand_sha" ../evidence_summary/SEQ_CANDIDATE_V3_NATIVE_PASS.lock || { echo FAIL_STAGE=V3_NATIVE_SHA_BINDING; exit 26; }
+          test "$(sha256sum SigProcDll-HostCompat-baseline.dll | awk '{print $1}')" = 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+          test "$(sha256sum SigProcDll-C63-original.dll | awk '{print $1}')" = 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+          echo V3_PAYLOAD_SHA_BOUND_TO_NATIVE_PASS
+          rm -f "$RUNNER_TEMP/pass.txt" "$RUNNER_TEMP/key.enc" "$RUNNER_TEMP/regression.enc" "$RUNNER_TEMP/regression.tar.xz"
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: PE ABI and import subset gate
+        shell: cmd
+        run: |
+          dumpbin /headers payload\SigProcDll-64HF.dll > candidate_v3_headers.txt
+          dumpbin /exports payload\SigProcDll-64HF.dll > candidate_v3_exports.txt
+          dumpbin /imports payload\SigProcDll-64HF.dll > candidate_v3_imports.txt
+          dumpbin /imports payload\SigProcDll-HostCompat-baseline.dll > hostcompat_imports.txt
+          findstr /C:"machine (x86)" candidate_v3_headers.txt > nul
+          if errorlevel 1 exit /b 40
+          findstr /C:"_SigProc_Init@8" candidate_v3_exports.txt > nul
+          if errorlevel 1 exit /b 41
+          findstr /C:"_SigProc@24" candidate_v3_exports.txt > nul
+          if errorlevel 1 exit /b 42
+          findstr /C:"_SigProc_Stat@0" candidate_v3_exports.txt > nul
+          if errorlevel 1 exit /b 43
+          findstr /C:"_SigProc_Fini@0" candidate_v3_exports.txt > nul
+          if errorlevel 1 exit /b 44
+          findstr /I /C:"ucrtbase.dll" candidate_v3_imports.txt > nul
+          if not errorlevel 1 exit /b 45
+
+      - name: Verify imports subset HostCompat
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          function Get-Dlls($p){$a=@();foreach($l in Get-Content $p){if($l -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$'){$a+=$Matches[1].ToLowerInvariant()}};@($a|Sort-Object -Unique)}
+          $cand=Get-Dlls 'candidate_v3_imports.txt';$base=Get-Dlls 'hostcompat_imports.txt';$extra=@($cand|Where-Object{$_ -notin $base})
+          "CANDIDATE_IMPORTS=$($cand -join ',')"|Out-File import_subset_v3.txt
+          "BASELINE_IMPORTS=$($base -join ',')"|Add-Content import_subset_v3.txt
+          "EXTRA_IMPORTS=$($extra -join ',')"|Add-Content import_subset_v3.txt
+          if($extra.Count -ne 0){Get-Content import_subset_v3.txt;exit 46}
+          'IMPORT_SUBSET_PASS'|Add-Content import_subset_v3.txt
+
+      - name: Loader contract in complete regression
+        shell: cmd
+        working-directory: payload
+        run: |
+          SigProcLoaderContractSmoke.exe > ..\loader_smoke_v3.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type ..\loader_smoke_v3.txt
+          if not %RC%==0 exit /b %RC%
+          findstr /C:"ALL_LOADER_CONTRACT_TESTS_PASS" ..\loader_smoke_v3.txt > nul
+          if errorlevel 1 exit /b 47
+
+      - name: Build replay stress harness warning-free
+        shell: cmd
+        working-directory: payload
+        run: |
+          cl /nologo /O2 /W4 /EHsc- /D_CRT_SECURE_NO_WARNINGS host_replay_win.c /Fe:HostReplayWin.exe > ..\harness_build.txt 2>&1
+          if errorlevel 1 (type ..\harness_build.txt & exit /b 50)
+          findstr /I /C:"warning C" ..\harness_build.txt > nul
+          if not errorlevel 1 (type ..\harness_build.txt & exit /b 51)
+          type ..\harness_build.txt
+
+      - name: Candidate v3 inner real 1Hz continuous playback
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_candidate.csv > ..\inner_candidate.log 2>&1
+          set RC=%ERRORLEVEL% & type ..\inner_candidate.log & exit /b %RC%
+
+      - name: Candidate v3 outer real 1Hz continuous playback
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 1000 --out ..\outer_candidate.csv > ..\outer_candidate.log 2>&1
+          set RC=%ERRORLEVEL% & type ..\outer_candidate.log & exit /b %RC%
+
+      - name: Two-thread lifecycle zero-input stress
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_outer --ghf outer_sample.ghf --mode stress --loops 2000 --threads 2 --out ..\stress.csv > ..\stress.log 2>&1
+          set RC=%ERRORLEVEL% & type ..\stress.log & exit /b %RC%
+
+      - name: Long-duration two-thread stability
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode stress --loops 20000 --threads 2 --out ..\stress_long.csv > ..\stress_long.log 2>&1
+          set RC=%ERRORLEVEL% & type ..\stress_long.log & exit /b %RC%
+
+      - name: HostCompat baseline inner real 1Hz
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-HostCompat-baseline.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_hostcompat.csv > ..\inner_hostcompat.log 2>&1
+          exit /b %ERRORLEVEL%
+
+      - name: HostCompat baseline outer real 1Hz
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-HostCompat-baseline.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 1000 --out ..\outer_hostcompat.csv > ..\outer_hostcompat.log 2>&1
+          exit /b %ERRORLEVEL%
+
+      - name: C63 original inner real 1Hz
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 1000 --out ..\inner_original.csv > ..\inner_original.log 2>&1
+          exit /b %ERRORLEVEL%
+
+      - name: C63 original outer real 1Hz
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-C63-original.dll --runtime runtime_outer --ghf outer_sample.ghf --mode replay --sleep-ms 1000 --out ..\outer_original.csv > ..\outer_original.log 2>&1
+          exit /b %ERRORLEVEL%
+
+      - name: Existing C63 regression validator
+        shell: cmd
+        working-directory: payload
+        run: |
+          python validate_windows_results.py ..\loader_smoke_v3.txt ..\inner_candidate.csv ..\outer_candidate.csv ..\stress.csv ..\inner_original.csv ..\outer_original.csv > ..\validation_c63.txt 2>&1
+          set RC=%ERRORLEVEL% & type ..\validation_c63.txt & exit /b %RC%
+
+      - name: Departure vital suppression return-to-bed target validator
+        shell: cmd
+        working-directory: payload
+        run: |
+          python validate_seq_targets.py ..\inner_hostcompat.csv ..\inner_candidate.csv ..\outer_hostcompat.csv ..\outer_candidate.csv > ..\validation_seq_targets.txt 2>&1
+          set RC=%ERRORLEVEL% & type ..\validation_seq_targets.txt & exit /b %RC%
+
+      - name: Determinism gate
+        shell: cmd
+        working-directory: payload
+        run: |
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out ..\det1.csv > ..\det1.log 2>&1
+          if errorlevel 1 exit /b 60
+          HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out ..\det2.csv > ..\det2.log 2>&1
+          if errorlevel 1 exit /b 61
+          fc /b ..\det1.csv ..\det2.csv > ..\determinism.txt
+          if errorlevel 1 exit /b 62
+          echo DETERMINISM_PASS>> ..\determinism.txt
+
+      - name: Historical GHF corpus no-crash sweep
+        shell: powershell
+        working-directory: payload
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force -Path ..\corpus_out|Out-Null
+          $rows=Import-Csv -Delimiter "`t" corpus_manifest.tsv;$i=0;$runs=0
+          foreach($r in $rows){$i++;if($r.bed -eq 'inner'){$beds=@('inner')}elseif($r.bed -eq 'outer'){$beds=@('outer')}else{$beds=@('inner','outer')};foreach($bed in $beds){$runs++;$out="..\corpus_out\c_${i}_${bed}.csv";$log="..\corpus_out\c_${i}_${bed}.log";& .\HostReplayWin.exe --dll SigProcDll-64HF.dll --runtime "runtime_$bed" --ghf (Join-Path 'corpus' $r.file) --mode replay --sleep-ms 0 --out $out *> $log;if($LASTEXITCODE -ne 0){Get-Content $log;exit $LASTEXITCODE}}}
+          "HISTORICAL_CORPUS_SWEEP_PASS files=$i runs=$runs"|Tee-Object -FilePath ..\corpus_summary.txt
+
+      - name: Performance regression gate
+        shell: powershell
+        working-directory: payload
+        run: |
+          $ErrorActionPreference='Stop'
+          function Time-Run($dll,$out){$sw=[Diagnostics.Stopwatch]::StartNew();& .\HostReplayWin.exe --dll $dll --runtime runtime_inner --ghf inner_sample.ghf --mode replay --sleep-ms 0 --out $out *> $null;if($LASTEXITCODE -ne 0){exit $LASTEXITCODE};$sw.Stop();return $sw.ElapsedMilliseconds}
+          $cand=Time-Run 'SigProcDll-64HF.dll' '..\perf_candidate.csv';$base=Time-Run 'SigProcDll-HostCompat-baseline.dll' '..\perf_hostcompat.csv';$limit=[Math]::Max(2000,5*$base+500)
+          "CANDIDATE_MS=$cand`nHOSTCOMPAT_MS=$base`nLIMIT_MS=$limit"|Out-File ..\performance.txt
+          if($cand -gt $limit){exit 70}
+          'PERFORMANCE_GATE_PASS'|Add-Content ..\performance.txt
+
+      - name: Mark full v3 regression pass
+        shell: cmd
+        run: |
+          echo FULL_SEQ_V3_REGRESSION_PASS > full_regression_v3_gate.txt
+
+      - name: Upload complete v3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-v3-full-regression-v8-evidence
+          path: |
+            candidate_v3_sha.txt
+            candidate_v3_headers.txt
+            candidate_v3_exports.txt
+            candidate_v3_imports.txt
+            hostcompat_imports.txt
+            import_subset_v3.txt
+            loader_smoke_v3.txt
+            harness_build.txt
+            inner_candidate.csv
+            outer_candidate.csv
+            stress.csv
+            stress_long.csv
+            inner_hostcompat.csv
+            outer_hostcompat.csv
+            inner_original.csv
+            outer_original.csv
+            validation_c63.txt
+            validation_seq_targets.txt
+            determinism.txt
+            corpus_summary.txt
+            corpus_out
+            performance.txt
+            full_regression_v3_gate.txt
+          if-no-files-found: ignore
+          retention-days: 5

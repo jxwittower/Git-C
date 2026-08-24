@@ -1,0 +1,132 @@
+name: c80-algo-only-stage2-fullreg
+on:
+  push:
+    branches:
+      - c80-algo-only-reset-20260815
+    paths:
+      - '.c80_exact_candidate/STAGE1_PASS.lock'
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  native-fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 110
+    env:
+      PAYLOAD_SHA: c1bde82d07768249d1a55aaa8e48bc8a3f26629f7eabddc214611106cb39173f
+      DRIVE_ID: 1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bind Stage1 candidate and evidence
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($f in @('.c80_exact_candidate\SigProcDll-64HF.dll','.c80_exact_candidate\C80_REPRODUCTION_PASS.txt','.c80_exact_candidate\ALGORITHM_ONLY_SOURCE_GATE.txt','.c80_exact_candidate\ABI_LOADER_SURFACE_PASS.txt','.c80_exact_candidate\STAGE1_PASS.lock')){ if(!(Test-Path $f)){ throw "STAGE1_EVIDENCE_MISSING $f" } }
+          $cand=(Get-FileHash .c80_exact_candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "STAGE1_CANDIDATE_SHA256=$cand" | Out-File stage2_binding.txt
+
+      - name: Download exact previously validated full regression payload
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check --quiet gdown
+          if($LASTEXITCODE -ne 0){ throw 'GDOWN_INSTALL_FAIL' }
+          gdown $env:DRIVE_ID -O payload.tar.xz
+          if($LASTEXITCODE -ne 0){ throw 'GDOWN_DOWNLOAD_FAIL' }
+          $h=(Get-FileHash payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:PAYLOAD_SHA){ throw "PAYLOAD_SHA_MISMATCH $h" }
+          7z x -y payload.tar.xz | Out-File extract_xz.log
+          if(!(Test-Path newfullreg_payload.tar)){ throw 'TAR_STAGE_MISSING' }
+          7z x -y newfullreg_payload.tar | Out-File extract_tar.log
+          if(!(Test-Path newfullreg_payload\fullreg.c)){ throw 'FULLREG_SOURCE_MISSING' }
+          $ghfs=Get-ChildItem newfullreg_payload\testdata -Recurse -Filter '*.ghf'
+          if($ghfs.Count -ne 13){ throw "GHF_COUNT_FAIL $($ghfs.Count)" }
+          "FULL_GHF_COUNT=$($ghfs.Count)`nFULL_GHF_BYTES=$(($ghfs | Measure-Object Length -Sum).Sum)" | Add-Content stage2_binding.txt
+          foreach($x in @(@('newfullreg_payload\HostCompat.dll',$env:HOST_SHA),@('newfullreg_payload\C63.dll',$env:C63_SHA),@('newfullreg_payload\SigProcLoaderContractSmoke.exe',$env:SMOKE_SHA))){
+            $xh=(Get-FileHash $x[0] -Algorithm SHA256).Hash.ToLowerInvariant(); if($xh -ne $x[1]){ throw "HARNESS_BIND_FAIL $($x[0]) $xh" }
+          }
+          Copy-Item .c80_exact_candidate\SigProcDll-64HF.dll newfullreg_payload\SigProcDll-64HF.dll -Force
+          $after=(Get-FileHash newfullreg_payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $before=(Get-FileHash .c80_exact_candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($after -ne $before){ throw 'CANDIDATE_COPY_CHANGED_BYTES' }
+
+      - name: Configure x86 MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Canonical loader contract
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location newfullreg_payload
+          .\SigProcLoaderContractSmoke.exe 2>&1 | Tee-Object ..\loader_contract.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "LOADER_SMOKE_FAIL rc=$rc" }
+          if(-not (Select-String loader_contract.log -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' -Quiet)){ throw 'LOADER_PASS_MARKER_MISSING' }
+          'CANONICAL_LOADER_CONTRACT=PASS' | Out-File loader_gate.txt
+
+      - name: Compile x86 full regression host
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location newfullreg_payload
+          cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:fullreg.exe fullreg.c
+          if($LASTEXITCODE -ne 0){ throw 'FULLREG_COMPILE_FAIL' }
+          Pop-Location
+
+      - name: Complete native Windows full-data regression
+        timeout-minutes: 95
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location newfullreg_payload
+          .\fullreg.exe .\SigProcDll-64HF.dll .\HostCompat.dll .\C63.dll .\testdata 2>&1 | Tee-Object ..\full_regression.log
+          $rc=$LASTEXITCODE
+          Pop-Location
+          if($rc -ne 0){ throw "FULL_REGRESSION_FAIL rc=$rc" }
+          foreach($m in @('DETERMINISTIC_REPLAY_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')){
+            if(-not (Select-String full_regression.log -SimpleMatch $m -Quiet)){ throw "FULLREG_MARKER_MISSING $m" }
+          }
+          'FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION=PASS' | Out-File fullreg_gate.txt
+
+      - name: Post-test identity lock and release evidence
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash .c80_exact_candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $h2=(Get-FileHash newfullreg_payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $h2){ throw 'POST_TEST_CANDIDATE_IDENTITY_CHANGED' }
+          "CANDIDATE_SHA256=$h`nSTAGE1_EXACT_C80_REPRO=PASS`nALGORITHM_ONLY_SOURCE_GATE=PASS`nLOADER_CONTRACT=PASS`nFULL_NATIVE_REGRESSION=PASS" | Out-File C80_ALGO_ONLY_STAGE2_PASS.lock
+          New-Item -ItemType Directory -Force .c80_exact_candidate\stage2 | Out-Null
+          Copy-Item C80_ALGO_ONLY_STAGE2_PASS.lock .c80_exact_candidate\stage2\
+          Copy-Item stage2_binding.txt .c80_exact_candidate\stage2\
+          Copy-Item loader_gate.txt .c80_exact_candidate\stage2\
+          Copy-Item fullreg_gate.txt .c80_exact_candidate\stage2\
+          Copy-Item loader_contract.log .c80_exact_candidate\stage2\
+          Copy-Item full_regression.log .c80_exact_candidate\stage2\
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .c80_exact_candidate/stage2
+          git commit -m 'Pass C80 algorithm-only native Windows full regression'
+          git push origin HEAD:c80-algo-only-reset-20260815
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c80-algo-only-stage2-pass-${{ github.run_id }}
+          path: |
+            .c80_exact_candidate/SigProcDll-64HF.dll
+            .c80_exact_candidate/C80_REPRODUCTION_PASS.txt
+            .c80_exact_candidate/ALGORITHM_ONLY_SOURCE_GATE.txt
+            .c80_exact_candidate/ABI_LOADER_SURFACE_PASS.txt
+            stage2_binding.txt
+            loader_contract.log
+            full_regression.log
+            C80_ALGO_ONLY_STAGE2_PASS.lock
+          if-no-files-found: error
+          retention-days: 30

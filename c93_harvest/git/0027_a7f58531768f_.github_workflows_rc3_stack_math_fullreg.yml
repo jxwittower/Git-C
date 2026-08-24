@@ -1,0 +1,343 @@
+name: rc3-stack-math-native-fullreg
+on:
+  push:
+    branches: [rc3-native-gate-20260810r]
+    paths: ['.github/workflows/rc3_stack_math_fullreg.yml']
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+env:
+  ARTIFACT_ID: '9034484495'
+  HOST_SHA: '081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804'
+  C63_SHA: '56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb'
+  SMOKE_SHA: 'a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d'
+  FULLREG_SHA: 'f946ba5e503f7f921aec0e9b4632981540d7487004596b5940053bc817694b14'
+  DELTA_B64_SHA: '28b6446caf5fdb7dcf194f58a1faf9ef59a51ff806dbeb4b55762f1d256daa30'
+  DELTA_ENC_SHA: '0f943c6568801ff62fa4faccddc31bca3c2af90731c01a5a8f927bc81d16f76c'
+  DELTA_XZ_SHA: '432be588c7550c8a49a4af46ea475716e9d378b21d5664456a3eaf734de1ae92'
+  RC3_SHA: '1c2695f5f5d48228a9cfee18c31669cc27615d6d1c53bf83228aa015240a2b92'
+  STACKFIX_SHA: 'ca82d1c611eb02afa5e3a42c5baeefb5983efee3d36b1ebf99b61e1b334179e9'
+  FINAL_SHA: 'efeed8bacb10aa9f4f37501d273b87882deb99f83f5602d12d10a5e26ee8738a'
+jobs:
+  native-fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - name: Checkout exact gate branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download verified prior Windows payload artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ env.ARTIFACT_ID }}
+          path: baseline_artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: '31300993195'
+          merge-multiple: true
+
+      - name: Bind baseline artifact corpus and runtime files
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=Resolve-Path 'baseline_artifact\payload'
+          $checks=@{
+            'HostCompat.dll'=$env:HOST_SHA
+            'C63.dll'=$env:C63_SHA
+            'SigProcLoaderContractSmoke.exe'=$env:SMOKE_SHA
+            'fullreg.c'=$env:FULLREG_SHA
+          }
+          foreach($n in $checks.Keys){
+            $f=Join-Path $p $n
+            if(!(Test-Path $f)){ throw "BASELINE_MISSING $n" }
+            $h=(Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($h -ne $checks[$n]){ throw "BASELINE_SHA_MISMATCH $n $h" }
+          }
+          $ghf=Get-ChildItem (Join-Path $p 'testdata') -Recurse -Filter '*.ghf'
+          if($ghf.Count -ne 13){ throw "GHF_COUNT_MISMATCH $($ghf.Count)" }
+          foreach($bed in @('inner-bed','outer-medical-bed')){
+            foreach($f in @('file_bed_model_v1','file_bias','file_sig','filter_brth','filter_hrt3')){
+              $q=Join-Path $p "runtime\$bed\$f"
+              if(!(Test-Path $q)){ throw "RUNTIME_MISSING $bed/$f" }
+            }
+          }
+          "HOST_SHA256=$env:HOST_SHA`nC63_SHA256=$env:C63_SHA`nSMOKE_SHA256=$env:SMOKE_SHA`nFULLREG_SHA256=$env:FULLREG_SHA`nGHF_FILES=13`nBASELINE_CORPUS_BINDING_PASS" | Tee-Object baseline_binding.txt
+
+      - name: Bind exact encrypted frozen-RC3 delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/rc3.delta.enc.b64"
+          for f in .rc3delta/chunk_00 .rc3delta/chunk_01 .rc3delta/chunk_02 .rc3delta/chunk_03 .rc3delta/chunk_04 .rc3delta/chunk_05 .rc3delta/chunk_06 .rc3delta/chunk_07 .rc3delta/chunk_08 .rc3delta/chunk_09; do
+            test -s "$f"
+            cat "$f" >> "$RUNNER_TEMP/rc3.delta.enc.b64"
+          done
+          b64_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.enc.b64")
+          b64_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.enc.b64" | awk '{print $1}')
+          test "$b64_bytes" = 74904
+          test "$b64_sha" = "$DELTA_B64_SHA"
+          base64 -d "$RUNNER_TEMP/rc3.delta.enc.b64" > "$RUNNER_TEMP/rc3.delta.xz.enc"
+          enc_bytes=$(wc -c < "$RUNNER_TEMP/rc3.delta.xz.enc")
+          enc_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz.enc" | awk '{print $1}')
+          test "$enc_bytes" = 56176
+          test "$enc_sha" = "$DELTA_ENC_SHA"
+          printf 'DELTA_B64_BYTES=%s\nDELTA_B64_SHA256=%s\nDELTA_ENC_BYTES=%s\nDELTA_ENC_SHA256=%s\nENCRYPTED_DELTA_BINDING_PASS\n' "$b64_bytes" "$b64_sha" "$enc_bytes" "$enc_sha" | tee delta_binding.txt
+
+      - name: Create one-time RSA transport key
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .secure_rc3_final
+          mkdir -p .secure_rc3_final
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/private_final.pem"
+          openssl pkey -in "$RUNNER_TEMP/private_final.pem" -pubout -out .secure_rc3_final/public.pem
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git add .secure_rc3_final/public.pem
+          git commit -m 'Publish RC3 final native gate one-time RSA public key'
+          git push origin HEAD:${GITHUB_REF_NAME}
+          echo FINAL_GATE_RSA_PUBLIC_KEY_PUBLISHED
+
+      - name: Receive RSA-wrapped AES passphrase
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 240); do
+            git pull --ff-only origin "${GITHUB_REF_NAME}" >/dev/null 2>&1 || true
+            if [ -s .secure_rc3_final/key.enc.b64 ]; then ok=1; break; fi
+            sleep 5
+          done
+          test "$ok" = 1
+          base64 -d .secure_rc3_final/key.enc.b64 > "$RUNNER_TEMP/key_final.enc"
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/private_final.pem" -in "$RUNNER_TEMP/key_final.enc" -out "$RUNNER_TEMP/pass_final.txt" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          test -s "$RUNNER_TEMP/pass_final.txt"
+          echo FINAL_GATE_RSA_WRAPPED_KEY_RECEIVED
+
+      - name: Reconstruct frozen RC3 apply stackfix then mathfix and bind all SHAs
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/rc3.delta.xz.enc" -out "$RUNNER_TEMP/rc3.delta.xz" -pass file:"$RUNNER_TEMP/pass_final.txt"
+          xz_sha=$(sha256sum < "$RUNNER_TEMP/rc3.delta.xz" | awk '{print $1}')
+          test "$xz_sha" = "$DELTA_XZ_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib,lzma,struct,os
+          base=Path('baseline_artifact/payload/HostCompat.dll').read_bytes()
+          raw=lzma.decompress((Path(os.environ['RUNNER_TEMP'])/'rc3.delta.xz').read_bytes())
+          if raw[:4] != b'R3D1': raise SystemExit('DELTA_MAGIC_FAIL')
+          target,nops=struct.unpack_from('<II',raw,4); pos=12; out=bytearray()
+          for _ in range(nops):
+              op=raw[pos:pos+1]; pos+=1
+              if op==b'C':
+                  src,n=struct.unpack_from('<II',raw,pos); pos+=8
+                  if src+n > len(base): raise SystemExit('DELTA_COPY_RANGE_FAIL')
+                  out.extend(base[src:src+n])
+              elif op==b'L':
+                  n,=struct.unpack_from('<I',raw,pos); pos+=4
+                  if pos+n > len(raw): raise SystemExit('DELTA_LITERAL_RANGE_FAIL')
+                  out.extend(raw[pos:pos+n]); pos+=n
+              else: raise SystemExit('DELTA_OPCODE_FAIL')
+          if pos != len(raw) or len(out) != target: raise SystemExit('DELTA_RECONSTRUCTION_SHAPE_FAIL')
+          Path('candidate').mkdir(exist_ok=True)
+          q=Path('candidate/RC3-frozen.dll'); q.write_bytes(out)
+          print('FROZEN_RC3_SHA256='+hashlib.sha256(out).hexdigest())
+          PY
+          frozen_sha=$(sha256sum candidate/RC3-frozen.dll | awk '{print $1}')
+          test "$frozen_sha" = "$RC3_SHA"
+          test "$(wc -c < candidate/RC3-frozen.dll)" = 442368
+          python tools/apply_windows_stackprobe_fix.py candidate/RC3-frozen.dll candidate/RC3-stackfix.dll --report stackfix_report.json
+          stack_sha=$(sha256sum candidate/RC3-stackfix.dll | awk '{print $1}')
+          test "$stack_sha" = "$STACKFIX_SHA"
+          test "$(wc -c < candidate/RC3-stackfix.dll)" = 442880
+          python tools/apply_windows_libm_xmm_fix.py candidate/RC3-stackfix.dll candidate/SigProcDll-64HF.dll --report mathfix_report.json
+          final_sha=$(sha256sum candidate/SigProcDll-64HF.dll | awk '{print $1}')
+          test "$final_sha" = "$FINAL_SHA"
+          test "$(wc -c < candidate/SigProcDll-64HF.dll)" = 443392
+          printf 'DELTA_XZ_SHA256=%s\nFROZEN_RC3_SHA256=%s\nSTACKFIX_SHA256=%s\nFINAL_SHA256=%s\nEXACT_STACK_MATH_RECONSTRUCTION_PASS\n' "$xz_sha" "$frozen_sha" "$stack_sha" "$final_sha" | tee candidate_binding.txt
+          rm -f "$RUNNER_TEMP/pass_final.txt" "$RUNNER_TEMP/key_final.enc" "$RUNNER_TEMP/private_final.pem"
+
+      - name: Verify PE import-bearing sections unchanged by ABI repairs
+        shell: python
+        run: |
+          from pathlib import Path
+          import struct,hashlib
+          def pe_sections(path):
+              b=Path(path).read_bytes(); pe=struct.unpack_from('<I',b,0x3c)[0]
+              fh=pe+4; ns=struct.unpack_from('<H',b,fh+2)[0]; optsz=struct.unpack_from('<H',b,fh+16)[0]; opt=fh+20; sec=opt+optsz
+              imp=struct.unpack_from('<II',b,opt+104)
+              out={}
+              for i in range(ns):
+                  o=sec+i*40; name=b[o:o+8].rstrip(b'\0').decode('ascii','replace'); vs,va,rs,rp=struct.unpack_from('<IIII',b,o+8)
+                  out[name]=(va,vs,rs,hashlib.sha256(b[rp:rp+rs]).hexdigest())
+              return imp,out
+          frozen_imp,frozen=pe_sections('candidate/RC3-frozen.dll')
+          final_imp,final=pe_sections('candidate/SigProcDll-64HF.dll')
+          if frozen_imp != final_imp: raise SystemExit(f'IMPORT_DIRECTORY_CHANGED {frozen_imp} {final_imp}')
+          for name in ('.rdata','.data','.reloc'):
+              if frozen.get(name) != final.get(name): raise SystemExit(f'IMPORT_BEARING_SECTION_CHANGED {name} {frozen.get(name)} {final.get(name)}')
+          Path('import_binary_identity.txt').write_text('IMPORT_DIRECTORY_RVA_SIZE_UNCHANGED=%r\nRDATA_DATA_RELOC_RAW_SHA_UNCHANGED\nIMPORT_BINARY_IDENTITY_PASS\n' % (frozen_imp,))
+          print(Path('import_binary_identity.txt').read_text())
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Gate final PE ABI exports imports and repair sections
+        shell: cmd
+        run: |
+          ver > windows_environment.txt
+          dumpbin /headers candidate\SigProcDll-64HF.dll > final_headers.txt
+          dumpbin /exports candidate\SigProcDll-64HF.dll > final_exports.txt
+          dumpbin /imports candidate\SigProcDll-64HF.dll > final_imports.txt
+          findstr /C:"14C machine (x86)" final_headers.txt > nul || exit /b 31
+          findstr /C:".stkfix" final_headers.txt > nul || exit /b 32
+          findstr /C:".mathfix" final_headers.txt > nul || exit /b 33
+          findstr /C:"_SigProc@24" final_exports.txt > nul || exit /b 34
+          findstr /C:"_SigProc_Init@8" final_exports.txt > nul || exit /b 35
+          findstr /C:"_SigProc_Stat@0" final_exports.txt > nul || exit /b 36
+          findstr /C:"_SigProc_Fini@0" final_exports.txt > nul || exit /b 37
+          findstr /I /C:"ucrtbase.dll" final_imports.txt > nul && exit /b 38 || ver > nul
+          echo FINAL_PE32_X86_EXPORT_IMPORT_REPAIR_GATE_PASS> final_pe_gate.txt
+
+      - name: Native real-license full-runtime loader contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force smoke_work | Out-Null
+          Copy-Item candidate\SigProcDll-64HF.dll smoke_work\SigProcDll-64HF.dll -Force
+          Copy-Item baseline_artifact\payload\SigProcLoaderContractSmoke.exe smoke_work\ -Force
+          Copy-Item baseline_artifact\payload\runtime\inner-bed\* smoke_work\ -Force
+          Push-Location smoke_work
+          .\SigProcLoaderContractSmoke.exe *> ..\loader_smoke.txt
+          $rc=$LASTEXITCODE
+          Pop-Location
+          Get-Content loader_smoke.txt
+          if($rc -ne 0){ throw "LOADER_CONTRACT_FAIL rc=$rc" }
+          if(-not (Select-String -Path loader_smoke.txt -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS')){ throw 'LOADER_PASS_MARKER_MISSING' }
+          'NATIVE_REAL_LICENSE_FULL_RUNTIME_LOADER_CONTRACT_PASS' | Out-File loader_gate.txt
+
+      - name: Repeated service-style full-runtime load init call fini stability
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          Push-Location smoke_work
+          for($i=1;$i -le 200;$i++){
+            .\SigProcLoaderContractSmoke.exe *> $null
+            if($LASTEXITCODE -ne 0){ throw "SEQUENTIAL_SMOKE_FAIL iteration=$i rc=$LASTEXITCODE" }
+          }
+          Pop-Location
+          'SEQUENTIAL_200_FULL_RUNTIME_CONTRACT_PASS' | Out-File sequential_gate.txt
+
+      - name: Isolated parallel-process loader stress
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $jobs=@()
+          for($j=0;$j -lt 4;$j++){
+            $d="stress_$j"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item smoke_work\* $d\ -Force
+            $jobs += Start-Job -ArgumentList (Resolve-Path $d) -ScriptBlock {
+              param($dir)
+              Set-Location $dir
+              for($i=1;$i -le 50;$i++){
+                .\SigProcLoaderContractSmoke.exe *> $null
+                if($LASTEXITCODE -ne 0){ return "FAIL $i $LASTEXITCODE" }
+              }
+              return 'PASS'
+            }
+          }
+          Wait-Job $jobs | Out-Null
+          $res=$jobs | Receive-Job
+          $jobs | Remove-Job -Force
+          $res | Set-Content parallel_results.txt
+          if(($res | Where-Object {$_ -ne 'PASS'}).Count -ne 0){ throw "PARALLEL_STRESS_FAIL $res" }
+          'PARALLEL_4X50_ISOLATED_PROCESS_PASS' | Out-File parallel_gate.txt
+
+      - name: Compile exact real-GHF regression harness with MSVC x86
+        shell: cmd
+        run: |
+          copy /Y baseline_artifact\payload\fullreg.c fullreg.c > nul
+          cl /nologo /O2 /W4 /TC fullreg.c /Fe:fullreg.exe > fullreg_build.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type fullreg_build.txt
+          if not "%RC%"=="0" exit /b %RC%
+          if not exist fullreg.exe exit /b 61
+          echo FULLREG_MSVC_X86_BUILD_PASS> fullreg_build_gate.txt
+
+      - name: Full Aug03 real-GHF regression determinism long-run thread stress realtime performance
+        shell: cmd
+        run: |
+          fullreg.exe candidate\SigProcDll-64HF.dll baseline_artifact\payload\HostCompat.dll baseline_artifact\payload\C63.dll baseline_artifact\payload\runtime\inner-bed baseline_artifact\payload\runtime\outer-medical-bed baseline_artifact\payload\testdata > fullreg.txt 2>&1
+          set RC=%ERRORLEVEL%
+          type fullreg.txt
+          if not "%RC%"=="0" exit /b %RC%
+          findstr /C:"HOSTCOMPAT_REAL_NONZERO_PASS" fullreg.txt > nul || exit /b 71
+          findstr /C:"C63_REAL_NONZERO_PASS" fullreg.txt > nul || exit /b 72
+          findstr /C:"SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS" fullreg.txt > nul || exit /b 73
+          findstr /C:"DETERMINISTIC_REPLAY_PASS" fullreg.txt > nul || exit /b 74
+          findstr /C:"LONG_STABILITY_PASS" fullreg.txt > nul || exit /b 75
+          findstr /C:"TWO_THREAD_STRESS_PASS" fullreg.txt > nul || exit /b 76
+          findstr /C:"REALTIME_1HZ_PASS" fullreg.txt > nul || exit /b 77
+          findstr /C:"PERFORMANCE_PASS" fullreg.txt > nul || exit /b 78
+          findstr /C:"COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS" fullreg.txt > nul || exit /b 79
+          echo COMPLETE_NATIVE_WINDOWS_REAL_GHF_GATE_PASS> fullreg_gate.txt
+
+      - name: Final immutable candidate SHA gate
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $h=(Get-FileHash candidate\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:FINAL_SHA){ throw "POST_TEST_SHA_CHANGED $h" }
+          "RC3_STACK_MATH_NATIVE_WINDOWS_FULLREG_PASS SHA256=$h" | Out-File RC3_FINAL_NATIVE_PASS.lock
+
+      - name: Upload non-proprietary gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rc3-stack-math-native-fullreg-evidence-${{ github.run_id }}
+          path: |
+            baseline_binding.txt
+            delta_binding.txt
+            candidate_binding.txt
+            stackfix_report.json
+            mathfix_report.json
+            import_binary_identity.txt
+            windows_environment.txt
+            final_headers.txt
+            final_exports.txt
+            final_imports.txt
+            final_pe_gate.txt
+            loader_smoke.txt
+            loader_gate.txt
+            sequential_gate.txt
+            parallel_results.txt
+            parallel_gate.txt
+            fullreg_build.txt
+            fullreg_build_gate.txt
+            fullreg.txt
+            fullreg_gate.txt
+            RC3_FINAL_NATIVE_PASS.lock
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove one-time RSA handoff from branch
+        if: always()
+        shell: bash
+        run: |
+          git pull --ff-only origin "${GITHUB_REF_NAME}" || true
+          rm -rf .secure_rc3_final
+          git add -A .secure_rc3_final || true
+          if ! git diff --cached --quiet; then
+            git config user.name windows-dll-test-bot
+            git config user.email windows-dll-test-bot@users.noreply.github.com
+            git commit -m 'Remove RC3 final native gate one-time RSA handoff'
+            git push origin HEAD:${GITHUB_REF_NAME} || true
+          fi

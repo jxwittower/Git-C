@@ -1,0 +1,149 @@
+name: c8b8-final-native-fullreg-v8
+on:
+  push:
+    branches: [c8b8-fullreg-v2-resume-20260809]
+    paths:
+      - '.github/workflows/c8b8_final_native_fullreg_v8.yml'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 140
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      HOST_SHA: 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+      HOST_FIXED_SHA: ba15a5b0d4755597892ab6d20b0f9eeb49d5ac5da9dfd97ed6e94ecff7aac13b
+      C63_SHA: 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+      SMOKE_SHA: a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+      HARNESS_SHA: f068bfa856ad791e0e8663cd4d76f54dc64f1b5e61fffb7a7fc02b4ff7b21582
+      XZ_SHA: 08a5af2c16526f9830ace68817d1e6517422d4a3e66a8051030e78f865b1dd48
+      SOURCE_RUN: '31310246212'
+      SOURCE_ARTIFACT: c8b8-decrypted-fullreg-xz-31310246212
+      HANDOFF_BRANCH: c8b8-fullreg-v2-resume-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore decrypted fullreg checkpoint
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force recovered | Out-Null
+          gh run download $env:SOURCE_RUN -n $env:SOURCE_ARTIFACT -D recovered
+          $xz='recovered\c8b8_fullreg_payload_v2.tar.xz'
+          if(!(Test-Path $xz)){throw 'DECRYPTED_XZ_MISSING'}
+          $h=(Get-FileHash $xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h -ne $env:XZ_SHA){throw "DECRYPTED_XZ_SHA_FAIL $h"}
+          Copy-Item $xz payload.tar.xz -Force
+          "DECRYPTED_CHECKPOINT_RESTORE_PASS SHA256=$h SOURCE_RUN=$env:SOURCE_RUN" | Set-Content decrypted_restore_gate.txt
+
+      - name: Extract and prepare V8 assets
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force extract_xz,extract_tar | Out-Null
+          & 7z x -y payload.tar.xz '-oextract_xz' | Out-File 7z_xz.log
+          if($LASTEXITCODE -ne 0){throw '7Z_XZ_FAIL'}
+          $tar=(Get-ChildItem extract_xz -File | Select-Object -First 1).FullName
+          if(-not $tar){throw 'PAYLOAD_TAR_MISSING'}
+          & 7z x -y $tar '-oextract_tar' | Out-File 7z_tar.log
+          if($LASTEXITCODE -ne 0){throw '7Z_TAR_FAIL'}
+          Move-Item extract_tar\c8b8_fullreg_payload_v2 payload
+          python .c8b8_resume_support\prepare_gate_v5.py | Tee-Object prepare_gate_v5.log
+          if($LASTEXITCODE -ne 0){throw 'PREPARE_GATE_V5_FAIL'}
+          @'
+          from pathlib import Path
+          s=Path('.c8b8_resume_support/run_windows_gate_v6.ps1').read_text().replace('\r\n','\n').replace('\r','\n')
+          Path('payload/run_windows_gate.ps1').write_bytes(s.replace('\n','\r\n').encode('utf-8'))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\install_v8.py
+          python $env:RUNNER_TEMP\install_v8.py
+          $hf=(Get-FileHash payload\HostCompat-stackprobe-fixed.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hs=(Get-FileHash payload\fullreg_c8b8.c -Algorithm SHA256).Hash.ToLowerInvariant()
+          $rs=(Get-FileHash payload\run_windows_gate.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($hf -ne $env:HOST_FIXED_SHA){throw "HOSTFIX_SHA_FAIL $hf"}
+          if($hs -ne $env:HARNESS_SHA){throw "HARNESS_SHA_FAIL $hs"}
+          if(-not (Select-String -Path payload\run_windows_gate.ps1 -Pattern "candidate_nonzero.log" -SimpleMatch -Quiet)){throw 'RUNNER_CANDIDATE_NONZERO_MISSING'}
+          if(-not (Select-String -Path payload\run_windows_gate.ps1 -Pattern "hostcompat_fixed_nonzero.log" -SimpleMatch -Quiet)){throw 'RUNNER_HOSTFIX_NONZERO_MISSING'}
+          if(-not (Select-String -Path payload\run_windows_gate.ps1 -Pattern "ORIGINAL_HOSTCOMPAT_DYNAMIC_SKIPPED_KNOWN_STACK_UNSAFE" -SimpleMatch -Quiet)){throw 'RUNNER_HOST_ORIGINAL_SKIP_MISSING'}
+          if(Select-String -Path payload\run_windows_gate.ps1 -Pattern "Run-Native 'hostcompat_nonzero.log'" -SimpleMatch -Quiet){throw 'RUNNER_UNSAFE_HOST_NONZERO_PRESENT'}
+          "V8_PREP_PASS HOSTFIX_SHA=$hf HARNESS_SHA=$hs RUNNER_RECORDED_SHA=$rs" | Set-Content v8_asset_prep_gate.txt
+
+      - name: Persist prepared V8 metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v8-prepared-assets-${{ github.run_id }}
+          path: |
+            decrypted_restore_gate.txt
+            v8_asset_prep_gate.txt
+            prepare_gate_v5.txt
+            prepare_gate_v5.log
+            payload/MANIFEST.txt
+            payload/run_windows_gate.ps1
+            payload/fullreg_c8b8.c
+            payload/HostCompat-stackprobe-fixed.dll
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Run c8b8 exact native Windows complete regression
+        shell: powershell
+        timeout-minutes: 115
+        run: |
+          $ErrorActionPreference='Stop'
+          powershell -NoProfile -ExecutionPolicy Bypass -File payload\run_windows_gate.ps1
+          if($LASTEXITCODE -ne 0){throw "WINDOWS_GATE_FAIL $LASTEXITCODE"}
+          if(!(Test-Path C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock)){throw 'PASS_LOCK_MISSING'}
+          Get-Content C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+
+      - name: Upload V8 exact evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v8-native-fullreg-evidence-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/HostCompat-stackprobe-fixed.dll
+            payload/MANIFEST.txt
+            decrypted_restore_gate.txt
+            v8_asset_prep_gate.txt
+            exact_asset_hashes.txt
+            exact_asset_binding.txt
+            ghf_sha_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            static_pe_gate.txt
+            static_gate_python.log
+            fullreg_compile.txt
+            loader_inner.log
+            loader_outer.log
+            hostcompat_original_runtime_defect.txt
+            hostfix_loader_inner.log
+            hostfix_loader_outer.log
+            candidate_nonzero.log
+            c63_nonzero.log
+            hostcompat_fixed_nonzero.log
+            native_loader_baseline_gate.txt
+            01_sentinel.log
+            02_long.log
+            03_threads.log
+            04_full.log
+            05_determinism.log
+            06_realtime.log
+            post_test_sha.txt
+            complete_regression_gate.txt
+            C8B8_EXACT_NATIVE_AND_FULLREG_PASS.lock
+            run_windows_gate_pass.txt
+          if-no-files-found: ignore
+          retention-days: 30

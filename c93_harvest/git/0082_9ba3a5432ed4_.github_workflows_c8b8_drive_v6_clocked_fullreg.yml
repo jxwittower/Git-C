@@ -1,0 +1,197 @@
+name: c8b8-drive-v6-clock-aware-fullreg
+on:
+  push:
+    branches: [c8b8-drive-v3-release-20260809]
+    paths:
+      - '.github/workflows/c8b8_drive_v6_clocked_fullreg.yml'
+permissions:
+  contents: read
+jobs:
+  fullreg:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      CAND_SHA: c8b8f49620b45707f80f47a9fadf14db376a115bc6052517e9243e0cb2dc20e9
+      ENC_SHA: 53d11ca2b252e1b319d7552ed0c6ec5fdd53415286d63df0ea0c69bba1bd60de
+      XZ_SHA: 95a0d2efecfcebee99355727bd8e9034e4c2fe08c169ea7a996b630e07da5fbc
+      HARNESS_SHA: faa0f57ab71ab82fef66d9475584658d3b7c0e91e26bf45862e762b5470fe83d
+      GHF_COUNT: '13'
+      GHF_BYTES: '82484656'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Create one-time mailbox and RSA key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def q(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=q('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('MAIL_DOMAIN_FAIL')
+          a=string.ascii_lowercase+string.digits;addr='ghc8b8v6'+''.join(secrets.choice(a) for _ in range(14))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32))
+          q('POST',base+'/accounts',{'address':addr,'password':pw});tok=q('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-C8B8-V6-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('MAILBOX_READY',addr)
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mailbox.py
+          python $env:RUNNER_TEMP\mailbox.py
+          if($LASTEXITCODE -ne 0){throw 'MAILBOX_FAIL'}
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          if($LASTEXITCODE -ne 0){throw 'RSA_FAIL'}
+          New-Item -ItemType Directory -Force handoff|Out-Null;Copy-Item mailbox.txt,subject_prefix.txt,public.pem handoff\ -Force
+
+      - name: Upload handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v6-handoff-${{ github.run_id }}
+          path: handoff/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Receive exact encrypted payload
+        shell: powershell
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text());token=cfg['token'];base='https://api.mail.tm';prefix=Path('subject_prefix.txt').read_text().strip();out=Path('transport');out.mkdir(exist_ok=True)
+          wanted={f'{prefix}-P{i}':i for i in range(1,5)};got=set();key=False;seen=set()
+          def j(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def b(url):
+              r=urllib.request.Request(url);r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=120) as x:return x.read()
+          end=time.time()+1800
+          while time.time()<end and (len(got)<4 or not key):
+              x=j(base+'/messages');msgs=x if isinstance(x,list) else x.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject') not in wanted or m.get('id') in seen:continue
+                  seen.add(m['id']);idx=wanted[m['subject']];d=j(base+'/messages/'+m['id'])
+                  for at in d.get('attachments',[]):
+                      u=at.get('downloadUrl');name=at.get('filename','')
+                      if not u:continue
+                      data=b(urllib.parse.urljoin(base,u))
+                      if name==f'c8b8_v6_part{idx}.bin':(out/name).write_bytes(data);got.add(idx)
+                      elif name=='c8b8_v6_wrapped_key.bin':(out/name).write_bytes(data);key=True
+              if len(got)<4 or not key:time.sleep(5)
+          if len(got)!=4 or not key:raise SystemExit(f'TRANSPORT_FAIL parts={sorted(got)} key={key}')
+          print('MAIL_TRANSPORT_COMPLETE parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py|Tee-Object mail_transport.txt
+          if($LASTEXITCODE -ne 0){throw 'TRANSPORT_FAIL'}
+
+      - name: Decrypt extract and exact-bind candidate and all GHF
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import os
+          from pathlib import Path
+          d=Path(os.environ['RUNNER_TEMP'])/'payload.enc'
+          with d.open('wb') as o:
+              for i in range(1,5):o.write((Path('transport')/f'c8b8_v6_part{i}.bin').read_bytes())
+          print('REASSEMBLED',d.stat().st_size)
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\join.py
+          python $env:RUNNER_TEMP\join.py
+          $h=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\c8b8_v6_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $env:RUNNER_TEMP\payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          if($LASTEXITCODE -ne 0){throw 'DECRYPT_FAIL'}
+          $x=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"}
+          @'
+          import os,tarfile,hashlib
+          from pathlib import Path
+          dst=Path('payload');dst.mkdir(exist_ok=True)
+          with tarfile.open(Path(os.environ['RUNNER_TEMP'])/'payload.tar.xz','r:xz') as t:t.extractall(dst)
+          for f in ['CORE_SHA256SUMS.txt','GHF_SHA256SUMS.txt']:
+              for line in (dst/f).read_text().splitlines():
+                  if not line.strip():continue
+                  sha,rel=line.split(None,1);p=dst/rel.strip();got=hashlib.sha256(p.read_bytes()).hexdigest()
+                  if got!=sha:raise SystemExit(f'SHA_FAIL {rel} {got}')
+          cand=hashlib.sha256((dst/'SigProcDll-64HF.dll').read_bytes()).hexdigest();ghf=list((dst/'testdata').rglob('*.ghf'));total=sum(p.stat().st_size for p in ghf)
+          if cand!=os.environ['CAND_SHA'] or len(ghf)!=int(os.environ['GHF_COUNT']) or total!=int(os.environ['GHF_BYTES']):raise SystemExit(f'BIND_FAIL cand={cand} ghf={len(ghf)} bytes={total}')
+          print('EXACT_PAYLOAD_BIND_PASS cand=%s ghf=%d bytes=%d'%(cand,len(ghf),total))
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\bind.py
+          python $env:RUNNER_TEMP\bind.py|Tee-Object exact_asset_binding.txt
+          if($LASTEXITCODE -ne 0){throw 'BIND_FAIL'}
+
+      - name: Install SHA-locked clock-aware full regression harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import base64,gzip,hashlib,os
+          from pathlib import Path
+          s='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'
+          b=gzip.decompress(base64.b64decode(s));p=Path('payload/fullreg.c');p.write_bytes(b);h=hashlib.sha256(b).hexdigest()
+          if h!=os.environ['HARNESS_SHA']:raise SystemExit('HARNESS_SHA_FAIL '+h)
+          print('CLOCK_AWARE_HARNESS_SHA_PASS',h)
+          '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\install_harness.py
+          python $env:RUNNER_TEMP\install_harness.py|Tee-Object harness_binding.txt
+          if($LASTEXITCODE -ne 0){throw 'HARNESS_BIND_FAIL'}
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile clock-aware x86 harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          $o=& cl /nologo /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Fe:payload\fullreg.exe payload\fullreg.c 2>&1;$rc=$LASTEXITCODE
+          $t=($o|ForEach-Object{$_.ToString()}) -join "`n";$t|Set-Content -Encoding utf8 fullreg_compile.txt;Write-Host $t
+          if($rc -ne 0){exit $rc}
+
+      - name: Execute exact complete full regression with simulated 1Hz replay and real 1Hz clock check
+        shell: powershell
+        timeout-minutes: 125
+        run: |
+          $ErrorActionPreference='Continue'
+          $o=& .\payload\fullreg.exe .\payload\SigProcDll-64HF.dll .\payload\HostCompat.dll .\payload\C63.dll .\payload\testdata .\payload\runtime\inner-bed .\payload\runtime\outer-medical-bed 2>&1;$rc=$LASTEXITCODE
+          $t=($o|ForEach-Object{$_.ToString()}) -join "`n";$t|Set-Content -Encoding utf8 full_regression.log;Write-Host $t
+          "FULLREG_EXIT=$rc"|Set-Content -Encoding ascii regression_runner_exit.txt
+          if($rc -ne 0){exit $rc}
+          $marks=@('FAKE_CLOCK_IAT_PASS tag=candidate-inner-full tick_seconds=1','INNER_FULL_REPLAY_PASS','OUTER_FULL_REPLAY_PASS','SEQ_TARGETS_VITAL_SUPPRESSION_RECOVERY_PASS','DETERMINISTIC_REPLAY_PASS','PERFORMANCE_PASS','LONG_STABILITY_PASS loops=20000','TWO_THREAD_STRESS_PASS threads=2 loops_each=2000','REALTIME_1HZ_PASS frames=60','HOSTCOMPAT_FULL_BASELINE_PASS','C63_FULL_BASELINE_PASS','BASELINE_COMPARISON_PASS','COMPLETE_NATIVE_WINDOWS_REGRESSION_PASS')
+          foreach($m in $marks){if(-not $t.Contains($m)){Write-Error "MISSING_MARKER $m";exit 90}}
+          'FULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_PASS'|Set-Content -Encoding ascii fullreg_gate.txt
+
+      - name: Exact post-test SHA release lock
+        shell: powershell
+        run: |
+          $h=(Get-FileHash payload\SigProcDll-64HF.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:CAND_SHA){throw "POST_SHA_FAIL $h"}
+          "POST_TEST_SHA256=$h"|Set-Content -Encoding ascii post_regression_sha256.txt
+          "NATIVE_WINDOWS_DYNAMIC_PASS SHA256=$h`nFULL_NATIVE_WINDOWS_COMPLETE_REGRESSION_PASS SHA256=$h`nRELEASE_GATE_PASS SHA256=$h`nHARNESS_SHA256=$env:HARNESS_SHA"|Set-Content -Encoding ascii C8B8_V6_EXACT_RELEASE_PASS.lock
+
+      - name: Upload exact tested DLL and full evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-v6-exact-release-${{ github.run_id }}
+          path: |
+            payload/SigProcDll-64HF.dll
+            payload/fullreg.c
+            exact_asset_binding.txt
+            harness_binding.txt
+            fullreg_compile.txt
+            full_regression.log
+            regression_runner_exit.txt
+            fullreg_gate.txt
+            post_regression_sha256.txt
+            C8B8_V6_EXACT_RELEASE_PASS.lock
+            mail_transport.txt
+          if-no-files-found: ignore
+          retention-days: 30

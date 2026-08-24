@@ -1,0 +1,293 @@
+name: full-regression-final-v1
+
+on:
+  push:
+    paths:
+      - '.github/workflows/full_regression_final_v1.yml'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  full-regression:
+    runs-on: windows-2022
+    timeout-minutes: 70
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Require exact native V5 pass lock
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 360); do
+            git fetch -q origin main || true
+            if git show origin/main:evidence_summary/FINAL_NATIVE_V5_PASS.lock > "$RUNNER_TEMP/native.lock" 2>/dev/null; then
+              if grep -Fq 'FINAL_NATIVE_WINDOWS_V5_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326' "$RUNNER_TEMP/native.lock"; then ok=1; break; fi
+            fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=NATIVE_V5_PREREQUISITE; exit 10; }
+          cat "$RUNNER_TEMP/native.lock"
+          echo EXACT_NATIVE_V5_PREREQUISITE_PASS
+
+      - name: Publish full-regression one-time RSA key
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/fullreg_private.pem"
+          openssl pkey -in "$RUNNER_TEMP/fullreg_private.pem" -pubout -out "$RUNNER_TEMP/fullreg_public.pem"
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            rm -rf .final_fullreg_handoff_v1
+            mkdir -p .final_fullreg_handoff_v1
+            cp "$RUNNER_TEMP/fullreg_public.pem" .final_fullreg_handoff_v1/public.pem
+            git add .final_fullreg_handoff_v1/public.pem
+            git commit -qm 'Publish final full regression v1 one-time RSA key' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=FULLREG_PUBLIC_KEY_PUSH; exit 19; }
+          echo FULLREG_V1_PUBLIC_KEY_PUBLISHED
+
+      - name: Download encrypted full regression payload
+        run: |
+          set -euo pipefail
+          url='https://drive.google.com/uc?export=download&id=1qodNWgYhbzggtOx_cOZjDo17jxrSXXj0'
+          ok=0
+          for i in $(seq 1 120); do
+            rm -f "$RUNNER_TEMP/fullreg.enc"
+            if curl -L -sS --fail --max-time 60 -o "$RUNNER_TEMP/fullreg.enc" "$url"; then
+              size=$(wc -c < "$RUNNER_TEMP/fullreg.enc" | tr -d '[:space:]')
+              if [ "$size" -gt 10000 ]; then ok=1; break; fi
+            fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=FULLREG_PAYLOAD_DOWNLOAD; exit 20; }
+          sha256sum "$RUNNER_TEMP/fullreg.enc" | tee fullreg_ciphertext_sha256.txt
+          echo FULLREG_ENCRYPTED_PAYLOAD_ACQUIRED
+
+      - name: Wait for matching full-regression wrapped AES key
+        run: |
+          set -euo pipefail
+          drive='https://drive.google.com/uc?export=download&id=1EprfV4hwC0Xjq3Lf_a6jMhvTqxFiX8ov'
+          ok=0
+          for i in $(seq 1 600); do
+            rm -f "$RUNNER_TEMP/fullreg_key.try" "$RUNNER_TEMP/fullreg_pass.try"
+            if curl -L -sS --fail --max-time 20 -o "$RUNNER_TEMP/fullreg_key.try" "$drive"; then
+              if [ "$(wc -c < "$RUNNER_TEMP/fullreg_key.try" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/fullreg_private.pem" -in "$RUNNER_TEMP/fullreg_key.try" -out "$RUNNER_TEMP/fullreg_pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/fullreg_pass.try" "$RUNNER_TEMP/fullreg_pass.txt"; ok=1; echo KEY_SOURCE=DRIVE; break
+                fi
+              fi
+            fi
+            git fetch -q origin main || true
+            if git show origin/main:.final_fullreg_handoff_v1/key.enc.b64 > "$RUNNER_TEMP/fullreg_key.b64" 2>/dev/null; then
+              if base64 -d "$RUNNER_TEMP/fullreg_key.b64" > "$RUNNER_TEMP/fullreg_key.try" 2>/dev/null && [ "$(wc -c < "$RUNNER_TEMP/fullreg_key.try" | tr -d '[:space:]')" = 384 ]; then
+                if openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/fullreg_private.pem" -in "$RUNNER_TEMP/fullreg_key.try" -out "$RUNNER_TEMP/fullreg_pass.try" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 >/dev/null 2>&1; then
+                  mv "$RUNNER_TEMP/fullreg_pass.try" "$RUNNER_TEMP/fullreg_pass.txt"; ok=1; echo KEY_SOURCE=GITHUB; break
+                fi
+              fi
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo FAIL_STAGE=FULLREG_RSA_KEY_TIMEOUT; exit 23; }
+          echo FULLREG_RSA_KEY_HANDOFF_PASS
+
+      - name: Decrypt and verify full-regression payload
+        run: |
+          set -euo pipefail
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 250000 -in "$RUNNER_TEMP/fullreg.enc" -out "$RUNNER_TEMP/fullreg.tar.xz" -pass file:"$RUNNER_TEMP/fullreg_pass.txt" || { echo FAIL_STAGE=FULLREG_AES_DECRYPT; exit 24; }
+          rm -rf payload && mkdir payload
+          tar -xJf "$RUNNER_TEMP/fullreg.tar.xz" -C payload || { echo FAIL_STAGE=FULLREG_EXTRACT; exit 25; }
+          cd payload/fullreg_v2_rootfs
+          sha256sum -c FULLREG_V2_SHA256SUMS.txt
+          cand=$(sha256sum mnt/data/GuanHu_exact_bins/SigProcDll-64HF.dll | awk '{print $1}')
+          base=$(sha256sum mnt/data/GuanHu_exact_bins/SigProcDll-HostCompat-baseline.dll | awk '{print $1}')
+          orig=$(sha256sum mnt/data/GuanHu_exact_bins/SigProcDll-C63-original.dll | awk '{print $1}')
+          smoke=$(sha256sum mnt/data/GuanHu_exact_bins/SigProcLoaderContractSmoke.exe | awk '{print $1}')
+          test "$cand" = 8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326
+          test "$base" = 081c4c62d2bf377913eb2aca0cc3cf3bf656350c8abaa3aaf11d171dac604804
+          test "$orig" = 56c02d18a9ee68a7ae14c4601e4ba24f7af170c6db01ea21fbff91cbe6b082fb
+          test "$smoke" = a9cc5cf614114c9481073669a3fd5d7ef5e1a1adce7e0fdc3f62824e0d50431d
+          printf '%s\n' "$cand" > ../../candidate_sha256.txt
+          rm -f "$RUNNER_TEMP/fullreg_pass.txt" "$RUNNER_TEMP/fullreg_key.try" "$RUNNER_TEMP/fullreg.enc" "$RUNNER_TEMP/fullreg.tar.xz"
+          echo FULLREG_EXACT_PAYLOAD_HASHES_PASS
+
+      - name: Recreate regression path tree
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $drive=(Get-Location).Drive.Root
+          $root=Join-Path $drive 'mnt\data'
+          if(Test-Path $root){ Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item -Recurse -Force 'payload\fullreg_v2_rootfs\mnt\data\*' $root
+          $script=Join-Path $root 'run_final_regression_windows.py'
+          if(!(Test-Path $script)){ throw 'REGRESSION_SCRIPT_MISSING' }
+          $unix='/mnt/data'
+          $win=($root -replace '\\','/')
+          $txt=Get-Content $script -Raw
+          $txt=$txt.Replace($unix,$win)
+          Set-Content -Encoding UTF8 $script $txt
+          "REGRESSION_ROOT=$root" | Out-File regression_root.txt
+          Get-FileHash (Join-Path $root 'GuanHu_exact_bins\SigProcDll-64HF.dll') -Algorithm SHA256 | Format-List | Out-File regression_candidate_hash.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Configure Python x86
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x86'
+
+      - name: Install native compatibility shims
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $tools=Join-Path $env:RUNNER_TEMP 'guanhu-tools'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          @'
+import os, subprocess, sys
+if len(sys.argv)<2: raise SystemExit(2)
+p=subprocess.run(sys.argv[1:])
+raise SystemExit(p.returncode)
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'wine_shim.py')
+          @'
+@echo off
+python "%~dp0wine_shim.py" %*
+exit /b %errorlevel%
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'wine.cmd')
+          @'
+import os, subprocess, sys
+args=sys.argv[1:]
+out=None; src=[]; wx=False
+i=0
+while i<len(args):
+ a=args[i]
+ if a=='-o' and i+1<len(args): out=args[i+1]; i+=2; continue
+ if a.lower().endswith('.c'): src.append(a)
+ if a in ('-Werror','-Werror=all'): wx=True
+ i+=1
+if not out or not src: raise SystemExit('gcc shim requires -o and .c source')
+cmd=['cl','/nologo','/O2','/W4']
+if wx: cmd.append('/WX')
+cmd += ['/Fe:'+out] + src
+p=subprocess.run(cmd)
+raise SystemExit(p.returncode)
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'gcc_shim.py')
+          @'
+@echo off
+python "%~dp0gcc_shim.py" %*
+exit /b %errorlevel%
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'i686-w64-mingw32-gcc.cmd')
+          @'
+import re, subprocess, sys
+args=sys.argv[1:]
+path=args[-1] if args else ''
+if not path: raise SystemExit(2)
+def run(x):
+ p=subprocess.run(x,capture_output=True,text=True,errors='replace')
+ if p.returncode: sys.stderr.write(p.stdout+p.stderr); raise SystemExit(p.returncode)
+ return p.stdout
+h=run(['dumpbin','/headers',path])
+e=run(['dumpbin','/exports',path])
+i=run(['dumpbin','/imports',path])
+if re.search(r'machine \(x86\)',h,re.I): print(path+': file format pei-i386')
+for line in i.splitlines():
+ m=re.match(r'^\s+([A-Za-z0-9_.-]+\.dll)\s*$',line)
+ if m: print('DLL Name: '+m.group(1))
+print(h); print(e); print(i)
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'objdump_shim.py')
+          @'
+@echo off
+python "%~dp0objdump_shim.py" %*
+exit /b %errorlevel%
+'@ | Set-Content -Encoding ASCII (Join-Path $tools 'i686-w64-mingw32-objdump.cmd')
+          $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          'SHIMS_INSTALLED' | Out-File shims_status.txt
+
+      - name: Run complete regression driver natively on Windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $drive=(Get-Location).Drive.Root
+          $root=Join-Path $drive 'mnt\data'
+          $script=Join-Path $root 'run_final_regression_windows.py'
+          $log=Join-Path (Get-Location) 'full_regression_windows.log'
+          Push-Location $root
+          try {
+            & python $script *>&1 | Tee-Object -FilePath $log
+            if($LASTEXITCODE -ne 0){ throw "REGRESSION_DRIVER_RC=$LASTEXITCODE" }
+          } finally { Pop-Location }
+          $marker=Join-Path $root 'full_regression_local_v5_pass'
+          if(!(Test-Path $marker)){ throw 'FULL_REGRESSION_PASS_MARKER_MISSING' }
+          'FULL_NATIVE_WINDOWS_REGRESSION_DRIVER_PASS' | Out-File full_regression_driver_pass.txt
+
+      - name: Re-run exact native loader contract after regression
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $drive=(Get-Location).Drive.Root
+          $root=Join-Path $drive 'mnt\data'
+          $dll=Join-Path $root 'GuanHu_exact_bins\SigProcDll-64HF.dll'
+          $smoke=Join-Path $root 'GuanHu_exact_bins\SigProcLoaderContractSmoke.exe'
+          Copy-Item -Force $smoke (Join-Path $root 'GuanHu_exact_bins\postreg_smoke.exe')
+          Push-Location (Join-Path $root 'GuanHu_exact_bins')
+          try {
+            .\postreg_smoke.exe *>&1 | Tee-Object -FilePath (Join-Path (Get-Location) 'postreg_loader_smoke.txt')
+            if($LASTEXITCODE -ne 0){ throw "POSTREG_SMOKE_RC=$LASTEXITCODE" }
+            if(-not (Select-String -Quiet -SimpleMatch 'ALL_LOADER_CONTRACT_TESTS_PASS' 'postreg_loader_smoke.txt')){ throw 'POSTREG_SMOKE_SENTINEL_MISSING' }
+          } finally { Pop-Location }
+          Get-FileHash $dll -Algorithm SHA256 | Format-List | Out-File postreg_candidate_hash.txt
+          'POSTREG_NATIVE_LOADER_PASS' | Out-File postreg_loader_pass.txt
+
+      - name: Publish exact full-regression pass lock
+        if: success()
+        run: |
+          set -euo pipefail
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          ok=0
+          for n in 1 2 3 4 5; do
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            mkdir -p evidence_summary
+            printf 'FULL_NATIVE_WINDOWS_REGRESSION_V1_PASS SHA256=8238712f68f5108ab6a6ca5d67e100e41af960a3c472899cd97a98925c68e326 NATIVE_GATE=V5 RUN_ID=%s\n' "$GITHUB_RUN_ID" > evidence_summary/FINAL_FULLREG_NATIVE_V1_PASS.lock
+            git add evidence_summary/FINAL_FULLREG_NATIVE_V1_PASS.lock
+            git commit -qm 'Record final native full regression v1 pass' || true
+            if git push -q origin HEAD:main; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || exit 60
+
+      - name: Upload full-regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-fullreg-native-v1-evidence
+          path: |
+            candidate_sha256.txt
+            fullreg_ciphertext_sha256.txt
+            regression_root.txt
+            regression_candidate_hash.txt
+            shims_status.txt
+            full_regression_windows.log
+            full_regression_driver_pass.txt
+            postreg_candidate_hash.txt
+            postreg_loader_pass.txt
+          if-no-files-found: ignore
+          retention-days: 7

