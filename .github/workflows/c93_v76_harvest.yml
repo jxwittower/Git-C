@@ -1,0 +1,134 @@
+name: c93-v76-replay-harness-harvest
+
+on:
+  push:
+    branches: [c93-v76-replay-20260824]
+    paths:
+      - '.github/workflows/c93_v76_harvest.yml'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          ref: c93-v76-replay-20260824
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Harvest replay sources from git history and recent artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf c93_harvest
+          mkdir -p c93_harvest/git c93_harvest/artifacts
+          python3 - <<'PY'
+          import os, re, json, io, zipfile, hashlib, subprocess, urllib.request
+          from pathlib import Path
+
+          out=Path('c93_harvest')
+          wanted_exact={
+              'fullreg.c','run_final_regression_windows.py','validate_windows_results.py',
+              'validate_seq_targets.py','sigprocprobe.c','sigproc_probe.c','replay.c',
+              'replay_harness.c','sigprocloadercontractsmoke.c'
+          }
+          key_re=re.compile(r'(fullreg|regression|replay|sigproc.*probe|loader.*smoke|validate_.*results|validate_.*targets)',re.I)
+          text_ext={'.c','.h','.hpp','.cpp','.py','.ps1','.cmd','.bat','.txt','.md','.json','.yml','.yaml'}
+          manifest=[]; seen_sha=set()
+
+          # 1) Search every reachable git object/path.
+          rows=subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='replace').splitlines()
+          for row in rows:
+              parts=row.split(' ',1)
+              if len(parts)!=2: continue
+              oid,path=parts
+              base=Path(path).name.lower()
+              if base not in wanted_exact and not key_re.search(path): continue
+              try:
+                  typ=subprocess.check_output(['git','cat-file','-t',oid],text=True,stderr=subprocess.DEVNULL).strip()
+                  if typ!='blob': continue
+                  size=int(subprocess.check_output(['git','cat-file','-s',oid],text=True).strip())
+                  if size>2_000_000: continue
+                  data=subprocess.check_output(['git','cat-file','-p',oid])
+              except Exception:
+                  continue
+              if Path(path).suffix.lower() not in text_ext: 
+                  manifest.append({'source':'git','path':path,'oid':oid,'size':size,'kept':False})
+                  continue
+              sha=hashlib.sha256(data).hexdigest()
+              if sha in seen_sha: continue
+              seen_sha.add(sha)
+              safe=re.sub(r'[^A-Za-z0-9._-]+','_',path)[-180:]
+              dest=out/'git'/f'{len(seen_sha):04d}_{sha[:12]}_{safe}'
+              dest.write_bytes(data)
+              manifest.append({'source':'git','path':path,'oid':oid,'sha256':sha,'size':size,'kept':True,'dest':str(dest)})
+
+          # 2) Search non-expired recent Actions artifacts.
+          token=os.environ['GH_TOKEN']; repo=os.environ['GITHUB_REPOSITORY']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          arts=[]
+          for page in range(1,8):
+              req=urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}',headers=headers)
+              with urllib.request.urlopen(req,timeout=30) as r: obj=json.load(r)
+              batch=obj.get('artifacts',[]); arts.extend(batch)
+              if len(batch)<100: break
+          arts=[a for a in arts if not a.get('expired') and a.get('size_in_bytes',0)<=150_000_000]
+          arts.sort(key=lambda a:(0 if key_re.search(a.get('name','')) else 1,-int(a['id'])))
+          downloaded=0; matches=0
+          for a in arts:
+              likely=bool(key_re.search(a.get('name','')))
+              if downloaded>=140 and not likely: continue
+              try:
+                  req=urllib.request.Request(a['archive_download_url'],headers=headers)
+                  with urllib.request.urlopen(req,timeout=60) as r: zbytes=r.read()
+                  downloaded+=1
+                  z=zipfile.ZipFile(io.BytesIO(zbytes))
+              except Exception as e:
+                  manifest.append({'source':'artifact','artifact_id':a['id'],'name':a.get('name'),'error':str(e)[:160]})
+                  continue
+              names=z.namelist()
+              interesting=[n for n in names if Path(n).name.lower() in wanted_exact or key_re.search(n)]
+              # Also capture C/H/Python sources from an artifact already recognized as regression/replay related.
+              if likely:
+                  interesting += [n for n in names if Path(n).suffix.lower() in {'.c','.h','.py'} and len(n)<260]
+              for n in sorted(set(interesting)):
+                  if n.endswith('/'): continue
+                  try: data=z.read(n)
+                  except Exception: continue
+                  sha=hashlib.sha256(data).hexdigest(); ext=Path(n).suffix.lower()
+                  keep=ext in text_ext and len(data)<=2_000_000
+                  rec={'source':'artifact','artifact_id':a['id'],'artifact_name':a.get('name'),'path':n,'sha256':sha,'size':len(data),'kept':False}
+                  if keep and sha not in seen_sha:
+                      seen_sha.add(sha); matches+=1
+                      safe=re.sub(r'[^A-Za-z0-9._-]+','_',n)[-170:]
+                      dest=out/'artifacts'/f'{a["id"]}_{matches:04d}_{sha[:12]}_{safe}'
+                      dest.write_bytes(data); rec['kept']=True; rec['dest']=str(dest)
+                  manifest.append(rec)
+
+          (out/'HARVEST_MANIFEST.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')
+          summary=[]
+          for p in sorted((out/'git').glob('*')): summary.append(f'GIT\t{p.name}\t{p.stat().st_size}')
+          for p in sorted((out/'artifacts').glob('*')): summary.append(f'ARTIFACT\t{p.name}\t{p.stat().st_size}')
+          (out/'HARVEST_SUMMARY.tsv').write_text('\n'.join(summary)+'\n',encoding='utf-8')
+          (out/'HARVEST_DONE.txt').write_text(f'HARVEST_DONE git_and_artifact_sources={len(summary)} artifacts_scanned={downloaded}\n',encoding='ascii')
+          print((out/'HARVEST_DONE.txt').read_text())
+          print('\n'.join(summary[:200]))
+          PY
+
+      - name: Commit harvested replay sources on isolated branch
+        run: |
+          set -euo pipefail
+          git config user.name c93-replay-bot
+          git config user.email c93-replay-bot@users.noreply.github.com
+          git add c93_harvest
+          if ! git diff --cached --quiet; then
+            git commit -m 'Harvest historical replay harness sources for C93 V76'
+            git push origin HEAD:c93-v76-replay-20260824
+          fi
