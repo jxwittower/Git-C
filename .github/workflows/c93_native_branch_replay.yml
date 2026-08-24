@@ -46,7 +46,8 @@ jobs:
           $ErrorActionPreference='Stop'
           $ok=$false
           for($i=0;$i -lt 150;$i++){
-            git pull --ff-only origin c93-v76-replay-20260824 2>$null | Out-Null
+            cmd /c "git pull --ff-only origin c93-v76-replay-20260824 >nul 2>nul"
+            if($LASTEXITCODE -ne 0){Start-Sleep -Seconds 2;continue}
             if((Test-Path .c93_branch_handoff\ready.txt) -and (Test-Path .c93_branch_handoff\key.enc.b64) -and (Test-Path .c93_branch_handoff\manifest.txt)){$ok=$true;break}
             Start-Sleep -Seconds 2
           }
