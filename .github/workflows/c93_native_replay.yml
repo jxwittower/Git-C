@@ -1,0 +1,220 @@
+name: c93-native-replay
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: write
+  actions: write
+jobs:
+  replay:
+    if: startsWith(github.event.issue.title, 'C93_NATIVE_REPLAY_')
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      C93_SHA: e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae
+      C92_SHA: d7aca4edcb90ed1826c1d68422c5d08197cc5681166b83b9466cd5c0e999529d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish one-time RSA public key
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\c93_private.pem
+          openssl pkey -in $env:RUNNER_TEMP\c93_private.pem -pubout -out c93_public.pem
+          $fp=(openssl pkey -pubin -in c93_public.pem -outform DER | openssl dgst -sha256).Split('=')[-1].Trim()
+          New-Item -ItemType Directory -Force c93_native_handoff | Out-Null
+          Copy-Item c93_public.pem c93_native_handoff\public.pem -Force
+          @("RUN_ID=$env:GITHUB_RUN_ID","ISSUE=${{ github.event.issue.number }}","PUBKEY_SHA256=$fp","C93_SHA=$env:C93_SHA") | Set-Content c93_native_handoff\binding.txt -Encoding ascii
+          git config user.name c93-native-test-bot
+          git config user.email c93-native-test-bot@users.noreply.github.com
+          git fetch origin main
+          git checkout -B main origin/main
+          git add c93_native_handoff
+          git commit -m "Publish C93 native replay one-time RSA key run $env:GITHUB_RUN_ID"
+          git push origin HEAD:main
+
+      - name: Wait for encrypted payload handoff
+        shell: powershell
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference='Stop'
+          $dir="c93_native_transport/$env:GITHUB_RUN_ID"
+          $ok=$false
+          for($i=0;$i -lt 300;$i++){
+            git fetch -q origin main
+            git checkout -q -B main origin/main
+            if(Test-Path "$dir/READY.txt"){ $ok=$true; break }
+            Start-Sleep -Seconds 3
+          }
+          if(!$ok){ throw 'C93_ENCRYPTED_PAYLOAD_TIMEOUT' }
+          $parts=Get-ChildItem "$dir/payload_*.b64" | Sort-Object Name
+          if($parts.Count -lt 2){ throw 'C93_PAYLOAD_PARTS_MISSING' }
+          $joined=Join-Path $env:RUNNER_TEMP 'payload.b64'
+          Remove-Item $joined -ErrorAction SilentlyContinue
+          foreach($p in $parts){ Get-Content $p.FullName -Raw | Add-Content $joined -NoNewline }
+          certutil -f -decode $joined $env:RUNNER_TEMP\payload.enc | Out-Null
+          certutil -f -decode "$dir/wrapped_key.b64" $env:RUNNER_TEMP\wrapped_key.bin | Out-Null
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\c93_private.pem -in $env:RUNNER_TEMP\wrapped_key.bin -out $env:RUNNER_TEMP\aes_pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){ throw 'RSA_KEY_UNWRAP_FAIL' }
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $env:RUNNER_TEMP\payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\aes_pass.txt
+          if($LASTEXITCODE -ne 0){ throw 'AES_DECRYPT_FAIL' }
+          New-Item -ItemType Directory -Force payload | Out-Null
+          @'
+          import tarfile
+          with tarfile.open(r"%RUNNER_TEMP%\payload.tar.xz",'r:xz') as t:
+              t.extractall('payload')
+          '@.Replace('%RUNNER_TEMP%',$env:RUNNER_TEMP) | Set-Content -Encoding ascii $env:RUNNER_TEMP\extract_payload.py
+          python $env:RUNNER_TEMP\extract_payload.py
+          $h93=(Get-FileHash payload\bin\C93.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $h92=(Get-FileHash payload\bin\C92.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($h93 -ne $env:C93_SHA){ throw "C93_SHA_MISMATCH $h93" }
+          if($h92 -ne $env:C92_SHA){ throw "C92_SHA_MISMATCH $h92" }
+          'PAYLOAD_DECRYPT_AND_HASH_BIND_PASS' | Out-File payload_gate.txt -Encoding ascii
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build native x86 replay harness
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          typedef int (__stdcall *InitFn)(char*,void*);
+          typedef unsigned char (__stdcall *StatFn)(void);
+          typedef void (__stdcall *FiniFn)(void);
+          typedef uint32_t (__stdcall *ProcFn)(const uint32_t*,const void*,int,void*,void*,void*);
+          static uint32_t ids[4096];
+          static uint16_t words[4096*4];
+          static unsigned char statebuf[0x105c], resultbuf[0x786];
+          static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
+          static int wr(FILE*f,const void*p,size_t n){return fwrite(p,1,n,f)==n;}
+          int main(int argc,char**argv){
+            FILE *in,*out,*log; HMODULE m; InitFn init;StatFn stat;FiniFn fini;ProcFn proc;
+            uint32_t nrec=0,i,rel,c,seq,prevrel=0; unsigned char statv,hdr[4]; char product[192]={0}; unsigned char lic[4]={1,0,0,0}; int ir;
+            if(argc<4){fprintf(stderr,"usage: replay dll input out\n");return 2;}
+            log=fopen("replay_log.txt","wb"); if(!log)return 3;
+            m=LoadLibraryA(argv[1]); if(!m){fprintf(log,"LOAD_FAIL %lu\r\n",GetLastError());return 10;}
+            init=(InitFn)GetProcAddress(m,"_SigProc_Init@8"); stat=(StatFn)GetProcAddress(m,"_SigProc_Stat@0"); fini=(FiniFn)GetProcAddress(m,"_SigProc_Fini@0"); proc=(ProcFn)GetProcAddress(m,"_SigProc@24");
+            if(!init||!stat||!fini||!proc){fprintf(log,"EXPORT_FAIL\r\n");return 11;}
+            ir=init(product,lic); fprintf(log,"INIT=%d STAT=%u PRODUCT=%s\r\n",ir,(unsigned)stat(),product); fflush(log); if(!ir)return 12;
+            in=fopen(argv[2],"rb"); if(!in)return 13; if(!rd(in,hdr,4)||memcmp(hdr,"GHR1",4)||!rd(in,&nrec,4))return 14;
+            out=fopen(argv[3],"wb"); if(!out)return 15; {unsigned char oh[4]={'G','H','O','1'};uint32_t sl=0x105c,rl=0x786;wr(out,oh,4);wr(out,&nrec,4);wr(out,&sl,4);wr(out,&rl,4);} 
+            for(i=0;i<nrec;i++){
+              if(!rd(in,&rel,4)||!rd(in,&c,4)||c>4096)return 20;
+              if(c && (!rd(in,ids,c*4)||!rd(in,words,c*8)))return 21;
+              if(i && rel>prevrel){DWORD d=rel-prevrel; if(d>5000)d=5000; Sleep(d);} prevrel=rel;
+              memset(statebuf,0,sizeof(statebuf)); memset(resultbuf,0,sizeof(resultbuf));
+              seq=proc(c?ids:0,c?words:0,(int)c,0,statebuf,resultbuf); Sleep(10); statv=stat();
+              if(!wr(out,&rel,4)||!wr(out,&seq,4)||!wr(out,&statv,1)||!wr(out,statebuf,sizeof(statebuf))||!wr(out,resultbuf,sizeof(resultbuf)))return 22;
+              if((i%30)==0){fprintf(log,"REC %u/%u seq=%u stat=%u state1028=%u\r\n",i,nrec,seq,(unsigned)statv,(unsigned)statebuf[1028]);fflush(log);}
+            }
+            fclose(in);fclose(out);fini();fprintf(log,"DONE records=%u finalstat=%u\r\n",nrec,(unsigned)stat());fflush(log);FreeLibrary(m);fclose(log);return 0;
+          }
+          '@ | Set-Content -Encoding ascii native_replay.c
+          cl /nologo /O2 /W3 /D_CRT_SECURE_NO_WARNINGS native_replay.c /link /out:NativeReplay.exe
+          if($LASTEXITCODE -ne 0){ throw 'NATIVE_REPLAY_BUILD_FAIL' }
+          dumpbin /headers NativeReplay.exe | Out-File native_replay_headers.txt
+          if((Get-Content native_replay_headers.txt -Raw) -notmatch '14C machine'){ throw 'NATIVE_REPLAY_NOT_X86' }
+
+      - name: Prepare 14 isolated A-B runs
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import lzma, shutil
+          root=Path('payload'); out=Path('runs'); out.mkdir(exist_ok=True)
+          cases={
+            'morning':'t_morning.ghr.xz',
+            'outer1':'t_outer1.ghr.xz',
+            'outer2a':'t_outer2a.ghr.xz',
+            'outer2b':'t_outer2b.ghr.xz',
+            'inner7':'t_inner7.ghr.xz',
+            'inner12':'t_inner12.ghr.xz',
+            'inner9':'t_inner9.ghr.xz',
+          }
+          side={'morning':'morning','outer1':'outer','outer2a':'outer','outer2b':'outer','inner7':'inner','inner12':'inner','inner9':'inner'}
+          for ver in ('C92','C93'):
+            for case,fn in cases.items():
+              d=out/f'{ver}_{case}'; d.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(root/'bin'/f'{ver}.dll',d/'SigProcDll-64HF.dll')
+              for p in (root/'sidecars'/side[case]).iterdir():
+                if p.is_file(): shutil.copy2(p,d/p.name)
+              (d/'input.ghr').write_bytes(lzma.decompress((root/'data'/fn).read_bytes()))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\prep.py
+          python $env:RUNNER_TEMP\prep.py
+
+      - name: Run C92 and C93 windows in parallel at real-time cadence
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe=(Resolve-Path NativeReplay.exe).Path
+          $procs=@()
+          Get-ChildItem runs -Directory | ForEach-Object {
+            $d=$_.FullName
+            $p=Start-Process -FilePath $exe -WorkingDirectory $d -ArgumentList 'SigProcDll-64HF.dll','input.ghr','rawout.bin' -RedirectStandardOutput "$d\stdout.txt" -RedirectStandardError "$d\stderr.txt" -PassThru
+            $procs += [PSCustomObject]@{Name=$_.Name;P=$p;Dir=$d}
+          }
+          $deadline=(Get-Date).AddMinutes(7)
+          foreach($x in $procs){
+            while(-not $x.P.HasExited -and (Get-Date) -lt $deadline){ Start-Sleep -Seconds 2; $x.P.Refresh() }
+            if(-not $x.P.HasExited){ Stop-Process -Id $x.P.Id -Force; "TIMEOUT" | Out-File "$($x.Dir)\exit.txt" }
+            else { "$($x.P.ExitCode)" | Out-File "$($x.Dir)\exit.txt" }
+          }
+          Get-ChildItem runs -Directory | ForEach-Object { "$($_.Name) EXIT=$(Get-Content ($_.FullName+'\exit.txt') -Raw)" } | Out-File native_run_status.txt
+
+      - name: Package raw A-B evidence
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import hashlib, json, struct
+          rows=[]
+          for d in sorted(Path('runs').iterdir()):
+              if not d.is_dir(): continue
+              ent={'run':d.name,'exit':(d/'exit.txt').read_text(errors='ignore').strip() if (d/'exit.txt').exists() else 'MISSING'}
+              for n in ('rawout.bin','replay_log.txt','stdout.txt','stderr.txt'):
+                  p=d/n
+                  ent[n]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} if p.exists() else None
+              rows.append(ent)
+          Path('native_evidence_manifest.json').write_text(json.dumps(rows,indent=2),encoding='utf-8')
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\manifest.py
+          python $env:RUNNER_TEMP\manifest.py
+          Compress-Archive -Path runs,native_run_status.txt,native_evidence_manifest.json,payload_gate.txt -DestinationPath c93_native_ab_results.zip -Force
+
+      - name: Upload native A-B artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c93-native-ab-results-${{ github.run_id }}
+          path: c93_native_ab_results.zip
+          retention-days: 7
+
+      - name: Commit non-sensitive completion marker
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          mkdir -p c93_native_results/${GITHUB_RUN_ID}
+          printf 'RUN_ID=%s\nARTIFACT=c93-native-ab-results-%s\nC93_SHA=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ID" "$C93_SHA" > c93_native_results/${GITHUB_RUN_ID}/DONE.txt
+          if [ -f native_run_status.txt ]; then cp native_run_status.txt c93_native_results/${GITHUB_RUN_ID}/RUN_STATUS.txt; fi
+          git config user.name c93-native-test-bot
+          git config user.email c93-native-test-bot@users.noreply.github.com
+          git fetch origin main
+          git checkout -B main origin/main
+          git add c93_native_results/${GITHUB_RUN_ID}
+          git commit -m "Record C93 native replay completion $GITHUB_RUN_ID" || true
+          git push origin HEAD:main
