@@ -25,15 +25,17 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/gm_probe.py" <<'PY'
-          import json, os, time, urllib.request, urllib.parse, http.cookiejar
+          import json, os, urllib.request, urllib.parse, http.cookiejar
           from pathlib import Path
           base='https://api.guerrillamail.com/ajax.php'
-          cj=http.cookiejar.CookieJar(); op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+          cookie=Path(os.environ['RUNNER_TEMP'])/'gm.cookies'
+          cj=http.cookiejar.MozillaCookieJar(str(cookie)); op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
           def call(params):
               q=urllib.parse.urlencode(params)
               req=urllib.request.Request(base+'?'+q,headers={'User-Agent':'GuanHu-C93-Native-Probe'})
               with op.open(req,timeout=30) as r:return json.load(r)
           a=call({'f':'get_email_address','lang':'en','ip':'127.0.0.1','agent':'GuanHu-C93'})
+          cj.save(ignore_discard=True,ignore_expires=True)
           addr=a['email_addr']; subject='C93-GM-PROBE-'+os.environ['GITHUB_RUN_ID']
           Path('gm_address.txt').write_text(addr+'\n'); Path('gm_subject.txt').write_text(subject+'\n')
           Path(os.environ['RUNNER_TEMP'],'gm_session.json').write_text(json.dumps({'addr':addr,'subject':subject}))
@@ -49,7 +51,7 @@ jobs:
           git add .c93_gm_probe
           git commit -m 'Publish C93 GuerrillaMail probe inbox'
           git push origin HEAD:c93-v76-replay-20260824
-      - name: Wait for probe message
+      - name: Wait for probe message using same mailbox session
         shell: bash
         run: |
           set -euo pipefail
@@ -57,16 +59,13 @@ jobs:
           import json, os, time, urllib.request, urllib.parse, http.cookiejar, html
           from pathlib import Path
           cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'gm_session.json').read_text())
-          base='https://api.guerrillamail.com/ajax.php'; cj=http.cookiejar.CookieJar(); op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-          # Re-acquire the published mailbox in this session.
+          base='https://api.guerrillamail.com/ajax.php'
+          cookie=Path(os.environ['RUNNER_TEMP'])/'gm.cookies'
+          cj=http.cookiejar.MozillaCookieJar(str(cookie)); cj.load(ignore_discard=True,ignore_expires=True)
+          op=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
           def call(params):
               q=urllib.parse.urlencode(params); req=urllib.request.Request(base+'?'+q,headers={'User-Agent':'GuanHu-C93-Native-Probe'})
               with op.open(req,timeout=30) as r:return json.load(r)
-          a=call({'f':'get_email_address','lang':'en','ip':'127.0.0.1','agent':'GuanHu-C93'})
-          user=cfg['addr'].split('@',1)[0]
-          data=urllib.parse.urlencode({'f':'set_email_user','email_user':user,'lang':'en','ip':'127.0.0.1','agent':'GuanHu-C93'}).encode()
-          req=urllib.request.Request(base,data=data,headers={'User-Agent':'GuanHu-C93-Native-Probe','Content-Type':'application/x-www-form-urlencoded'})
-          with op.open(req,timeout=30) as r: json.load(r)
           deadline=time.time()+150; found=None
           while time.time()<deadline and not found:
               z=call({'f':'check_email','seq':0,'ip':'127.0.0.1','agent':'GuanHu-C93'})
@@ -76,7 +75,9 @@ jobs:
               if not found: time.sleep(3)
           if not found: raise SystemExit('GM_PROBE_TIMEOUT')
           f=call({'f':'fetch_email','email_id':found['mail_id'],'ip':'127.0.0.1','agent':'GuanHu-C93'})
-          body=f.get('mail_body','')
+          body=html.unescape(f.get('mail_body',''))
+          token='C93_GUERRILLA_TRANSPORT_PROBE_PASS_TOKEN_20260824'
+          if token not in body: raise SystemExit('GM_PROBE_BODY_TOKEN_MISSING')
           Path('C93_GM_PROBE_PASS.txt').write_text(f"PASS\nADDRESS={cfg['addr']}\nSUBJECT={cfg['subject']}\nBODY_LEN={len(body)}\n")
           print('GM_PROBE_PASS BODY_LEN='+str(len(body)))
           PY
