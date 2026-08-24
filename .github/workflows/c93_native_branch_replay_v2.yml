@@ -1,0 +1,173 @@
+name: c93-native-inner7-branch-replay-v2
+
+on:
+  push:
+    branches: [c93-v76-replay-20260824]
+    paths:
+      - '.github/workflows/c93_native_branch_replay_v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  native-inner7-v2:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c93-v76-replay-20260824
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish one-time RSA handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
+          openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out $env:RUNNER_TEMP\public.pem
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          Remove-Item -Recurse -Force .c93_branch_handoff_v2 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force .c93_branch_handoff_v2 | Out-Null
+          Copy-Item $env:RUNNER_TEMP\public.pem .c93_branch_handoff_v2\public.pem
+          @("RUN_ID=$env:GITHUB_RUN_ID","EXPECTED_PLAIN_SHA=283e68bec9e87976c717f8609d4f874a1020c51f889747abe135640c497d36c9","EXPECTED_DLL_SHA=e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae") | Set-Content .c93_branch_handoff_v2\binding.txt
+          git add .c93_branch_handoff_v2
+          git commit -m 'Publish C93 branch replay v2 RSA handoff'
+          git push origin HEAD:c93-v76-replay-20260824
+
+      - name: Receive encrypted branch payload
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference='Stop'
+          $ok=$false
+          for($i=0;$i -lt 360;$i++){
+            git pull --ff-only origin c93-v76-replay-20260824 2>$null | Out-Null
+            if((Test-Path .c93_branch_handoff_v2\ready.txt) -and (Test-Path .c93_branch_handoff_v2\key.enc.b64) -and (Test-Path .c93_branch_handoff_v2\manifest.txt)){$ok=$true;break}
+            Start-Sleep -Seconds 2
+          }
+          if(-not $ok){throw 'BRANCH_PAYLOAD_TIMEOUT'}
+          $manifest=Get-Content .c93_branch_handoff_v2\manifest.txt
+          $encSha=(($manifest | Where-Object {$_ -like 'ENC_SHA256=*'}) -split '=')[1].Trim()
+          $expectedChunks=[int]((($manifest | Where-Object {$_ -like 'CHUNKS=*'}) -split '=')[1].Trim())
+          $chunks=Get-ChildItem .c93_branch_handoff_v2\chunk_*.b64 | Sort-Object Name
+          if($chunks.Count -ne $expectedChunks){throw "CHUNK_COUNT_FAIL got=$($chunks.Count) expected=$expectedChunks"}
+          $b64=Join-Path $env:RUNNER_TEMP 'payload.enc.b64'
+          Remove-Item $b64 -ErrorAction SilentlyContinue
+          foreach($c in $chunks){Get-Content $c.FullName -Raw | Add-Content -NoNewline $b64}
+          certutil -decode $b64 $env:RUNNER_TEMP\payload.enc | Out-Null
+          $actualEnc=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actualEnc -ne $encSha){throw "ENC_SHA_FAIL $actualEnc"}
+          certutil -decode .c93_branch_handoff_v2\key.enc.b64 $env:RUNNER_TEMP\key.enc | Out-Null
+          if((Get-Item $env:RUNNER_TEMP\key.enc).Length -ne 384){throw 'KEY_SIZE_FAIL'}
+          openssl pkeyutl -decrypt -inkey $env:RUNNER_TEMP\private.pem -in $env:RUNNER_TEMP\key.enc -out $env:RUNNER_TEMP\pass.txt -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          if($LASTEXITCODE -ne 0){throw 'RSA_DECRYPT_FAIL'}
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in $env:RUNNER_TEMP\payload.enc -out $env:RUNNER_TEMP\payload.tar.xz -pass file:$env:RUNNER_TEMP\pass.txt
+          if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
+          $plain=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($plain -ne '283e68bec9e87976c717f8609d4f874a1020c51f889747abe135640c497d36c9'){throw "PLAIN_SHA_FAIL $plain"}
+          New-Item -ItemType Directory -Force payload | Out-Null
+          tar -xJf $env:RUNNER_TEMP\payload.tar.xz -C payload --strip-components=1
+          if($LASTEXITCODE -ne 0){throw 'PAYLOAD_EXTRACT_FAIL'}
+          $dll=(Get-FileHash payload\bin\C93.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($dll -ne 'e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae'){throw "DLL_SHA_FAIL $dll"}
+          xz -dc payload\data\inner_slow7.ghr.xz > payload\input.ghr
+          'NATIVE_PAYLOAD_BINDING_PASS' | Out-File payload_binding.txt
+
+      - name: Configure MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build and run real-cadence replay
+        shell: powershell
+        timeout-minutes: 9
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          #include <windows.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          typedef uint32_t (__stdcall *PF)(const uint32_t*,const void*,int,void*,void*,void*);
+          typedef int (__stdcall *IF)(char*,void*); typedef void (__stdcall *FF)(void); typedef uint8_t (__stdcall *SF)(void);
+          static uint32_t ids[2048]; static uint16_t w[8192]; static unsigned char st[0x105c],rs[0x786];
+          static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
+          int main(void){FILE*f=fopen("input.ghr","rb"),*o;char m4[4],prod[160]={0};uint32_t n,i,rel,c,k,seq=0;unsigned char lic[4]={1,0,0,0};HMODULE m;PF p;IF init;FF fini;SF stat;if(!f)return 10;if(!rd(f,m4,4)||memcmp(m4,"GHR1",4)||!rd(f,&n,4))return 11;m=LoadLibraryA("SigProcDll-64HF.dll");if(!m){printf("LOAD_FAIL %lu\n",GetLastError());return 12;}p=(PF)GetProcAddress(m,"_SigProc@24");init=(IF)GetProcAddress(m,"_SigProc_Init@8");fini=(FF)GetProcAddress(m,"_SigProc_Fini@0");stat=(SF)GetProcAddress(m,"_SigProc_Stat@0");if(!p||!init||!fini||!stat)return 13;if(!init(prod,lic))return 14;printf("INIT_PASS STAT=%u PRODUCT=%s RECORDS=%u\n",(unsigned)stat(),prod,n);o=fopen("state.csv","w");fprintf(o,"rel_ms,u16_0,u16_2,u16_4,u16_4176\n");for(i=0;i<n;i++){if(!rd(f,&rel,4)||!rd(f,&c,4)||c>2048)return 20;if(c&&(!rd(f,ids,c*4)||!rd(f,w,c*8)))return 21;if(c){for(k=0;k<c;k+=32){uint32_t z=c-k;if(z>32)z=32;seq=p(ids+k,w+k*4,(int)z,0,st,rs);Sleep(50);}}else{seq=p(0,0,0,0,st,rs);Sleep(1000);} {uint16_t a,b,d,e;memcpy(&a,st,2);memcpy(&b,st+2,2);memcpy(&d,st+4,2);memcpy(&e,st+4176,2);fprintf(o,"%u,%u,%u,%u,%u\n",rel,a,b,d,e);fflush(o);}if(i%25==0){printf("REC %u/%u rel=%u seq=%u stat=%u\n",i,n,rel,seq,(unsigned)stat());fflush(stdout);}}fclose(o);fclose(f);fini();printf("DONE STAT=%u\n",(unsigned)stat());FreeLibrary(m);return 0;}
+          '@ | Set-Content -Encoding ascii payload\native_replay.c
+          Push-Location payload
+          try { cl /nologo /O2 /W4 /MT native_replay.c /Fe:NativeReplay.exe *>&1 | Tee-Object -FilePath ..\native_build.txt; if($LASTEXITCODE -ne 0){throw "BUILD_RC=$LASTEXITCODE"} } finally { Pop-Location }
+          $run=Join-Path (Get-Location) 'payload\run';New-Item -ItemType Directory -Force $run|Out-Null
+          Copy-Item payload\NativeReplay.exe,payload\input.ghr $run\
+          Copy-Item payload\bin\C93.dll $run\SigProcDll-64HF.dll
+          Copy-Item payload\sidecars\* $run\
+          Push-Location $run
+          try {
+            $env:SIGPROC_REBUILD_DEBUG_CSV='rebuild.csv'
+            $env:SIGPROC_RR_SHADOW_DEBUG_CSV='rrshadow.csv'
+            $env:SIGPROC_BED_CAL_DEBUG_CSV='bedcal.csv'
+            $env:SIGPROC_ENERGY_DEBUG_CSV='energy.csv'
+            $env:SIGPROC_PHYSICS_DEBUG_CSV='physics.csv'
+            .\NativeReplay.exe *>&1 | Tee-Object native_replay.log
+            if($LASTEXITCODE -ne 0){throw "REPLAY_RC=$LASTEXITCODE"}
+          } finally {Pop-Location}
+
+      - name: Analyze native result
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          @'
+          import csv,pathlib,statistics,collections,hashlib,re
+          p=pathlib.Path('payload/run'); out=['C93_NATIVE_WINDOWS_INNER7_BRANCH_REPLAY_V2']
+          if pathlib.Path('payload_binding.txt').exists():out.append('PAYLOAD_BINDING=PASS')
+          if (p/'SigProcDll-64HF.dll').exists():out.append('DLL_SHA256='+hashlib.sha256((p/'SigProcDll-64HF.dll').read_bytes()).hexdigest())
+          if (p/'native_replay.log').exists():
+            t=(p/'native_replay.log').read_text(errors='ignore');m=re.search(r'INIT_PASS[^\n]*PRODUCT=([^\r\n]+)',t);out.append('NATIVE_INIT=' + ('PASS PRODUCT='+m.group(1).strip() if m else 'NO_SENTINEL'));out.append('NATIVE_DONE=' + ('PASS' if 'DONE STAT=0' in t else 'NO'))
+          else: out.append('NATIVE_REPLAY_LOG=MISSING')
+          if (p/'rebuild.csv').exists():
+            r=list(csv.DictReader((p/'rebuild.csv').open(newline=''))); num=lambda x,k,d=0:float(x.get(k,d) or d)
+            maxreal=max((num(x,'real_channel_count') for x in r),default=0);maxactive=max((num(x,'active_count') for x in r),default=0);minbad=min((num(x,'bad_channels',64) for x in r),default=64);maxclock=max((num(x,'sample_clock_windows') for x in r),default=0);rates=[int(float(x['rr_rate'])) for x in r if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]
+            f0=(329000-147000)/(480000-147000); f1=(416000-147000)/(480000-147000); a=max(0,min(len(r),round(f0*len(r)))); b=max(a,min(len(r),round(f1*len(r)))); ev=r[a:b]; evr=[int(float(x['rr_rate'])) for x in ev if x.get('rr_rate') and int(float(x['rr_rate']))!=65535]
+            out.append(f'REBUILD_ROWS={len(r)} MAX_REAL_CHANNELS={maxreal:g} MAX_ACTIVE_CHANNELS={maxactive:g} MIN_BAD_CHANNELS={minbad:g} MAX_SAMPLE_CLOCK_WINDOWS={maxclock:g}')
+            out.append(f'ALL_RR_VALID={len(rates)}/{len(r)}')
+            out.append(f'SLOW7_APPROX_ROWS={len(ev)} VALID_RR={len(evr)} MEDIAN={(statistics.median(evr) if evr else "NA")} COUNTS={dict(collections.Counter(evr).most_common(12))}')
+            verdict='P0_C93_NATIVE_ALL_CHANNELS_REJECTED' if maxreal==0 and minbad>=64 else ('C93_NATIVE_CHANNEL_GATE_RECOVERED' if maxreal>0 else 'C93_NATIVE_REVIEW')
+          else:
+            out.append('REBUILD_CSV=MISSING'); verdict='NATIVE_REPLAY_NOT_COMPLETED'
+          out.append('VERDICT='+verdict)
+          pathlib.Path('C93_NATIVE_BRANCH_V2_RESULT.txt').write_text('\n'.join(out)+'\n'); print('\n'.join(out))
+          '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\an.py
+          python $env:RUNNER_TEMP\an.py | Tee-Object analysis_console.txt
+
+      - name: Commit result summary
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Continue'
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          New-Item -ItemType Directory -Force evidence_summary | Out-Null
+          if(Test-Path C93_NATIVE_BRANCH_V2_RESULT.txt){Copy-Item C93_NATIVE_BRANCH_V2_RESULT.txt evidence_summary\C93_NATIVE_BRANCH_V2_RESULT.txt -Force}
+          git add evidence_summary
+          git commit -m 'Record C93 native branch replay v2 result' 2>$null
+          if($LASTEXITCODE -eq 0){git push origin HEAD:c93-v76-replay-20260824}
+
+      - name: Cleanup encrypted handoff
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git fetch -q origin c93-v76-replay-20260824
+          git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          git config user.name windows-dll-test-bot
+          git config user.email windows-dll-test-bot@users.noreply.github.com
+          rm -rf .c93_branch_handoff_v2
+          git add -A .c93_branch_handoff_v2
+          if ! git diff --cached --quiet; then git commit -m 'Remove C93 branch replay v2 handoff'; git push origin HEAD:c93-v76-replay-20260824 || true; fi
