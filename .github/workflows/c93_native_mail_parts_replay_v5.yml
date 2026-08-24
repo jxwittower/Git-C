@@ -29,19 +29,25 @@ jobs:
           import json,os,secrets,string,urllib.request
           from pathlib import Path
           def req(method,url,obj=None,token=None):
-              data=None if obj is None else json.dumps(obj).encode();r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method);r.add_header('Accept','application/json')
               if data is not None:r.add_header('Content-Type','application/json')
               if token:r.add_header('Authorization','Bearer '+token)
               with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
           base='https://api.mail.tm';z=req('GET',base+'/domains');m=z if isinstance(z,list) else z.get('hydra:member',[])
           if not m:raise SystemExit('MAILTM_NO_DOMAIN')
-          a=string.ascii_lowercase+string.digits;u='c93v5'+''.join(secrets.choice(a) for _ in range(14));pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32));addr=u+'@'+m[0]['domain']
-          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token'];Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'password':pw,'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('prefix.txt').write_text('C93V5-'+os.environ['GITHUB_RUN_ID']+'\n');print('MAILBOX='+addr);print('PREFIX='+Path('prefix.txt').read_text().strip())
+          a=string.ascii_lowercase+string.digits;u='c93v5b'+''.join(secrets.choice(a) for _ in range(13));pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(32));addr=u+'@'+m[0]['domain']
+          req('POST',base+'/accounts',{'address':addr,'password':pw});tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'mail.json').write_text(json.dumps({'address':addr,'password':pw,'token':tok}));Path('mailbox.txt').write_text(addr+'\n');Path('prefix.txt').write_text('C93V5B-'+os.environ['GITHUB_RUN_ID']+'\n');print('MAILBOX='+addr);print('PREFIX='+Path('prefix.txt').read_text().strip())
           '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\mk.py
           python $env:RUNNER_TEMP\mk.py
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out $env:RUNNER_TEMP\private.pem
           openssl pkey -in $env:RUNNER_TEMP\private.pem -pubout -out public.pem
-          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;Remove-Item -Recurse -Force .c93_mail_parts_handoff_v5 -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force .c93_mail_parts_handoff_v5|Out-Null;Copy-Item public.pem,mailbox.txt,prefix.txt .c93_mail_parts_handoff_v5\;git add .c93_mail_parts_handoff_v5;git commit -m 'Publish C93 multipart mail v5 handoff';git push origin HEAD:c93-v76-replay-20260824
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com
+          git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824
+          Remove-Item -Recurse -Force .c93_mail_parts_handoff_v5 -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force .c93_mail_parts_handoff_v5|Out-Null
+          Copy-Item public.pem,mailbox.txt,prefix.txt .c93_mail_parts_handoff_v5\
+          git add .c93_mail_parts_handoff_v5;git commit -m 'Publish C93 26-part mail v5b handoff';git push origin HEAD:c93-v76-replay-20260824
 
       - name: Receive multipart encrypted payload
         shell: powershell
@@ -51,7 +57,7 @@ jobs:
           @'
           import json,os,time,urllib.request,re,base64
           from pathlib import Path
-          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text());tok=cfg['token'];base='https://api.mail.tm';pre=Path('prefix.txt').read_text().strip();N=12;parts={};key=None;seen=set()
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'mail.json').read_text());tok=cfg['token'];base='https://api.mail.tm';pre=Path('prefix.txt').read_text().strip();N=26;parts={};key=None;seen=set()
           def gj(url):
               r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
               with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
@@ -76,7 +82,8 @@ jobs:
               if len(parts)<N or key is None:time.sleep(2)
           if len(parts)!=N or key is None:raise SystemExit(f'MULTIPART_TIMEOUT parts={sorted(parts)} key={None if key is None else len(key)}')
           if len(key)!=384:raise SystemExit('KEY_SIZE_FAIL')
-          b=''.join(parts[i] for i in range(1,N+1));enc=base64.b64decode(b);Path(os.environ['RUNNER_TEMP'],'key.enc').write_bytes(key);Path(os.environ['RUNNER_TEMP'],'payload.enc').write_bytes(enc);print('MULTIPART_COMPLETE',len(enc),len(key),len(b))
+          b=''.join(parts[i] for i in range(1,N+1));enc=base64.b64decode(b)
+          Path(os.environ['RUNNER_TEMP'],'key.enc').write_bytes(key);Path(os.environ['RUNNER_TEMP'],'payload.enc').write_bytes(enc);print('MULTIPART_COMPLETE',len(enc),len(key),len(b))
           '@ | Set-Content -Encoding ascii $env:RUNNER_TEMP\recv.py
           python $env:RUNNER_TEMP\recv.py
           $encsha=(Get-FileHash $env:RUNNER_TEMP\payload.enc -Algorithm SHA256).Hash.ToLowerInvariant();if($encsha -ne '9ff295770ea99e1a58e9bc95bd541c434f86378a40143524992ae99bbad62e33'){throw "ENC_SHA_FAIL $encsha"}
@@ -86,7 +93,9 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'AES_DECRYPT_FAIL'}
           $plain=(Get-FileHash $env:RUNNER_TEMP\payload.tar.xz -Algorithm SHA256).Hash.ToLowerInvariant();if($plain -ne '283e68bec9e87976c717f8609d4f874a1020c51f889747abe135640c497d36c9'){throw "PLAIN_SHA_FAIL $plain"}
           New-Item -ItemType Directory -Force payload|Out-Null;tar -xJf $env:RUNNER_TEMP\payload.tar.xz -C payload --strip-components=1;if($LASTEXITCODE -ne 0){throw 'EXTRACT_FAIL'}
-          $dll=(Get-FileHash payload\bin\C93.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($dll -ne 'e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae'){throw "DLL_SHA_FAIL $dll"};xz -dc payload\data\inner_slow7.ghr.xz > payload\input.ghr;'NATIVE_PAYLOAD_BINDING_PASS'|Out-File payload_binding.txt
+          $dll=(Get-FileHash payload\bin\C93.dll -Algorithm SHA256).Hash.ToLowerInvariant();if($dll -ne 'e4ce56dd12e6f43c3a4a9069ac1837d221ca1360b7e54fb106e49b6f4aa613ae'){throw "DLL_SHA_FAIL $dll"}
+          xz -dc payload\data\inner_slow7.ghr.xz > payload\input.ghr
+          'NATIVE_PAYLOAD_BINDING_PASS'|Out-File payload_binding.txt
 
       - name: Configure MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
@@ -103,10 +112,13 @@ jobs:
           #include <stdint.h>
           #include <stdio.h>
           #include <string.h>
-          typedef uint32_t (__stdcall *PF)(const uint32_t*,const void*,int,void*,void*,void*);typedef int (__stdcall *IF)(char*,void*);typedef void (__stdcall *FF)(void);typedef uint8_t (__stdcall *SF)(void);static uint32_t ids[2048];static uint16_t w[8192];static unsigned char st[0x105c],rs[0x786];static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
+          typedef uint32_t (__stdcall *PF)(const uint32_t*,const void*,int,void*,void*,void*);typedef int (__stdcall *IF)(char*,void*);typedef void (__stdcall *FF)(void);typedef uint8_t (__stdcall *SF)(void);
+          static uint32_t ids[2048];static uint16_t w[8192];static unsigned char st[0x105c],rs[0x786];static int rd(FILE*f,void*p,size_t n){return fread(p,1,n,f)==n;}
           int main(void){FILE*f=fopen("input.ghr","rb"),*o;char m4[4],prod[160]={0};uint32_t n,i,rel,c,k,seq=0;unsigned char lic[4]={1,0,0,0};HMODULE m;PF p;IF init;FF fini;SF stat;if(!f)return 10;if(!rd(f,m4,4)||memcmp(m4,"GHR1",4)||!rd(f,&n,4))return 11;m=LoadLibraryA("SigProcDll-64HF.dll");if(!m){printf("LOAD_FAIL %lu\n",GetLastError());return 12;}p=(PF)GetProcAddress(m,"_SigProc@24");init=(IF)GetProcAddress(m,"_SigProc_Init@8");fini=(FF)GetProcAddress(m,"_SigProc_Fini@0");stat=(SF)GetProcAddress(m,"_SigProc_Stat@0");if(!p||!init||!fini||!stat)return 13;if(!init(prod,lic))return 14;printf("INIT_PASS STAT=%u PRODUCT=%s RECORDS=%u\n",(unsigned)stat(),prod,n);o=fopen("state.csv","w");fprintf(o,"rel_ms,u16_0,u16_2,u16_4,u16_4176\n");for(i=0;i<n;i++){if(!rd(f,&rel,4)||!rd(f,&c,4)||c>2048)return 20;if(c&&(!rd(f,ids,c*4)||!rd(f,w,c*8)))return 21;if(c){for(k=0;k<c;k+=32){uint32_t z=c-k;if(z>32)z=32;seq=p(ids+k,w+k*4,(int)z,0,st,rs);Sleep(50);}}else{seq=p(0,0,0,0,st,rs);Sleep(1000);}if(i%25==0){printf("REC %u/%u rel=%u seq=%u stat=%u\n",i,n,rel,seq,(unsigned)stat());fflush(stdout);} {uint16_t a,b,d,e;memcpy(&a,st,2);memcpy(&b,st+2,2);memcpy(&d,st+4,2);memcpy(&e,st+4176,2);fprintf(o,"%u,%u,%u,%u,%u\n",rel,a,b,d,e);fflush(o);}}fclose(o);fclose(f);fini();printf("DONE STAT=%u\n",(unsigned)stat());FreeLibrary(m);return 0;}
           '@|Set-Content -Encoding ascii payload\native_replay.c
-          Push-Location payload;try{cl /nologo /O2 /W4 /MT native_replay.c /Fe:NativeReplay.exe *>&1|Tee-Object -FilePath ..\native_build.txt;if($LASTEXITCODE -ne 0){throw "BUILD_RC=$LASTEXITCODE"}}finally{Pop-Location};$run=Join-Path (Get-Location) 'payload\run';New-Item -ItemType Directory -Force $run|Out-Null;Copy-Item payload\NativeReplay.exe,payload\input.ghr $run\;Copy-Item payload\bin\C93.dll $run\SigProcDll-64HF.dll;Copy-Item payload\sidecars\* $run\;Push-Location $run;try{$env:SIGPROC_REBUILD_DEBUG_CSV='rebuild.csv';$env:SIGPROC_RR_SHADOW_DEBUG_CSV='rrshadow.csv';$env:SIGPROC_BED_CAL_DEBUG_CSV='bedcal.csv';$env:SIGPROC_ENERGY_DEBUG_CSV='energy.csv';$env:SIGPROC_PHYSICS_DEBUG_CSV='physics.csv';.\NativeReplay.exe *>&1|Tee-Object native_replay.log;if($LASTEXITCODE -ne 0){throw "REPLAY_RC=$LASTEXITCODE"}}finally{Pop-Location}
+          Push-Location payload;try{cl /nologo /O2 /W4 /MT native_replay.c /Fe:NativeReplay.exe *>&1|Tee-Object -FilePath ..\native_build.txt;if($LASTEXITCODE -ne 0){throw "BUILD_RC=$LASTEXITCODE"}}finally{Pop-Location}
+          $run=Join-Path (Get-Location) 'payload\run';New-Item -ItemType Directory -Force $run|Out-Null;Copy-Item payload\NativeReplay.exe,payload\input.ghr $run\;Copy-Item payload\bin\C93.dll $run\SigProcDll-64HF.dll;Copy-Item payload\sidecars\* $run\
+          Push-Location $run;try{$env:SIGPROC_REBUILD_DEBUG_CSV='rebuild.csv';$env:SIGPROC_RR_SHADOW_DEBUG_CSV='rrshadow.csv';$env:SIGPROC_BED_CAL_DEBUG_CSV='bedcal.csv';$env:SIGPROC_ENERGY_DEBUG_CSV='energy.csv';$env:SIGPROC_PHYSICS_DEBUG_CSV='physics.csv';.\NativeReplay.exe *>&1|Tee-Object native_replay.log;if($LASTEXITCODE -ne 0){throw "REPLAY_RC=$LASTEXITCODE"}}finally{Pop-Location}
 
       - name: Analyze and commit result
         if: always()
@@ -115,7 +127,7 @@ jobs:
           $ErrorActionPreference='Continue'
           @'
           import csv,pathlib,statistics,collections,hashlib,re
-          p=pathlib.Path('payload/run');o=['C93_NATIVE_WINDOWS_INNER7_MAIL_PARTS_V5'];
+          p=pathlib.Path('payload/run');o=['C93_NATIVE_WINDOWS_INNER7_MAIL_PARTS_V5B_26X50K']
           if pathlib.Path('payload_binding.txt').exists():o.append('PAYLOAD_BINDING=PASS')
           if (p/'SigProcDll-64HF.dll').exists():o.append('DLL_SHA256='+hashlib.sha256((p/'SigProcDll-64HF.dll').read_bytes()).hexdigest())
           if (p/'native_replay.log').exists():
@@ -124,12 +136,13 @@ jobs:
           if (p/'rebuild.csv').exists():
               r=list(csv.DictReader((p/'rebuild.csv').open(newline='')));num=lambda x,k,d=0:float(x.get(k,d) or d);mr=max((num(x,'real_channel_count') for x in r),default=0);ma=max((num(x,'active_count') for x in r),default=0);mb=min((num(x,'bad_channels',64) for x in r),default=64);mc=max((num(x,'sample_clock_windows') for x in r),default=0);rates=[int(float(x['rr_rate'])) for x in r if x.get('rr_rate') and int(float(x['rr_rate']))!=65535];f0=(329000-147000)/(480000-147000);f1=(416000-147000)/(480000-147000);a=round(f0*len(r));b=round(f1*len(r));ev=r[a:b];evr=[int(float(x['rr_rate'])) for x in ev if x.get('rr_rate') and int(float(x['rr_rate']))!=65535];o.append(f'REBUILD_ROWS={len(r)} MAX_REAL_CHANNELS={mr:g} MAX_ACTIVE_CHANNELS={ma:g} MIN_BAD_CHANNELS={mb:g} MAX_SAMPLE_CLOCK_WINDOWS={mc:g}');o.append(f'ALL_RR_VALID={len(rates)}/{len(r)}');o.append(f'SLOW7_APPROX_ROWS={len(ev)} VALID_RR={len(evr)} MEDIAN={(statistics.median(evr) if evr else "NA")} COUNTS={dict(collections.Counter(evr).most_common(12))}');v='P0_C93_NATIVE_ALL_CHANNELS_REJECTED' if mr==0 and mb>=64 else ('C93_NATIVE_CHANNEL_GATE_RECOVERED' if mr>0 else 'C93_NATIVE_REVIEW')
           else:o.append('REBUILD_CSV=MISSING');v='NATIVE_REPLAY_NOT_COMPLETED'
-          o.append('VERDICT='+v);pathlib.Path('C93_NATIVE_MAIL_PARTS_V5_RESULT.txt').write_text('\n'.join(o)+'\n');print('\n'.join(o))
+          o.append('VERDICT='+v);pathlib.Path('C93_NATIVE_MAIL_PARTS_V5B_RESULT.txt').write_text('\n'.join(o)+'\n');print('\n'.join(o))
           '@|Set-Content -Encoding ascii $env:RUNNER_TEMP\an.py
-          python $env:RUNNER_TEMP\an.py|Tee-Object analysis_console.txt;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;New-Item -ItemType Directory -Force evidence_summary|Out-Null;if(Test-Path C93_NATIVE_MAIL_PARTS_V5_RESULT.txt){Copy-Item C93_NATIVE_MAIL_PARTS_V5_RESULT.txt evidence_summary\C93_NATIVE_MAIL_PARTS_V5_RESULT.txt -Force};git add evidence_summary;git commit -m 'Record C93 native mail-parts v5 result' 2>$null;if($LASTEXITCODE -eq 0){git push origin HEAD:c93-v76-replay-20260824}
+          python $env:RUNNER_TEMP\an.py|Tee-Object analysis_console.txt
+          git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;New-Item -ItemType Directory -Force evidence_summary|Out-Null;if(Test-Path C93_NATIVE_MAIL_PARTS_V5B_RESULT.txt){Copy-Item C93_NATIVE_MAIL_PARTS_V5B_RESULT.txt evidence_summary\C93_NATIVE_MAIL_PARTS_V5B_RESULT.txt -Force};git add evidence_summary;git commit -m 'Record C93 native 26-part mail result' 2>$null;if($LASTEXITCODE -eq 0){git push origin HEAD:c93-v76-replay-20260824}
 
       - name: Cleanup handoff
         if: always()
         shell: bash
         run: |
-          set +e;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;rm -rf .c93_mail_parts_handoff_v5;git add -A .c93_mail_parts_handoff_v5;if ! git diff --cached --quiet;then git commit -m 'Remove C93 multipart mail v5 handoff';git push origin HEAD:c93-v76-replay-20260824||true;fi
+          set +e;git fetch -q origin c93-v76-replay-20260824;git checkout -q -B c93-v76-replay-20260824 origin/c93-v76-replay-20260824;git config user.name windows-dll-test-bot;git config user.email windows-dll-test-bot@users.noreply.github.com;rm -rf .c93_mail_parts_handoff_v5;git add -A .c93_mail_parts_handoff_v5;if ! git diff --cached --quiet;then git commit -m 'Remove C93 26-part mail handoff';git push origin HEAD:c93-v76-replay-20260824||true;fi
