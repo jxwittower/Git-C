@@ -1,0 +1,30 @@
+name: HSK Assets Diagnostic
+on:
+  push:
+    branches: [hsk-crawl-20260914]
+    paths: ['.github/workflows/hsk-assets-diag.yml']
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect Flutter assets and endpoints
+        shell: bash
+        run: |
+          set -e
+          base=https://hsk.blcu.edu.cn
+          for f in flutter.js flutter_service_worker.js main.dart.js manifest.json version.json; do
+            echo "===== $f ====="
+            curl -k -L --max-time 60 -A 'Mozilla/5.0' "$base/$f" -o "/tmp/${f//\//_}" -w 'STATUS=%{http_code} SIZE=%{size_download} TYPE=%{content_type}\n'
+            wc -c "/tmp/${f//\//_}"
+            head -c 500 "/tmp/${f//\//_}" | tr '\n' ' ' || true
+            echo
+          done
+          echo '===== URLs/API-like strings from main.dart.js ====='
+          grep -aoE 'https?://[^"'"'"' <>]+' /tmp/main.dart.js | sort -u | head -200 || true
+          echo '===== HSK paths / API keywords ====='
+          grep -aoE '/[A-Za-z0-9_?=&.-]{2,120}' /tmp/main.dart.js | grep -Ei 'login|user|search|query|stat|article|composition|essay|error|country|download|word|sentence|ai|chat|token|api' | sort -u | head -400 || true
+          echo '===== domain/port strings ====='
+          strings /tmp/main.dart.js | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}(:[0-9]+)?|[A-Za-z0-9.-]+\.blcu\.edu\.cn(:[0-9]+)?' | sort -u | head -100 || true
