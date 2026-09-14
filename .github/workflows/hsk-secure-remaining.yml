@@ -1,0 +1,112 @@
+name: HSK Secure Remaining Audit
+on:
+  push:
+    branches: [hsk-crawl-20260914]
+    paths: ['hsk_remaining_request.txt']
+permissions:
+  contents: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: hsk-crawl-20260914, fetch-depth: 0, persist-credentials: true}
+      - uses: actions/setup-node@v4
+        with: {node-version: '20'}
+      - run: npm install --no-audit --no-fund
+      - run: node --check hsk_remaining_audit.js
+      - name: Create one-time secure handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/hsk_private.pem" 2>/dev/null
+          openssl pkey -in "$RUNNER_TEMP/hsk_private.pem" -pubout -out hsk_public.pem
+          python3 - <<'PY'
+          import json,secrets,string,urllib.request,os
+          from pathlib import Path
+          def req(method,url,obj=None):
+              data=None if obj is None else json.dumps(obj).encode(); r=urllib.request.Request(url,data=data,method=method); r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'; d=req('GET',base+'/domains'); ds=d if isinstance(d,list) else d.get('hydra:member',[]); abc=string.ascii_lowercase+string.digits
+          u='hsk'+''.join(secrets.choice(abc) for _ in range(18)); pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(42)); addr=u+'@'+ds[0]['domain']; req('POST',base+'/accounts',{'address':addr,'password':pw}); tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').write_text(json.dumps({'address':addr,'token':tok})); Path('hsk_mailbox.txt').write_text(addr+'\n'); Path('hsk_subject.txt').write_text('HSK-SECURE-'+os.environ['GITHUB_RUN_ID']+'\n'); Path('hsk_captcha_subject.txt').write_text('HSK-CAPTCHA-'+os.environ['GITHUB_RUN_ID']+'\n')
+          PY
+          R=$GITHUB_RUN_ID; mkdir -p hsk_secure_handoff/$R; cp hsk_public.pem hsk_mailbox.txt hsk_subject.txt hsk_captcha_subject.txt hsk_secure_handoff/$R/; printf 'RUN_ID=%s\n' "$R" > hsk_secure_handoff/$R/READY.txt
+          git config user.name hsk-secure-remaining-bot; git config user.email hsk-secure-remaining-bot@users.noreply.github.com; git fetch origin hsk-crawl-20260914; git checkout -B hsk-crawl-20260914 origin/hsk-crawl-20260914; git add hsk_secure_handoff/$R; git commit -m "Publish HSK remaining handoff $R"; git push origin HEAD:hsk-crawl-20260914
+      - name: Receive encrypted login payload
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          c=json.loads(Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').read_text()); base='https://api.mail.tm'; sub=Path('hsk_subject.txt').read_text().strip(); out=None; seen=set()
+          def j(u):r=urllib.request.Request(u,headers={'Authorization':'Bearer '+c['token'],'Accept':'application/json'});return json.load(urllib.request.urlopen(r,timeout=30))
+          def b(u):r=urllib.request.Request(u,headers={'Authorization':'Bearer '+c['token']});return urllib.request.urlopen(r,timeout=120).read()
+          end=time.time()+850
+          while time.time()<end and out is None:
+              z=j(base+'/messages'); ms=z if isinstance(z,list) else z.get('hydra:member',[])
+              for m in ms:
+                  if m.get('subject')!=sub or m['id'] in seen:continue
+                  seen.add(m['id']); d=j(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      if a.get('filename')=='creds.enc' and a.get('downloadUrl'):out=b(urllib.parse.urljoin(base,a['downloadUrl']));break
+              if out is None:time.sleep(3)
+          if out is None:raise SystemExit('CREDENTIAL_TIMEOUT')
+          Path(os.environ['RUNNER_TEMP'],'creds.enc').write_bytes(out)
+          PY
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/hsk_private.pem" -in "$RUNNER_TEMP/creds.enc" -out "$RUNNER_TEMP/hsk_creds.json" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          echo "HSK_CREDS_FILE=$RUNNER_TEMP/hsk_creds.json" >> "$GITHUB_ENV"; echo "HSK_CAPTCHA_FILE=$RUNNER_TEMP/hsk_captcha_code.txt" >> "$GITHUB_ENV"
+      - name: Start remaining audit and pause at captcha
+        shell: bash
+        run: |
+          set -euo pipefail; rm -rf hsk_remaining_output; RUNNER_TRACKING_ID='' nohup node hsk_remaining_audit.js > "$RUNNER_TEMP/hsk_remaining.log" 2>&1 & echo $! > "$RUNNER_TEMP/hsk_pid"
+          for i in $(seq 1 120); do [ -f hsk_remaining_output/captcha_ready.txt ] && exit 0; kill -0 $(cat "$RUNNER_TEMP/hsk_pid") 2>/dev/null || { cat "$RUNNER_TEMP/hsk_remaining.log"; exit 3; }; sleep 1; done; exit 4
+      - uses: actions/upload-artifact@v4
+        with: {name: 'hsk-captcha-${{ github.run_id }}', path: hsk_remaining_output/captcha.png, retention-days: 1, if-no-files-found: error}
+      - name: Receive human-read captcha code
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          python3 - <<'PY'
+          import json,os,time,urllib.request,re
+          from pathlib import Path
+          c=json.loads(Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').read_text()); base='https://api.mail.tm'; sub=Path('hsk_captcha_subject.txt').read_text().strip(); code=None; seen=set()
+          def j(u):r=urllib.request.Request(u,headers={'Authorization':'Bearer '+c['token'],'Accept':'application/json'});return json.load(urllib.request.urlopen(r,timeout=30))
+          end=time.time()+850
+          while time.time()<end and not code:
+              z=j(base+'/messages'); ms=z if isinstance(z,list) else z.get('hydra:member',[])
+              for m in ms:
+                  if m.get('subject')!=sub or m['id'] in seen:continue
+                  seen.add(m['id']); d=j(base+'/messages/'+m['id']); v=d.get('text') or d.get('intro') or ''; v=' '.join(v) if isinstance(v,list) else str(v); h=re.search(r'\b[A-Za-z0-9]{4,8}\b',v); code=h.group(0) if h else None
+              if not code:time.sleep(2)
+          if not code:raise SystemExit('CAPTCHA_TIMEOUT')
+          Path(os.environ['RUNNER_TEMP'],'hsk_captcha_code.txt').write_text(code)
+          PY
+      - name: Wait remaining audit completion
+        shell: bash
+        timeout-minutes: 22
+        run: |
+          set -euo pipefail; p=$(cat "$RUNNER_TEMP/hsk_pid"); while kill -0 "$p" 2>/dev/null; do sleep 2; done; cat "$RUNNER_TEMP/hsk_remaining.log"; ! grep -q '^FATAL ' "$RUNNER_TEMP/hsk_remaining.log"
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p hsk_remaining_output/metadata; cp "$RUNNER_TEMP/hsk_remaining.log" hsk_remaining_output/metadata/runner.log 2>/dev/null || true; rm -f hsk_remaining_output/captcha.png hsk_remaining_output/captcha_ready.txt; (cd hsk_remaining_output && find . -type f -print0|sort -z|xargs -0 sha256sum)>hsk_remaining_output/metadata/SHA256SUMS.txt 2>/dev/null||true; zip -qr hsk_remaining_output_${GITHUB_RUN_ID}.zip hsk_remaining_output || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 'hsk-remaining-output-${{ github.run_id }}'
+          path: |
+            hsk_remaining_output
+            hsk_remaining_output_${{ github.run_id }}.zip
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Destroy sensitive material
+        if: always()
+        shell: bash
+        run: |
+          shred -u "$RUNNER_TEMP/hsk_creds.json" 2>/dev/null||rm -f "$RUNNER_TEMP/hsk_creds.json"; shred -u "$RUNNER_TEMP/creds.enc" 2>/dev/null||rm -f "$RUNNER_TEMP/creds.enc"; shred -u "$RUNNER_TEMP/hsk_private.pem" 2>/dev/null||rm -f "$RUNNER_TEMP/hsk_private.pem"; rm -f "$RUNNER_TEMP/hsk_mail.json" "$RUNNER_TEMP/hsk_captcha_code.txt"
