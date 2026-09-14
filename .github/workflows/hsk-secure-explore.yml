@@ -98,7 +98,13 @@ jobs:
           mkdir -p hsk_coord_output/metadata; cp "$RUNNER_TEMP/hsk_explorer.log" hsk_coord_output/metadata/explorer.log 2>/dev/null || true; rm -f hsk_coord_output/captcha.png hsk_coord_output/captcha_ready.txt; (cd hsk_coord_output && find . -type f -print0|sort -z|xargs -0 sha256sum)>hsk_coord_output/metadata/SHA256SUMS.txt 2>/dev/null||true; zip -qr hsk_coord_output_${GITHUB_RUN_ID}.zip hsk_coord_output || true
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: 'hsk-coord-output-${{ github.run_id }}', path: 'hsk_coord_output\nhsk_coord_output_${{ github.run_id }}.zip', retention-days: 7, if-no-files-found: warn}
+        with:
+          name: 'hsk-coord-output-${{ github.run_id }}'
+          path: |
+            hsk_coord_output
+            hsk_coord_output_${{ github.run_id }}.zip
+          retention-days: 7
+          if-no-files-found: warn
       - name: Destroy sensitive material
         if: always()
         shell: bash
