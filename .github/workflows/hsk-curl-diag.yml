@@ -10,23 +10,36 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: DNS and HTTP diagnostics
+      - name: Fetch HSK OpenAPI schema
         shell: bash
         run: |
-          set +e
-          echo '=== DNS ==='
-          getent ahosts hsk.blcu.edu.cn
-          nslookup hsk.blcu.edu.cn || true
-          echo '=== HTTPS headers ==='
-          curl -k -I -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/ || true
-          echo '=== HTTPS body ==='
-          curl -k -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/ -o /tmp/hsk.html -w 'STATUS=%{http_code} SIZE=%{size_download} TYPE=%{content_type} IP=%{remote_ip}\n' || true
-          wc -c /tmp/hsk.html || true
-          head -c 5000 /tmp/hsk.html || true
-          echo
-          echo '=== LOGIN ==='
-          curl -k -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/Login -o /tmp/login.html -w 'STATUS=%{http_code} SIZE=%{size_download} TYPE=%{content_type} IP=%{remote_ip}\n' || true
-          wc -c /tmp/login.html || true
-          head -c 5000 /tmp/login.html || true
+          set -euo pipefail
+          mkdir -p hsk_openapi
+          for u in openapi.json docs redoc; do
+            code=$(curl -k -L --max-time 30 -A 'Mozilla/5.0' "https://hsk.blcu.edu.cn/$u" -o "hsk_openapi/${u//\//_}.txt" -w '%{http_code}')
+            echo "$u HTTP=$code bytes=$(wc -c < hsk_openapi/${u//\//_}.txt)"
+          done
+          if python3 -m json.tool hsk_openapi/openapi.json.txt > hsk_openapi/openapi.pretty.json 2>/dev/null; then
+            python3 - <<'PY'
+          import json
+          o=json.load(open('hsk_openapi/openapi.json.txt'))
+          for path,ops in o.get('paths',{}).items():
+              if any(k in path for k in ('sentence/search','statistics','nlp/tools','resource')):
+                  print('\nPATH',path)
+                  for method,v in ops.items():
+                      if not isinstance(v,dict): continue
+                      print(' ',method.upper(),v.get('summary'))
+                      rb=v.get('requestBody',{})
+                      if rb: print('  requestBody=',json.dumps(rb,ensure_ascii=False)[:3000])
+                      ps=v.get('parameters',[])
+                      if ps: print('  params=',json.dumps(ps,ensure_ascii=False)[:3000])
+          PY
+          fi
+      - name: Upload OpenAPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsk-openapi
+          path: hsk_openapi
+          retention-days: 7
