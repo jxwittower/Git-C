@@ -1,0 +1,27 @@
+name: HSK Flutter UI Probe
+on:
+  push:
+    branches: [hsk-crawl-20260914]
+    paths: ['hsk_flutter_probe.js','.github/workflows/hsk-flutter-probe.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: hsk-crawl-20260914}
+      - uses: actions/setup-node@v4
+        with: {node-version: '20'}
+      - run: npm install --no-audit --no-fund
+      - name: Probe Flutter semantics
+        run: node hsk_flutter_probe.js
+      - name: Upload UI probe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsk-flutter-probe
+          path: hsk_flutter_probe
+          if-no-files-found: warn
