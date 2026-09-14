@@ -1,0 +1,35 @@
+name: BLCU BCC headful single test
+
+on:
+  push:
+    branches: [blcu-site-audit]
+    paths:
+      - 'tools/blcu_audit/bcc_headful_single.py'
+      - '.github/workflows/blcu-bcc-headful-single.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CJK fonts, Xvfb and Playwright package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-noto-cjk xvfb
+          fc-cache -f
+          pip install playwright
+      - name: Run one paced headful query
+        run: xvfb-run -a python tools/blcu_audit/bcc_headful_single.py
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-BCC-headful-single
+          path: bcc_headful_single/**
+          if-no-files-found: warn
+          retention-days: 7
