@@ -1,3 +1,4 @@
+# paced public query test; no CAPTCHA bypass
 import json, time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
