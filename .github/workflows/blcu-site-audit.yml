@@ -1,0 +1,42 @@
+name: BLCU site audit
+
+on:
+  push:
+    branches: [blcu-site-audit]
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Explore BLCU site
+        run: python tools/blcu_audit/explore.py
+      - name: Pack output
+        if: always()
+        run: |
+          python - <<'PY'
+          import shutil, pathlib
+          p=pathlib.Path('blcu_audit_output')
+          if p.exists():
+              shutil.make_archive('BLCU_site_exploration','zip',p)
+          PY
+      - name: Upload exploration artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-site-exploration
+          path: |
+            blcu_audit_output/**
+            BLCU_site_exploration.zip
+          if-no-files-found: warn
+          retention-days: 7
