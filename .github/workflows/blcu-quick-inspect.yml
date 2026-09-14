@@ -1,6 +1,11 @@
 name: BLCU quick inspect
 
 on:
+  push:
+    branches: [blcu-site-audit]
+    paths:
+      - 'tools/blcu_audit/quick_inspect.py'
+      - '.github/workflows/blcu-quick-inspect.yml'
   workflow_dispatch:
 
 jobs:
@@ -25,7 +30,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: BLCU-quick-inspect
+          name: BLCU-quick-inspect-fixed
           path: |
             blcu_quick_output/**
             BLCU_quick_inspect.zip
