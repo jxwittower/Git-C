@@ -1,0 +1,36 @@
+name: BLCU public app interactions
+
+on:
+  push:
+    branches: [blcu-site-audit]
+    paths:
+      - 'tools/blcu_audit/public_app_interactions.py'
+      - '.github/workflows/blcu-public-app-interactions.yml'
+  workflow_dispatch:
+
+jobs:
+  interact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright Python package
+        run: pip install playwright
+      - name: Interact with public applications
+        run: python tools/blcu_audit/public_app_interactions.py
+      - name: Pack evidence
+        if: always()
+        run: python -c "import shutil, pathlib; p=pathlib.Path('blcu_public_interactions'); p.exists() and shutil.make_archive('BLCU_public_app_interactions','zip',p)"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-public-app-interactions
+          path: |
+            blcu_public_interactions/**
+            BLCU_public_app_interactions.zip
+          if-no-files-found: warn
+          retention-days: 7
