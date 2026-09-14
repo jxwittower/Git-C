@@ -1,0 +1,33 @@
+name: HSK Public Probe
+on:
+  push:
+    branches:
+      - hsk-crawl-20260914
+    paths:
+      - 'hsk_public_probe.js'
+      - 'package.json'
+      - '.github/workflows/hsk-public-probe.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hsk-crawl-20260914
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Probe HSK public access
+        run: node hsk_public_probe.js
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsk-public-probe
+          path: hsk_public_output
+          if-no-files-found: warn
