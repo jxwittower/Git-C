@@ -1,8 +1,6 @@
-name: BLCU site audit
+name: BLCU site broad exploration
 
 on:
-  push:
-    branches: [blcu-site-audit]
   workflow_dispatch:
 
 jobs:
