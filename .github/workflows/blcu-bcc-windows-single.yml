@@ -1,0 +1,31 @@
+name: BLCU BCC Windows single test
+
+on:
+  push:
+    branches: [blcu-site-audit]
+    paths:
+      - 'tools/blcu_audit/bcc_windows_single.py'
+      - '.github/workflows/blcu-bcc-windows-single.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright Python package
+        run: pip install playwright
+      - name: Run one paced Edge query
+        run: python tools/blcu_audit/bcc_windows_single.py
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-BCC-windows-single
+          path: bcc_windows_single/**
+          if-no-files-found: warn
+          retention-days: 7
