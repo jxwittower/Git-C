@@ -1,8 +1,6 @@
 name: BLCU quick inspect
 
 on:
-  push:
-    branches: [blcu-site-audit]
   workflow_dispatch:
 
 jobs:
