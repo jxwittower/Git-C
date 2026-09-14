@@ -1,0 +1,25 @@
+name: HSK Network Diagnostic
+on:
+  push:
+    branches:
+      - hsk-crawl-20260914
+    paths:
+      - 'hsk_diag.js'
+      - '.github/workflows/hsk-diag.yml'
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hsk-crawl-20260914
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Diagnose HSK network
+        run: node hsk_diag.js
