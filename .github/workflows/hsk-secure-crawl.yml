@@ -20,6 +20,8 @@ jobs:
         with:
           node-version: '20'
       - run: npm install --no-audit --no-fund
+      - name: Syntax-check authenticated scanner
+        run: node --check hsk_auth_structure_v2.js
       - name: Create one-time RSA key and mailbox
         shell: bash
         run: |
@@ -94,24 +96,25 @@ jobs:
           PY
           chmod 600 "$RUNNER_TEMP/hsk_creds.json"
           echo "HSK_CREDS_FILE=$RUNNER_TEMP/hsk_creds.json" >> "$GITHUB_ENV"
-      - name: Run full authenticated HSK crawl
-        run: node hsk_full_crawl.js
-      - name: Build evidence package
+      - name: Run authenticated HSK structure scan
+        run: node hsk_auth_structure_v2.js
+      - name: Build structure evidence package
         if: always()
         shell: bash
         run: |
           set +e
-          cp hsk_secure_handoff/$GITHUB_RUN_ID/READY.txt hsk_full_output/metadata/handoff_run.txt 2>/dev/null || true
-          (cd hsk_full_output && find . -type f -print0 | sort -z | xargs -0 sha256sum) > hsk_full_output/metadata/SHA256SUMS.txt 2>/dev/null || true
-          zip -qr hsk_full_output_${GITHUB_RUN_ID}.zip hsk_full_output || true
-      - name: Upload complete site evidence
+          mkdir -p hsk_structure_output/metadata
+          cp hsk_secure_handoff/$GITHUB_RUN_ID/READY.txt hsk_structure_output/metadata/handoff_run.txt 2>/dev/null || true
+          (cd hsk_structure_output && find . -type f -print0 | sort -z | xargs -0 sha256sum) > hsk_structure_output/metadata/SHA256SUMS.txt 2>/dev/null || true
+          zip -qr hsk_structure_output_${GITHUB_RUN_ID}.zip hsk_structure_output || true
+      - name: Upload authenticated structure evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hsk-full-output-${{ github.run_id }}
+          name: hsk-structure-output-${{ github.run_id }}
           path: |
-            hsk_full_output
-            hsk_full_output_${{ github.run_id }}.zip
+            hsk_structure_output
+            hsk_structure_output_${{ github.run_id }}.zip
           retention-days: 7
           if-no-files-found: warn
       - name: Destroy login material
