@@ -1,0 +1,32 @@
+name: HSK Curl Diagnostic
+on:
+  push:
+    branches:
+      - hsk-crawl-20260914
+    paths:
+      - '.github/workflows/hsk-curl-diag.yml'
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: DNS and HTTP diagnostics
+        shell: bash
+        run: |
+          set +e
+          echo '=== DNS ==='
+          getent ahosts hsk.blcu.edu.cn
+          nslookup hsk.blcu.edu.cn || true
+          echo '=== HTTPS headers ==='
+          curl -k -I -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/ || true
+          echo '=== HTTPS body ==='
+          curl -k -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/ -o /tmp/hsk.html -w 'STATUS=%{http_code} SIZE=%{size_download} TYPE=%{content_type} IP=%{remote_ip}\n' || true
+          wc -c /tmp/hsk.html || true
+          head -c 5000 /tmp/hsk.html || true
+          echo
+          echo '=== LOGIN ==='
+          curl -k -L --max-time 20 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36' https://hsk.blcu.edu.cn/Login -o /tmp/login.html -w 'STATUS=%{http_code} SIZE=%{size_download} TYPE=%{content_type} IP=%{remote_ip}\n' || true
+          wc -c /tmp/login.html || true
+          head -c 5000 /tmp/login.html || true
