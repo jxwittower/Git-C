@@ -1,0 +1,35 @@
+name: BLCU quick inspect
+
+on:
+  push:
+    branches: [blcu-site-audit]
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Inspect applications
+        run: python tools/blcu_audit/quick_inspect.py
+      - name: Pack output
+        if: always()
+        run: python -c "import shutil, pathlib; p=pathlib.Path('blcu_quick_output'); p.exists() and shutil.make_archive('BLCU_quick_inspect','zip',p)"
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-quick-inspect
+          path: |
+            blcu_quick_output/**
+            BLCU_quick_inspect.zip
+          if-no-files-found: warn
+          retention-days: 7
