@@ -1,0 +1,36 @@
+name: BLCU BCC real audit
+
+on:
+  push:
+    branches: [blcu-site-audit]
+    paths:
+      - 'tools/blcu_audit/bcc_real_audit.py'
+      - '.github/workflows/blcu-bcc-real-audit.yml'
+  workflow_dispatch:
+
+jobs:
+  bcc-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright Python package
+        run: pip install playwright
+      - name: Run real BCC searches
+        run: python tools/blcu_audit/bcc_real_audit.py
+      - name: Pack evidence
+        if: always()
+        run: python -c "import shutil, pathlib; p=pathlib.Path('bcc_real_output'); p.exists() and shutil.make_archive('BLCU_BCC_real_audit','zip',p)"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-BCC-real-audit
+          path: |
+            bcc_real_output/**
+            BLCU_BCC_real_audit.zip
+          if-no-files-found: warn
+          retention-days: 7
