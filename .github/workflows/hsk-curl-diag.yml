@@ -12,34 +12,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: Fetch HSK OpenAPI schema
+      - name: Probe HSK search request models
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p hsk_openapi
-          for u in openapi.json docs redoc; do
-            code=$(curl -k -L --max-time 30 -A 'Mozilla/5.0' "https://hsk.blcu.edu.cn/$u" -o "hsk_openapi/${u//\//_}.txt" -w '%{http_code}')
-            echo "$u HTTP=$code bytes=$(wc -c < hsk_openapi/${u//\//_}.txt)"
-          done
-          if python3 -m json.tool hsk_openapi/openapi.json.txt > hsk_openapi/openapi.pretty.json 2>/dev/null; then
-            python3 - <<'PY'
-          import json
-          o=json.load(open('hsk_openapi/openapi.json.txt'))
-          for path,ops in o.get('paths',{}).items():
-              if any(k in path for k in ('sentence/search','statistics','nlp/tools','resource')):
-                  print('\nPATH',path)
-                  for method,v in ops.items():
-                      if not isinstance(v,dict): continue
-                      print(' ',method.upper(),v.get('summary'))
-                      rb=v.get('requestBody',{})
-                      if rb: print('  requestBody=',json.dumps(rb,ensure_ascii=False)[:3000])
-                      ps=v.get('parameters',[])
-                      if ps: print('  params=',json.dumps(ps,ensure_ascii=False)[:3000])
+          mkdir -p hsk_search_models
+          python3 - <<'PY'
+          import json,urllib.request,urllib.error,pathlib
+          base='https://hsk.blcu.edu.cn'
+          eps=['keyword','pairs','wrongju','wrongpian','terms','fulltext']
+          payloads=[{}, {'page':1,'per_page':5}, {'keyword':'把','page':1,'per_page':5}, {'query':'把','page':1,'per_page':5}, {'word':'把','page':1,'per_page':5}, {'word1':'如果','word2':'就','page':1,'per_page':5}]
+          out=[]
+          for ep in eps:
+              for pl in payloads:
+                  data=json.dumps(pl,ensure_ascii=False).encode()
+                  r=urllib.request.Request(base+'/api/v1/sentence/search/'+ep,data=data,method='POST',headers={'Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+                  try:
+                      with urllib.request.urlopen(r,timeout=30) as x:
+                          body=x.read().decode('utf-8','replace');status=x.status
+                  except urllib.error.HTTPError as e:
+                      body=e.read().decode('utf-8','replace');status=e.code
+                  except Exception as e:
+                      body=str(e);status=-1
+                  rec={'endpoint':ep,'payload':pl,'status':status,'body':body[:20000]};out.append(rec)
+                  print('\n',ep,pl,'=>',status,body[:1200].replace('\n',' '))
+                  if status==200: break
+          pathlib.Path('hsk_search_models/models.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
           PY
-          fi
-      - name: Upload OpenAPI
+      - name: Upload search model probe
         uses: actions/upload-artifact@v4
         with:
-          name: hsk-openapi
-          path: hsk_openapi
+          name: hsk-search-models
+          path: hsk_search_models
           retention-days: 7
