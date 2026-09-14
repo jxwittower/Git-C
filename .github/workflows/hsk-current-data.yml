@@ -1,0 +1,51 @@
+name: HSK Current Research Data
+on:
+  push:
+    branches: [hsk-crawl-20260914]
+    paths: ['.github/workflows/hsk-current-data.yml']
+  workflow_dispatch:
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Collect current HSK API evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p hsk_current_data
+          python3 - <<'PY'
+          import json,urllib.request,urllib.error,pathlib,time
+          base='https://hsk.blcu.edu.cn'
+          def call(path,payload=None):
+              data=None if payload is None else json.dumps(payload,ensure_ascii=False).encode()
+              r=urllib.request.Request(base+path,data=data,method='GET' if data is None else 'POST',headers={'User-Agent':'Mozilla/5.0','Content-Type':'application/json'})
+              try:
+                  with urllib.request.urlopen(r,timeout=60) as x:return {'status':x.status,'data':json.loads(x.read().decode())}
+              except urllib.error.HTTPError as e:
+                  return {'status':e.code,'body':e.read().decode('utf-8','replace')}
+              except Exception as e:return {'status':-1,'error':str(e)}
+          out={'collected_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'statistics':{},'keyword_search':{},'tokenize':{},'dependency':{},'ai_qa':{}}
+          for name,path in {
+            'all_num':'/api/v1/statistics/all-num','nation':'/api/v1/statistics/nation','title':'/api/v1/statistics/title','wrong_zi':'/api/v1/statistics/wrong/zi','wrong_ci':'/api/v1/statistics/wrong/ci','wrong_ju':'/api/v1/statistics/wrong/ju','wrong_biaodian':'/api/v1/statistics/wrong/biaodian','wrong_biaodian_summary':'/api/v1/statistics/wrong/summary/biaodian','wrong_pianzhang':'/api/v1/statistics/wrong/summary/pianzhang'}.items():out['statistics'][name]=call(path)
+          for q in ['把','被','了','给','是']:
+              out['keyword_search'][q]=call('/api/v1/sentence/search/keyword',{'keyword':q,'page':1,'per_page':5})
+          sents=['我昨天在北京买了一本汉语词典。','他把作业写完了以后就去休息了。','这件事情给我带来了很大的帮助。','如果明天下雨，我们就不去公园了。','虽然汉语很难，但是我越来越喜欢学习汉语。']
+          for i,s in enumerate(sents,1):
+              out['tokenize'][str(i)]=call('/api/v1/nlp/tools/tokenize',{'sentence':s})
+              out['dependency'][str(i)]=call('/api/v1/nlp/tools/dep',{'sentence':s})
+          questions=['如何检索“把”字句？','如何按国家和地区统计作文？','语料库目前有多少篇作文？','怎样下载检索结果？','HSK动态作文语料库适合研究哪些问题？']
+          for i,q in enumerate(questions,1):out['ai_qa'][str(i)]=call('/api/v1/nlp/tools/chat/kimi',{'input':q})
+          pathlib.Path('hsk_current_data/current_data.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary={}
+          for q,r in out['keyword_search'].items():
+              d=r.get('data',{}).get('data',{}) if isinstance(r.get('data'),dict) else {}
+              summary[q]={'status':r['status'],'total':d.get('total'),'examples':len(d.get('data',[])) if isinstance(d,dict) else None}
+          pathlib.Path('hsk_current_data/summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hsk-current-data
+          path: hsk_current_data
+          retention-days: 7
