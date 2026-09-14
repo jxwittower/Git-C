@@ -1,0 +1,33 @@
+name: BLCU system Chrome inspect
+
+on:
+  push:
+    branches: [blcu-site-audit]
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright Python package
+        run: pip install playwright
+      - name: Inspect applications with runner Chrome
+        run: python tools/blcu_audit/quick_inspect_system.py
+      - name: Pack output
+        if: always()
+        run: python -c "import shutil, pathlib; p=pathlib.Path('blcu_sys_output'); p.exists() and shutil.make_archive('BLCU_system_inspect','zip',p)"
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLCU-system-inspect
+          path: |
+            blcu_sys_output/**
+            BLCU_system_inspect.zip
+          if-no-files-found: warn
+          retention-days: 7
