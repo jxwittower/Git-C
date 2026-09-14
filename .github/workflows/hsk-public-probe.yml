@@ -5,6 +5,7 @@ on:
       - hsk-crawl-20260914
     paths:
       - 'hsk_flutter_probe.js'
+      - 'hsk_bundle_inspect.js'
       - 'package.json'
       - '.github/workflows/hsk-public-probe.yml'
   workflow_dispatch:
@@ -13,7 +14,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,12 +23,12 @@ jobs:
         with:
           node-version: '20'
       - run: npm install --no-audit --no-fund
-      - name: Probe HSK Flutter UI
-        run: node hsk_flutter_probe.js
-      - name: Upload probe artifacts
+      - name: Inspect HSK Flutter bundle
+        run: node hsk_bundle_inspect.js
+      - name: Upload bundle report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hsk-flutter-probe
-          path: hsk_flutter_probe
+          name: hsk-bundle-report
+          path: hsk_bundle_report
           if-no-files-found: warn
