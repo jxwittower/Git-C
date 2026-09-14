@@ -21,7 +21,7 @@ jobs:
           node-version: '20'
       - run: npm install --no-audit --no-fund
       - name: Syntax-check authenticated scanner
-        run: node --check hsk_auth_structure_v2.js
+        run: node --check hsk_auth_structure_v3.js
       - name: Create one-time RSA key and mailbox
         shell: bash
         run: |
@@ -31,12 +31,11 @@ jobs:
           python3 - <<'PY'
           import json,secrets,string,urllib.request,os
           from pathlib import Path
-          def req(method,url,obj=None,token=None):
+          def req(method,url,obj=None):
               data=None if obj is None else json.dumps(obj).encode()
               r=urllib.request.Request(url,data=data,method=method)
               r.add_header('Accept','application/json')
               if data is not None:r.add_header('Content-Type','application/json')
-              if token:r.add_header('Authorization','Bearer '+token)
               with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
           base='https://api.mail.tm'; d=req('GET',base+'/domains'); ds=d if isinstance(d,list) else d.get('hydra:member',[])
           if not ds: raise SystemExit('NO_MAIL_DOMAIN')
@@ -44,11 +43,11 @@ jobs:
           user='hsk'+''.join(secrets.choice(abc) for _ in range(18)); pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(42)); addr=user+'@'+ds[0]['domain']
           req('POST',base+'/accounts',{'address':addr,'password':pw}); tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
           Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').write_text(json.dumps({'address':addr,'password':pw,'token':tok}))
-          Path('hsk_mailbox.txt').write_text(addr+'\n'); Path('hsk_subject.txt').write_text('HSK-SECURE-'+os.environ['GITHUB_RUN_ID']+'\n')
+          Path('hsk_mailbox.txt').write_text(addr+'\n'); Path('hsk_subject.txt').write_text('HSK-SECURE-'+os.environ['GITHUB_RUN_ID']+'\n');Path('hsk_captcha_subject.txt').write_text('HSK-CAPTCHA-'+os.environ['GITHUB_RUN_ID']+'\n')
           print('MAILBOX_READY',addr)
           PY
           RUN="$GITHUB_RUN_ID"; mkdir -p "hsk_secure_handoff/$RUN"
-          cp hsk_public.pem hsk_mailbox.txt hsk_subject.txt "hsk_secure_handoff/$RUN/"
+          cp hsk_public.pem hsk_mailbox.txt hsk_subject.txt hsk_captcha_subject.txt "hsk_secure_handoff/$RUN/"
           openssl pkey -pubin -in hsk_public.pem -outform DER | openssl dgst -sha256 | sed 's/^.*= //' > "hsk_secure_handoff/$RUN/pubkey_sha256.txt"
           printf 'RUN_ID=%s\n' "$RUN" > "hsk_secure_handoff/$RUN/READY.txt"
           git config user.name hsk-secure-crawl-bot
@@ -96,8 +95,66 @@ jobs:
           PY
           chmod 600 "$RUNNER_TEMP/hsk_creds.json"
           echo "HSK_CREDS_FILE=$RUNNER_TEMP/hsk_creds.json" >> "$GITHUB_ENV"
-      - name: Run authenticated HSK structure scan
-        run: node hsk_auth_structure_v2.js
+          echo "HSK_CAPTCHA_FILE=$RUNNER_TEMP/hsk_captcha_code.txt" >> "$GITHUB_ENV"
+      - name: Start browser and pause at human verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf hsk_structure_output
+          RUNNER_TRACKING_ID='' nohup node hsk_auth_structure_v3.js > "$RUNNER_TEMP/hsk_scanner.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/hsk_scanner.pid"
+          for i in $(seq 1 120); do
+            if [ -f hsk_structure_output/captcha_ready.txt ]; then echo CAPTCHA_SCREEN_READY; exit 0; fi
+            if ! kill -0 $(cat "$RUNNER_TEMP/hsk_scanner.pid") 2>/dev/null; then cat "$RUNNER_TEMP/hsk_scanner.log"; exit 3; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/hsk_scanner.log" || true
+          exit 4
+      - name: Upload human-verification image
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsk-captcha-${{ github.run_id }}
+          path: |
+            hsk_structure_output/captcha.png
+            hsk_structure_output/screenshots/*人机验证*.png
+          retention-days: 1
+          if-no-files-found: error
+      - name: Wait for human-read verification code
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,time,urllib.request,re
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').read_text());base='https://api.mail.tm';tok=cfg['token'];subj=Path('hsk_captcha_subject.txt').read_text().strip();seen=set();code=None
+          def getj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          end=time.time()+850
+          while time.time()<end and not code:
+              obj=getj(base+'/messages'); ms=obj if isinstance(obj,list) else obj.get('hydra:member',[])
+              for m in ms:
+                  if m.get('subject')!=subj or m['id'] in seen:continue
+                  seen.add(m['id']);d=getj(base+'/messages/'+m['id'])
+                  val=d.get('text') or d.get('intro') or ''
+                  if isinstance(val,list): val=' '.join(map(str,val))
+                  hit=re.search(r'\b[A-Za-z0-9]{4,8}\b',str(val))
+                  if hit: code=hit.group(0);break
+              if not code:time.sleep(2)
+          if not code:raise SystemExit('CAPTCHA_CODE_TIMEOUT')
+          Path(os.environ['RUNNER_TEMP'],'hsk_captcha_code.txt').write_text(code)
+          print('CAPTCHA_CODE_DELIVERED',len(code))
+          PY
+      - name: Wait for authenticated structure scan to finish
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          pid=$(cat "$RUNNER_TEMP/hsk_scanner.pid")
+          while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+          cat "$RUNNER_TEMP/hsk_scanner.log"
+          if grep -q '^FATAL ' "$RUNNER_TEMP/hsk_scanner.log"; then exit 5; fi
       - name: Build structure evidence package
         if: always()
         shell: bash
@@ -105,6 +162,8 @@ jobs:
           set +e
           mkdir -p hsk_structure_output/metadata
           cp hsk_secure_handoff/$GITHUB_RUN_ID/READY.txt hsk_structure_output/metadata/handoff_run.txt 2>/dev/null || true
+          cp "$RUNNER_TEMP/hsk_scanner.log" hsk_structure_output/metadata/scanner.log 2>/dev/null || true
+          rm -f hsk_structure_output/captcha.png hsk_structure_output/captcha_ready.txt
           (cd hsk_structure_output && find . -type f -print0 | sort -z | xargs -0 sha256sum) > hsk_structure_output/metadata/SHA256SUMS.txt 2>/dev/null || true
           zip -qr hsk_structure_output_${GITHUB_RUN_ID}.zip hsk_structure_output || true
       - name: Upload authenticated structure evidence
@@ -124,4 +183,4 @@ jobs:
           shred -u "$RUNNER_TEMP/hsk_creds.json" 2>/dev/null || rm -f "$RUNNER_TEMP/hsk_creds.json"
           shred -u "$RUNNER_TEMP/creds.enc" 2>/dev/null || rm -f "$RUNNER_TEMP/creds.enc"
           shred -u "$RUNNER_TEMP/hsk_private.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/hsk_private.pem"
-          rm -f "$RUNNER_TEMP/hsk_mail.json"
+          rm -f "$RUNNER_TEMP/hsk_mail.json" "$RUNNER_TEMP/hsk_captcha_code.txt"
