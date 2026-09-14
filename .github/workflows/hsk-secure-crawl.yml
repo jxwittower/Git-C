@@ -1,0 +1,124 @@
+name: HSK Secure Full Crawl
+on:
+  push:
+    branches: [hsk-crawl-20260914]
+    paths:
+      - 'hsk_secure_request.txt'
+permissions:
+  contents: write
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hsk-crawl-20260914
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      - name: Create one-time RSA key and mailbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/hsk_private.pem" 2>/dev/null
+          openssl pkey -in "$RUNNER_TEMP/hsk_private.pem" -pubout -out hsk_public.pem
+          python3 - <<'PY'
+          import json,secrets,string,urllib.request,os
+          from pathlib import Path
+          def req(method,url,obj=None,token=None):
+              data=None if obj is None else json.dumps(obj).encode()
+              r=urllib.request.Request(url,data=data,method=method)
+              r.add_header('Accept','application/json')
+              if data is not None:r.add_header('Content-Type','application/json')
+              if token:r.add_header('Authorization','Bearer '+token)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          base='https://api.mail.tm'; d=req('GET',base+'/domains'); ds=d if isinstance(d,list) else d.get('hydra:member',[])
+          if not ds: raise SystemExit('NO_MAIL_DOMAIN')
+          abc=string.ascii_lowercase+string.digits
+          user='hsk'+''.join(secrets.choice(abc) for _ in range(18)); pw=''.join(secrets.choice(string.ascii_letters+string.digits+'-_') for _ in range(42)); addr=user+'@'+ds[0]['domain']
+          req('POST',base+'/accounts',{'address':addr,'password':pw}); tok=req('POST',base+'/token',{'address':addr,'password':pw})['token']
+          Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').write_text(json.dumps({'address':addr,'password':pw,'token':tok}))
+          Path('hsk_mailbox.txt').write_text(addr+'\n'); Path('hsk_subject.txt').write_text('HSK-SECURE-'+os.environ['GITHUB_RUN_ID']+'\n')
+          print('MAILBOX_READY',addr)
+          PY
+          RUN="$GITHUB_RUN_ID"; mkdir -p "hsk_secure_handoff/$RUN"
+          cp hsk_public.pem hsk_mailbox.txt hsk_subject.txt "hsk_secure_handoff/$RUN/"
+          openssl pkey -pubin -in hsk_public.pem -outform DER | openssl dgst -sha256 | sed 's/^.*= //' > "hsk_secure_handoff/$RUN/pubkey_sha256.txt"
+          printf 'RUN_ID=%s\n' "$RUN" > "hsk_secure_handoff/$RUN/READY.txt"
+          git config user.name hsk-secure-crawl-bot
+          git config user.email hsk-secure-crawl-bot@users.noreply.github.com
+          git fetch origin hsk-crawl-20260914
+          git checkout -B hsk-crawl-20260914 origin/hsk-crawl-20260914
+          git add "hsk_secure_handoff/$RUN"
+          git commit -m "Publish HSK one-time crawl handoff $RUN"
+          git push origin HEAD:hsk-crawl-20260914
+      - name: Wait for RSA-encrypted login payload
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,time,urllib.request,urllib.parse
+          from pathlib import Path
+          cfg=json.loads(Path(os.environ['RUNNER_TEMP'],'hsk_mail.json').read_text());base='https://api.mail.tm';tok=cfg['token'];subj=Path('hsk_subject.txt').read_text().strip();seen=set();out=None
+          def getj(url):
+              r=urllib.request.Request(url);r.add_header('Accept','application/json');r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=30) as x:return json.load(x)
+          def getb(url):
+              r=urllib.request.Request(url);r.add_header('Authorization','Bearer '+tok)
+              with urllib.request.urlopen(r,timeout=120) as x:return x.read()
+          end=time.time()+850
+          while time.time()<end and out is None:
+              obj=getj(base+'/messages'); ms=obj if isinstance(obj,list) else obj.get('hydra:member',[])
+              for m in ms:
+                  if m.get('subject')!=subj or m['id'] in seen:continue
+                  seen.add(m['id']);d=getj(base+'/messages/'+m['id'])
+                  for a in d.get('attachments',[]):
+                      if a.get('filename')=='creds.enc' and a.get('downloadUrl'):
+                          out=getb(urllib.parse.urljoin(base,a['downloadUrl']));break
+              if out is None:time.sleep(3)
+          if out is None:raise SystemExit('ENCRYPTED_LOGIN_PAYLOAD_TIMEOUT')
+          Path(os.environ['RUNNER_TEMP'],'creds.enc').write_bytes(out)
+          print('ENCRYPTED_PAYLOAD_RECEIVED',len(out))
+          PY
+          openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/hsk_private.pem" -in "$RUNNER_TEMP/creds.enc" -out "$RUNNER_TEMP/hsk_creds.json" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          python3 - <<'PY'
+          import json,os
+          p=os.path.join(os.environ['RUNNER_TEMP'],'hsk_creds.json');d=json.load(open(p,encoding='utf-8'))
+          assert isinstance(d.get('user'),str) and '@' in d['user'];assert isinstance(d.get('pass'),str) and len(d['pass'])>=6
+          print('LOGIN_PAYLOAD_VALIDATED')
+          PY
+          chmod 600 "$RUNNER_TEMP/hsk_creds.json"
+          echo "HSK_CREDS_FILE=$RUNNER_TEMP/hsk_creds.json" >> "$GITHUB_ENV"
+      - name: Run full authenticated HSK crawl
+        run: node hsk_full_crawl.js
+      - name: Build evidence package
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cp hsk_secure_handoff/$GITHUB_RUN_ID/READY.txt hsk_full_output/metadata/handoff_run.txt 2>/dev/null || true
+          (cd hsk_full_output && find . -type f -print0 | sort -z | xargs -0 sha256sum) > hsk_full_output/metadata/SHA256SUMS.txt 2>/dev/null || true
+          zip -qr hsk_full_output_${GITHUB_RUN_ID}.zip hsk_full_output || true
+      - name: Upload complete site evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsk-full-output-${{ github.run_id }}
+          path: |
+            hsk_full_output
+            hsk_full_output_${{ github.run_id }}.zip
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Destroy login material
+        if: always()
+        shell: bash
+        run: |
+          shred -u "$RUNNER_TEMP/hsk_creds.json" 2>/dev/null || rm -f "$RUNNER_TEMP/hsk_creds.json"
+          shred -u "$RUNNER_TEMP/creds.enc" 2>/dev/null || rm -f "$RUNNER_TEMP/creds.enc"
+          shred -u "$RUNNER_TEMP/hsk_private.pem" 2>/dev/null || rm -f "$RUNNER_TEMP/hsk_private.pem"
+          rm -f "$RUNNER_TEMP/hsk_mail.json"
